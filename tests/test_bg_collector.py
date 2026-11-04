@@ -11,6 +11,7 @@ import pytest
 from avia.bg_collector import BackgroundCollector
 from avia.bot import Bot
 from avia.config import Settings, load_settings
+from avia.history import PriceHistory
 from avia.models import Offer, Query, SiteResult
 
 
@@ -129,11 +130,14 @@ async def test_run_once_search_fn_error_resilience():
 
 @pytest.mark.asyncio
 async def test_run_once_success_annotates_and_increments():
-    """При успешном поиске вызывается annotate и увеличивается счётчик суток."""
+    """При успешном поиске вызывается annotate (с assign_ids) и увеличивается счётчик суток."""
     q = _make_query()
     history = MagicMock()
     history.collect_candidates.return_value = [q]
-    site_res = [SiteResult("aviasales", True, [Offer("aviasales", 5000, offer_id="o1")])]
+    offer = Offer("aviasales", 5000)
+    assert offer.offer_id == ""
+    assert offer.fetched_at is None
+    site_res = [SiteResult("aviasales", True, [offer])]
     search_fn = AsyncMock(return_value=site_res)
     is_idle = MagicMock(return_value=True)
     fixed_now = 1700000000.0
@@ -151,6 +155,8 @@ async def test_run_once_success_annotates_and_increments():
 
     res = await collector.run_once()
     assert res is True
+    assert offer.offer_id != ""
+    assert offer.fetched_at == fixed_now
     history.collect_candidates.assert_called_once_with(
         limit=1,
         today=fixed_today,
@@ -160,6 +166,57 @@ async def test_run_once_success_annotates_and_increments():
     search_fn.assert_called_once_with(q)
     history.annotate.assert_called_once_with(q, site_res, fixed_now)
     assert collector.done_today == 1
+
+
+@pytest.mark.asyncio
+async def test_run_once_with_real_price_history_saves_offers_without_initial_id(tmp_path):
+    """Фоновый сбор сохраняет офферы без исходного offer_id в реальную БД через assign_ids + annotate."""
+    db_path = tmp_path / "prices.sqlite"
+    history = PriceHistory(db_path)
+    q = _make_query()
+
+    fixed_now = 1700000000.0
+    history.annotate(
+        q,
+        [SiteResult("aviasales", True, [Offer("aviasales", 6000, offer_id="seed1")])],
+        now=fixed_now - 10 * 3600,
+    )
+
+    candidates = history.collect_candidates(limit=1, today=q.depart, now=fixed_now)
+    assert len(candidates) == 1
+    assert candidates[0].destination == q.destination
+
+    raw_offer = Offer("aviasales", 4500)
+    assert raw_offer.offer_id == ""
+    assert raw_offer.fetched_at is None
+    site_res = [SiteResult("aviasales", True, [raw_offer])]
+    search_fn = AsyncMock(return_value=site_res)
+    is_idle = MagicMock(return_value=True)
+    settings = _make_settings()
+
+    collector = BackgroundCollector(
+        history,
+        search_fn,
+        is_idle,
+        settings,
+        clock=lambda: fixed_now,
+        today=lambda: q.depart,
+    )
+
+    res = await collector.run_once()
+    assert res is True
+    assert raw_offer.offer_id != ""
+    assert raw_offer.fetched_at == fixed_now
+    assert collector.done_today == 1
+
+    with history._connect() as db:
+        rows = db.execute(
+            "SELECT offer_id, price, observed_at FROM price_history WHERE price = 4500"
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == raw_offer.offer_id
+        assert rows[0][1] == 4500
+        assert rows[0][2] == fixed_now
 
 
 @pytest.mark.asyncio

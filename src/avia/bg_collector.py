@@ -10,6 +10,7 @@ from typing import Any, Callable
 from .config import Settings
 from .history import PriceHistory
 from .models import Query
+from .offers import assign_ids
 
 log = logging.getLogger("avia.bg_collector")
 
@@ -75,6 +76,8 @@ class BackgroundCollector:
             return False
 
         try:
+            if results:
+                assign_ids(results, now=now)
             await asyncio.to_thread(self.history.annotate, q, results, now)
         except asyncio.CancelledError:
             raise
