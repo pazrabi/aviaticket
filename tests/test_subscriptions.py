@@ -230,29 +230,33 @@ def test_due_logic(tmp_path):
     today = date(2026, 10, 1)
     now = 10000.0
 
+    def _interval(sub_id: int, base: int) -> float:
+        j = ((sub_id * 37) % 21 - 10) / 100.0
+        return base * (1.0 + j)
+
     # 1. Первый опрос: last_checked_at is None -> due
     sub_new = store.create(1, _query(depart=date(2026, 11, 15)), "any", SearchCriteria())
 
-    # 2. Диапазон > 30 дней (interval = 3600):
+    # 2. Диапазон > 30 дней (interval = 3600 * (1 + j)):
     sub_long_due = store.create(1, _query(depart=date(2026, 11, 20)), "any", SearchCriteria())
-    store.mark_checked(sub_long_due.id, now=now - 3600)
+    store.mark_checked(sub_long_due.id, now=now - _interval(sub_long_due.id, 3600))
 
     sub_long_not_due = store.create(1, _query(depart=date(2026, 11, 25)), "any", SearchCriteria())
-    store.mark_checked(sub_long_not_due.id, now=now - 3500)
+    store.mark_checked(sub_long_not_due.id, now=now - _interval(sub_long_not_due.id, 3600) + 10)
 
-    # 3. Диапазон 8-30 дней (interval = 2700):
+    # 3. Диапазон 8-30 дней (interval = 2700 * (1 + j)):
     sub_mid_due = store.create(1, _query(depart=date(2026, 10, 20)), "any", SearchCriteria())
-    store.mark_checked(sub_mid_due.id, now=now - 2700)
+    store.mark_checked(sub_mid_due.id, now=now - _interval(sub_mid_due.id, 2700))
 
     sub_mid_not_due = store.create(1, _query(depart=date(2026, 10, 25)), "any", SearchCriteria())
-    store.mark_checked(sub_mid_not_due.id, now=now - 2600)
+    store.mark_checked(sub_mid_not_due.id, now=now - _interval(sub_mid_not_due.id, 2700) + 10)
 
-    # 4. Диапазон <= 7 дней (interval = 1800):
+    # 4. Диапазон <= 7 дней (interval = 1800 * (1 + j)):
     sub_short_due = store.create(1, _query(depart=date(2026, 10, 5)), "any", SearchCriteria())
-    store.mark_checked(sub_short_due.id, now=now - 1800)
+    store.mark_checked(sub_short_due.id, now=now - _interval(sub_short_due.id, 1800))
 
     sub_short_not_due = store.create(1, _query(depart=date(2026, 10, 6)), "any", SearchCriteria())
-    store.mark_checked(sub_short_not_due.id, now=now - 1700)
+    store.mark_checked(sub_short_not_due.id, now=now - _interval(sub_short_not_due.id, 1800) + 10)
 
     # 5. Неактивные подписки не попадают
     sub_inactive = store.create(1, _query(depart=date(2026, 10, 2)), "any", SearchCriteria())
@@ -270,6 +274,43 @@ def test_due_logic(tmp_path):
     assert sub_mid_not_due.id not in due_ids
     assert sub_short_not_due.id not in due_ids
     assert sub_inactive.id not in due_ids
+
+
+def test_due_deterministic_jitter(tmp_path):
+    """Детерминированный разброс due(): диапазон ±10%, стабилен между запусками, новая проверяется сразу."""
+    store = SubscriptionStore(tmp_path / "subs.db")
+    today = date(2026, 10, 1)
+    now = 10000.0
+
+    # Создаём несколько подписок на одну дату (базовый интервал 3600) у разных пользователей
+    subs = [store.create(i, _query(depart=date(2026, 11, 20)), "any", SearchCriteria()) for i in range(1, 11)]
+
+    for sub in subs:
+        j = ((sub.id * 37) % 21 - 10) / 100.0
+        assert -0.10 <= j <= 0.10
+
+    # Новые подписки без last_checked_at созревают сразу
+    due_new = store.due(now=now, today=today)
+    assert len(due_new) == 10
+
+    # Отмечаем все проверенными ровно 3600 с назад (базовый интервал)
+    for sub in subs:
+        store.mark_checked(sub.id, now=now - 3600)
+
+    due_jittered = store.due(now=now, today=today)
+    due_jittered_2 = store.due(now=now, today=today)
+    # Детерминированность: повторный вызов даёт ровно те же подписки
+    assert [s.id for s in due_jittered] == [s.id for s in due_jittered_2]
+
+    # Не все созрели одновременно (разброс сработал: часть с j<=0 созрели, с j>0 — нет)
+    due_ids = {s.id for s in due_jittered}
+    for sub in subs:
+        j = ((sub.id * 37) % 21 - 10) / 100.0
+        expected_interval = 3600 * (1.0 + j)
+        if 3600 >= expected_interval:
+            assert sub.id in due_ids
+        else:
+            assert sub.id not in due_ids
 
 
 def test_record_price_updates_min_and_history(tmp_path):

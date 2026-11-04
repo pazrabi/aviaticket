@@ -88,6 +88,7 @@ class Scheduler:
         rules: NotifyRules | None = None,
         clock: Callable[[], float] = time.time,
         today: Callable[[], date] = date.today,
+        max_groups_per_run: int = 5,
     ) -> None:
         self.store = store
         self.search_fn = search_fn
@@ -96,6 +97,7 @@ class Scheduler:
         self.rules = rules if rules is not None else NotifyRules()
         self.clock = clock
         self.today = today
+        self.max_groups_per_run = max_groups_per_run
 
     async def run_once(self) -> int:
         """Один проход планировщика; возвращает число отправленных уведомлений."""
@@ -110,9 +112,20 @@ class Scheduler:
         for sub in due:
             groups.setdefault(sub.group_key(), []).append(sub)
 
+        # Сортируем группы по давности последней проверки (самые просроченные первыми)
+        def _group_staleness(subs: list[Subscription]) -> float:
+            checks = [s.last_checked_at for s in subs]
+            if any(c is None for c in checks):
+                return float("-inf")
+            return min(c for c in checks if c is not None)
+
+        sorted_groups = sorted(groups.items(), key=lambda item: _group_staleness(item[1]))
+        if self.max_groups_per_run is not None and self.max_groups_per_run > 0:
+            sorted_groups = sorted_groups[: self.max_groups_per_run]
+
         notifications_sent = 0
 
-        for group_key, group_subs in groups.items():
+        for group_key, group_subs in sorted_groups:
             try:
                 first_sub = group_subs[0]
                 query = first_sub.query()

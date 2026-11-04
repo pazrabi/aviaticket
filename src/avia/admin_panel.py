@@ -167,6 +167,30 @@ def build_overview(ctx: dict[str, Any]) -> str:
     busy_cnt = ctx.get("busy_searches", 0)
     lines.append(f"Поисков сейчас: {busy_cnt}")
 
+    queue_data = ctx.get("search_queue") or ctx.get("gate") or ctx.get("prio_gate")
+    if queue_data is not None:
+        if hasattr(queue_data, "waiting_by_priority") and callable(queue_data.waiting_by_priority):
+            x = queue_data.active()
+            n = queue_data.capacity
+            w = queue_data.waiting_by_priority()
+            a = w.get(0, 0)
+            b = w.get(1, 0)
+            c = w.get(2, 0)
+            lines.append(f"Очередь поисков: идёт {x} из {n}, ждут: люди {a}, подписки {b}, фон {c}")
+        elif isinstance(queue_data, dict):
+            x = queue_data.get("active", 0)
+            n = queue_data.get("capacity", 0)
+            w = queue_data.get("waiting") or queue_data.get("waiting_by_priority") or {}
+            a = queue_data.get("people", w.get(0, 0))
+            b = queue_data.get("subs", w.get(1, 0))
+            c = queue_data.get("bg", w.get(2, 0))
+            lines.append(f"Очередь поисков: идёт {x} из {n}, ждут: люди {a}, подписки {b}, фон {c}")
+        elif isinstance(queue_data, str):
+            if not queue_data.startswith("Очередь поисков:"):
+                lines.append(f"Очередь поисков: {queue_data}")
+            else:
+                lines.append(queue_data)
+
     last_b = ctx.get("last_backup_at")
     now_ts = ctx.get("now", time.time())
     lines.append(f"Последний бэкап: {format_backup_time(last_b, now_ts)}")

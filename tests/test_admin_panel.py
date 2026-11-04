@@ -657,3 +657,51 @@ def test_build_parse_telephones_and_site_device():
     # Пара с 2 запусками не должна отображаться
     assert "onetwotrip × realme" not in txt
     assert len(txt) <= 3800
+
+
+def test_overview_search_queue_display(tmp_path):
+    """Строка очереди поисков отображается в обзоре при наличии данных и опускается при отсутствии."""
+    # 1. Без данных очереди строка отсутствует
+    ctx_without = {
+        "uptime_seconds": 100,
+        "git_version": "v1",
+        "users_total": 5,
+        "users_active_24h": 1,
+        "users_active_7d": 1,
+        "users_new_24h": 0,
+        "searches_today": 3,
+        "bg_searches": "выключен",
+        "active_subs": 2,
+        "busy_searches": 1,
+        "last_backup_at": None,
+        "now": 1000.0,
+        "state_size_mb": 1.0,
+    }
+    txt_without = admin_panel.build_overview(ctx_without)
+    assert "Очередь поисков:" not in txt_without
+
+    # 2. С данными очереди через словарь
+    ctx_with_dict = dict(ctx_without)
+    ctx_with_dict["search_queue"] = {
+        "active": 1,
+        "capacity": 2,
+        "waiting": {0: 1, 1: 2, 2: 3},
+    }
+    txt_dict = admin_panel.build_overview(ctx_with_dict)
+    assert "Очередь поисков: идёт 1 из 2, ждут: люди 1, подписки 2, фон 3" in txt_dict
+
+    # 3. С объектом PriorityGate
+    from avia.prio_gate import PriorityGate
+    gate = PriorityGate(3)
+    ctx_with_gate = dict(ctx_without)
+    ctx_with_gate["search_queue"] = gate
+    txt_gate = admin_panel.build_overview(ctx_with_gate)
+    assert "Очередь поисков: идёт 0 из 3, ждут: люди 0, подписки 0, фон 0" in txt_gate
+
+    # 4. Проверка контекста в Bot
+    bot = make_bot(tmp_path, allowed_ids={1})
+    ov_data = bot._collect_overview_data()
+    assert "search_queue" in ov_data
+    assert ov_data["search_queue"]["capacity"] == bot.s.max_parallel_searches
+    txt_bot_ov = admin_panel.build_overview(ov_data)
+    assert f"Очередь поисков: идёт 0 из {bot.s.max_parallel_searches}, ждут: люди 0, подписки 0, фон 0" in txt_bot_ov

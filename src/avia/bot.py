@@ -37,6 +37,7 @@ from .models import Query
 from .offers import assign_ids, filter_by_baggage
 from .parsing import city_name
 from .pipeline import search
+from .prio_gate import PriorityGate
 from .scheduler import Scheduler
 from .store import ResultStore
 from .subscriptions import SubscriptionStore
@@ -77,7 +78,7 @@ class Bot:
             log.exception("метрики недоступны")
             self.metrics = None
         self.last_backup_at: float | None = self._find_last_backup_time()
-        self._search_sem = asyncio.Semaphore(settings.max_parallel_searches)
+        self._gate = PriorityGate(settings.max_parallel_searches)
         self._active_searches: int = 0
         self.history = PriceHistory(settings.storage_dir / "history.sqlite")
         self.bg_collector: BackgroundCollector | None = None
@@ -324,7 +325,7 @@ class Bot:
 
             self._active_searches += 1
             try:
-                async with self._search_sem:
+                async with self._gate.slot(0):
                     results = await _search_call(search, q, self.s, priority=0)
             finally:
                 self._active_searches -= 1
@@ -712,6 +713,14 @@ class Bot:
         busy_cnt = len(self.busy)
         last_b = self.last_backup_at
 
+        gate_info = None
+        if hasattr(self, "_gate") and self._gate is not None:
+            gate_info = {
+                "active": self._gate.active(),
+                "capacity": self._gate.capacity,
+                "waiting": self._gate.waiting_by_priority(),
+            }
+
         state_mb = 0.0
         try:
             if self.s.storage_dir.exists():
@@ -734,6 +743,8 @@ class Bot:
             "last_backup_at": last_b,
             "now": now,
             "state_size_mb": state_mb,
+            "search_queue": gate_info,
+            "gate": self._gate,
         }
 
     def _collect_parse_data(self, period: str = "24h") -> dict[str, Any]:
@@ -979,7 +990,7 @@ class Bot:
         return not self.busy and self._active_searches == 0
 
     async def _bg_search(self, q: Query):
-        async with self._search_sem:
+        async with self._gate.slot(2):
             results = await _search_call(search, q, self.s, priority=2)
         self._record_metrics("bg", results)
         return results
@@ -988,7 +999,7 @@ class Bot:
         # телефоны общие: фоновый опрос стоит в той же очереди, что и поиски людей
         self._active_searches += 1
         try:
-            async with self._search_sem:
+            async with self._gate.slot(1):
                 results = await _search_call(search, q, self.s, priority=1)
         finally:
             self._active_searches -= 1

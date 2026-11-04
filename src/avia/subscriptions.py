@@ -340,8 +340,13 @@ class SubscriptionStore:
         result: list[Subscription] = []
         for row in rows:
             sub = self._row_to_sub(row)
-            interval = poll_interval_seconds(sub.depart, today)
-            if sub.last_checked_at is None or (now - sub.last_checked_at) >= interval:
+            if sub.last_checked_at is None:
+                result.append(sub)
+                continue
+            base_interval = poll_interval_seconds(sub.depart, today)
+            j = ((sub.id * 37) % 21 - 10) / 100.0
+            interval = base_interval * (1.0 + j)
+            if (now - sub.last_checked_at) >= interval:
                 result.append(sub)
         return result
 

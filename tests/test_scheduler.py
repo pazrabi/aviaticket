@@ -657,3 +657,60 @@ async def test_history_annotate_integration(store, history, clock, today):
         assert row is not None
         assert row[0] == 10000
         assert row[1] == "RUB"
+
+
+@pytest.mark.asyncio
+async def test_scheduler_max_groups_per_run_and_staleness_order(store, clock, today):
+    """Ограничение числа групп за проход и порядок по давности последней проверки."""
+    # Создаём 6 групп с разными направлениями
+    cities = ["LED", "AER", "OVB", "SVX", "KZN", "ROV"]
+    subs = []
+    for i, city in enumerate(cities, start=1):
+        q = Query(origin="MOW", destination=city, depart=date(2026, 12, 10), adults=1)
+        sub = store.create(chat_id=100 + i, query=q, baggage_mode="any", criteria=SearchCriteria(), now=clock())
+        subs.append(sub)
+
+    # Задаём разную давность проверки (все старше интервала опроса ~2700 с, чтобы были due):
+    # sub[0] (LED): None (никогда не проверялась -> самая просроченная)
+    # sub[1] (AER): 8000 с назад (давняя)
+    # sub[2] (OVB): 7000 с назад
+    # sub[3] (SVX): 6000 с назад
+    # sub[4] (KZN): 5000 с назад
+    # sub[5] (ROV): 4000 с назад (самая свежая)
+    now_ts = clock()
+    store.mark_checked(subs[1].id, now=now_ts - 8000)
+    store.mark_checked(subs[2].id, now=now_ts - 7000)
+    store.mark_checked(subs[3].id, now=now_ts - 6000)
+    store.mark_checked(subs[4].id, now=now_ts - 5000)
+    store.mark_checked(subs[5].id, now=now_ts - 4000)
+
+    searched_destinations: list[str] = []
+
+    async def search_fn(query: Query) -> list[SiteResult]:
+        searched_destinations.append(query.destination)
+        return [
+            SiteResult(
+                site="aviasales",
+                ok=True,
+                offers=[Offer(site="aviasales", price=5000, currency="RUB", url="https://s.ru/1")],
+            )
+        ]
+
+    sched = Scheduler(
+        store=store,
+        search_fn=search_fn,
+        notify_fn=lambda *a, **k: None,
+        clock=clock,
+        today=today,
+        max_groups_per_run=3,
+    )
+
+    # Первый проход: должно выполниться ровно 3 поиска в порядке давности: LED (None), AER (-8000), OVB (-7000)
+    await sched.run_once()
+    assert searched_destinations == ["LED", "AER", "OVB"]
+
+    # Второй проход: следующие по давности SVX (-6000), KZN (-5000), ROV (-4000)
+    searched_destinations.clear()
+    await sched.run_once()
+    assert searched_destinations == ["SVX", "KZN", "ROV"]
+

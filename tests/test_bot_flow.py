@@ -335,3 +335,76 @@ async def test_bot_run_allowed_updates():
     assert len(handled_callbacks) == 1
     assert handled_callbacks[0]["data"] == "menu:go"
 
+
+@pytest.mark.asyncio
+async def test_bot_human_search_overtakes_waiting_subscription(monkeypatch):
+    """Человек встаёт впереди ожидающей проверки подписки с контролем порядка выполнения."""
+    from avia.criteria import SearchCriteria
+    from avia.dialog import SearchRequest
+
+    settings = Settings(
+        sites=[],
+        tg_token="secret_test_token_12345",
+        tg_allowed_ids={123},
+        max_parallel_searches=1,
+    )
+    bot = RecordingBot(settings)
+
+    execution_order: list[str] = []
+    blocker_running = asyncio.Event()
+    release_blocker = asyncio.Event()
+
+    async def mock_search(q, s, priority=None):
+        if q.origin == "BLOCK":
+            execution_order.append("blocker_start")
+            blocker_running.set()
+            await release_blocker.wait()
+            execution_order.append("blocker_done")
+            return []
+        elif q.origin == "SUB":
+            execution_order.append("sub_search")
+            return [SiteResult("site1", True, [Offer("site1", 5000)])]
+        elif q.origin == "HUMAN":
+            execution_order.append("human_search")
+            return [SiteResult("site1", True, [Offer("site1", 5000)])]
+        return []
+
+    monkeypatch.setattr("avia.bot.search", mock_search)
+
+    # 1. Запускаем первый поиск, который захватит единственный слот
+    q_block = Query(origin="BLOCK", destination="LED", depart=date(2026, 12, 10))
+    t_block = asyncio.create_task(bot._bg_search(q_block))
+    await blocker_running.wait()
+
+    # 2. Запускаем поиск подписки (priority=1), он встаёт в очередь
+    q_sub = Query(origin="SUB", destination="LED", depart=date(2026, 12, 10))
+    t_sub = asyncio.create_task(bot._scheduler_search(q_sub))
+    await asyncio.sleep(0.01)
+
+    assert bot._gate.waiting_by_priority().get(1) == 1
+
+    # 3. Запускаем поиск человека (priority=0)
+    q_human = Query(origin="HUMAN", destination="LED", depart=date(2026, 12, 10))
+    req_human = SearchRequest(query=q_human, baggage_mode="any", criteria=SearchCriteria())
+    t_human = asyncio.create_task(bot._run_search(123, req_human))
+    await asyncio.sleep(0.01)
+
+    assert bot._gate.waiting_by_priority().get(0) == 1
+    assert bot._gate.waiting_by_priority().get(1) == 1
+
+    # 4. Освобождаем блокер
+    release_blocker.set()
+
+    await asyncio.gather(t_block, t_sub, t_human)
+
+    # Человек встаёт впереди подписки!
+    assert execution_order == [
+        "blocker_start",
+        "blocker_done",
+        "human_search",
+        "sub_search",
+    ]
+    assert bot._gate.active() == 0
+    assert bot._is_idle()
+
+
