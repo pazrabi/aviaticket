@@ -120,3 +120,24 @@ def test_build_forecast_section():
     assert "🔮 <b>Прогноз</b>" in txt
     assert "<b>Прогноз:</b>" in txt
     assert "рано: нужно ещё 500 ответов" in txt
+
+
+def test_build_forecast_section_uninitialized_fallback():
+    """Раздел прогноза до первого обучения показывает информативный вердикт «рано» и вылетевшие рейсы."""
+    ctx = {
+        "forecast": {
+            "trained_at": None,
+            "train_rows": 0,
+            "test_rows": 0,
+            "routes_count": 0,
+            "departed_flights_count": 3,
+            "verdict": "рано: нужно ещё 500 ответов",
+            "metrics": None,
+        }
+    }
+    txt = admin_panel.build_forecast(ctx)
+    assert "🔮 <b>Прогноз</b>" in txt
+    assert "• Обучение: —" in txt
+    assert "• Строк: обучение 0 · проверка 0" in txt
+    assert "Вылетевших рейсов с ответами: 3" in txt
+    assert "• Вердикт: рано: нужно ещё 500 ответов" in txt

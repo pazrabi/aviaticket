@@ -678,8 +678,8 @@ class Bot:
                 ctx = await asyncio.to_thread(self._collect_backup_data)
                 text = admin_panel.build_backups(ctx)
             elif section == "forecast":
-                fc = forecast.load_report(self.s.forecast_dir) if self.s.forecast_enabled else None
-                text = admin_panel.build_forecast({"forecast": fc})
+                ctx = await asyncio.to_thread(self._collect_forecast_data)
+                text = admin_panel.build_forecast(ctx)
             else:
                 text = admin_panel.build_home()
                 keyboard = admin_panel.make_home_keyboard()
@@ -868,7 +868,24 @@ class Bot:
             routes_list.append({"origin": orig, "destination": dest, "count": count, "min_price": min_p})
 
         sites = self.history.site_share(days=7, now=now) if self.history else []
+        fc = self._collect_forecast_data().get("forecast")
 
+        return {
+            "routes_count": t_overview.get("routes_count", 0),
+            "searches_count": t_overview.get("searches_count", 0),
+            "avg_days_to_departure": t_overview.get("avg_days_to_departure"),
+            "popular_routes": routes_list,
+            "baggage": {
+                "with": t_overview.get("baggage_with", 0),
+                "without": t_overview.get("baggage_without", 0),
+                "unknown": t_overview.get("baggage_unknown", 0),
+                "total": t_overview.get("baggage_total", 0),
+            },
+            "site_share": sites,
+            "forecast": fc,
+        }
+
+    def _collect_forecast_data(self) -> dict[str, Any]:
         fc = None
         if self.s.forecast_enabled:
             try:
@@ -886,21 +903,7 @@ class Bot:
                     }
             except Exception:
                 fc = None
-
-        return {
-            "routes_count": t_overview.get("routes_count", 0),
-            "searches_count": t_overview.get("searches_count", 0),
-            "avg_days_to_departure": t_overview.get("avg_days_to_departure"),
-            "popular_routes": routes_list,
-            "baggage": {
-                "with": t_overview.get("baggage_with", 0),
-                "without": t_overview.get("baggage_without", 0),
-                "unknown": t_overview.get("baggage_unknown", 0),
-                "total": t_overview.get("baggage_total", 0),
-            },
-            "site_share": sites,
-            "forecast": fc,
-        }
+        return {"forecast": fc}
 
     def _collect_subs_data(self) -> dict[str, Any]:
         now = time.time()

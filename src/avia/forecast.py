@@ -161,6 +161,12 @@ def prepare_dataset(
     today_d = _normalize_date(today) or date.today()
     today_str = today_d.isoformat()
 
+    # Сворачиваем неагрегированные дни из price_history в route_daily
+    try:
+        history.rebuild_all_route_daily()
+    except Exception:
+        log.exception("ошибка обновления route_daily перед формированием датасета")
+
     with history._connect() as db:
         rows = db.execute(
             "SELECT origin, destination, depart, return_date, adults, day, min_price, p25_price, median_price, samples "
@@ -169,18 +175,6 @@ def prepare_dataset(
             "ORDER BY origin, destination, depart, return_date, adults, day ASC",
             (today_str,),
         ).fetchall()
-
-    if not rows:
-        # Если route_daily пуст, попробуем пересчитать из price_history
-        history.rebuild_all_route_daily()
-        with history._connect() as db:
-            rows = db.execute(
-                "SELECT origin, destination, depart, return_date, adults, day, min_price, p25_price, median_price, samples "
-                "FROM route_daily "
-                "WHERE depart < ? "
-                "ORDER BY origin, destination, depart, return_date, adults, day ASC",
-                (today_str,),
-            ).fetchall()
 
     if not rows:
         return []
@@ -364,27 +358,7 @@ def train_and_eval(
     f_dir.mkdir(parents=True, exist_ok=True)
     today_d = _normalize_date(today) or date.today()
 
-    # 1. Проверяем наличие scikit-learn (ленивый импорт)
-    try:
-        from sklearn.ensemble import HistGradientBoostingClassifier
-    except ImportError:
-        departed_cnt = history.count_departed_flights(today_d)
-        report = {
-            "trained_at": datetime.now().isoformat(timespec="seconds"),
-            "samples_total": 0,
-            "train_rows": 0,
-            "test_rows": 0,
-            "train_routes": 0,
-            "test_routes": 0,
-            "routes_count": 0,
-            "departed_flights_count": departed_cnt,
-            "verdict": "sklearn не установлен",
-            "metrics": None,
-        }
-        _save_report(report, f_dir)
-        return report
-
-    # 2. Собираем учебную выборку
+    # 1. Собираем учебную выборку
     observations = prepare_dataset(history, today=today_d)
     train_obs, val_obs = split_train_val(observations)
 
@@ -395,14 +369,14 @@ def train_and_eval(
     routes_count = len({(obs.origin, obs.destination) for obs in observations})
     departed_cnt = history.count_departed_flights(today_d)
 
-    # 3. Проверка порогов достаточности данных
+    # 2. Проверка порогов достаточности данных
     if train_rows < MIN_TRAIN_ROWS or train_routes < MIN_TRAIN_ROUTES or val_rows < MIN_TEST_ROWS:
         if train_rows < MIN_TRAIN_ROWS:
             verdict = f"рано: нужно ещё {MIN_TRAIN_ROWS - train_rows} ответов"
-        elif val_rows < MIN_TEST_ROWS:
-            verdict = f"рано: нужно ещё {MIN_TEST_ROWS - val_rows} ответов в проверке"
         elif train_routes < MIN_TRAIN_ROUTES:
             verdict = f"рано: нужно ещё {MIN_TRAIN_ROUTES - train_routes} маршрутов+вылетов"
+        elif val_rows < MIN_TEST_ROWS:
+            verdict = f"рано: нужно ещё {MIN_TEST_ROWS - val_rows} ответов в проверке"
         else:
             verdict = "рано: недостаточно данных"
         report = {
@@ -415,6 +389,26 @@ def train_and_eval(
             "routes_count": routes_count,
             "departed_flights_count": departed_cnt,
             "verdict": verdict,
+            "metrics": None,
+        }
+        _save_report(report, f_dir)
+        _remove_model(f_dir)
+        return report
+
+    # 3. Проверяем наличие scikit-learn (ленивый импорт) ТОЛЬКО при достаточном объёме данных
+    try:
+        from sklearn.ensemble import HistGradientBoostingClassifier
+    except ImportError:
+        report = {
+            "trained_at": datetime.now().isoformat(timespec="seconds"),
+            "samples_total": len(observations),
+            "train_rows": train_rows,
+            "test_rows": val_rows,
+            "train_routes": train_routes,
+            "test_routes": val_routes,
+            "routes_count": routes_count,
+            "departed_flights_count": departed_cnt,
+            "verdict": "sklearn не установлен",
             "metrics": None,
         }
         _save_report(report, f_dir)
@@ -510,6 +504,12 @@ def predict_drop_prob(
     now: float | None = None,
 ) -> float | None:
     """Возвращает вероятность падения цены (0.0..1.0), только если модель есть и verdict «лучше правил»."""
+    now_ts = time.time() if now is None else float(now)
+    obs_d = datetime.fromtimestamp(now_ts).date()
+    dep_d = _normalize_date(q.depart)
+    if dep_d is None or dep_d <= obs_d:
+        return None
+
     if forecast_dir is None:
         return None
     f_dir = Path(forecast_dir)
@@ -533,11 +533,6 @@ def predict_drop_prob(
         log.exception("ошибка загрузки модели прогноза")
         return None
 
-    now_ts = time.time() if now is None else float(now)
-    obs_d = datetime.fromtimestamp(now_ts).date()
-    dep_d = _normalize_date(q.depart)
-    if dep_d is None:
-        return None
     ret_d = _normalize_date(q.return_date)
 
     if stats is None and history is not None:

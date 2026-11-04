@@ -107,6 +107,27 @@ class TestForecastDatasetAndLabels:
         assert r2_obs[0].label == 0
         assert r2_obs[1].label == 0
 
+    def test_prepare_dataset_rebuilds_unrolled_price_history_when_route_daily_not_empty(self, tmp_path):
+        """Если route_daily не пуст, prepare_dataset всё равно сворачивает неагрегированные дни из price_history."""
+        hist = PriceHistory(tmp_path / "history.sqlite")
+        today = date(2026, 11, 4)
+
+        # 1. В route_daily уже есть строка по рейсу A (2026-10-01)
+        _insert_daily_row(hist, "MOW", "AER", "2026-10-01", "", 1, "2026-09-20", 5000)
+
+        # 2. В price_history накопились замеры по рейсу B (2026-10-10), которые ещё не сворачивались в route_daily
+        ts1 = datetime(2026, 9, 21, 10, 0).timestamp()
+        ts2 = datetime(2026, 9, 22, 10, 0).timestamp()
+        _insert_price_raw(hist, "MOW", "LED", "2026-10-10", None, 1, 7000, ts1, "s1")
+        _insert_price_raw(hist, "MOW", "LED", "2026-10-10", None, 1, 6000, ts2, "s2")
+
+        # 3. Вызываем prepare_dataset
+        obs = forecast.prepare_dataset(hist, today=today)
+        # Рейс B должен попасть в выборку, так как rebuild_all_route_daily() свернул его дни
+        destinations = {o.destination for o in obs}
+        assert "AER" in destinations
+        assert "LED" in destinations
+
     def test_no_future_leakage_in_features(self, tmp_path):
         """Отсутствие утечки будущего: признаки замера зависят только от данных до замера."""
         hist = PriceHistory(tmp_path / "history.sqlite")
@@ -265,21 +286,56 @@ class TestForecastVerdictAndSmallData:
         assert f"нужно ещё {forecast.MIN_TRAIN_ROUTES - rep['train_routes']} маршрутов+вылетов" in rep["verdict"]
 
     def test_work_without_sklearn(self, tmp_path, monkeypatch):
-        """Без scikit-learn модуль не падает и возвращает статус «sklearn не установлен»."""
+        """Без scikit-learn модуль не падает и возвращает статус «sklearn не установлен» при достаточном объёме данных."""
         hist = PriceHistory(tmp_path / "history.sqlite")
         f_dir = tmp_path / "forecast"
+        today = date(2026, 11, 4)
+
+        # Создаём достаточную выборку (30 рейсов по 25 замеров = 750 строк)
+        for i in range(30):
+            dep_date = date(2026, 8, 1) + timedelta(days=i * 3)
+            dep_str = dep_date.isoformat()
+            dest = f"NOSK{i:02d}"
+            for d_left in range(25, 0, -1):
+                obs_d = dep_date - timedelta(days=d_left)
+                _insert_daily_row(
+                    hist, "MOW", dest, dep_str, "", 1, obs_d.isoformat(), 10000
+                )
 
         # Симулируем отсутствие sklearn
         monkeypatch.setitem(sys.modules, "sklearn", None)
         monkeypatch.setitem(sys.modules, "sklearn.ensemble", None)
 
-        rep = forecast.train_and_eval(hist, f_dir)
+        rep = forecast.train_and_eval(hist, f_dir, today=today)
         assert rep["verdict"] == "sklearn не установлен"
+        assert rep["train_rows"] >= forecast.MIN_TRAIN_ROWS
         assert rep["metrics"] is None
 
         # Прогноз также возвращает None без падений
-        prob = forecast.predict_drop_prob(hist, Query(origin="MOW", destination="LED", depart="2026-12-01"), forecast_dir=f_dir)
+        prob = forecast.predict_drop_prob(
+            hist,
+            Query(origin="MOW", destination="NOSK01", depart=date(2026, 11, 20)),
+            forecast_dir=f_dir,
+        )
         assert prob is None
+
+    def test_predict_drop_prob_depart_today_or_past(self, tmp_path):
+        """Рейсы с вылетом сегодня или в прошлом возвращают None (не прогнозируются)."""
+        hist = PriceHistory(tmp_path / "history.sqlite")
+        f_dir = tmp_path / "forecast"
+        now_ts = datetime(2026, 11, 4, 12, 0).timestamp()
+
+        # Рейс с вылетом сегодня
+        q_today = Query(origin="MOW", destination="LED", depart=date(2026, 11, 4))
+        assert forecast.predict_drop_prob(hist, q_today, forecast_dir=f_dir, now=now_ts) is None
+
+        # Рейс с вылетом в прошлом
+        q_past = Query(origin="MOW", destination="LED", depart=date(2026, 11, 3))
+        assert forecast.predict_drop_prob(hist, q_past, forecast_dir=f_dir, now=now_ts) is None
+
+        # Рейс без даты вылета
+        q_none = Query(origin="MOW", destination="LED", depart=None)
+        assert forecast.predict_drop_prob(hist, q_none, forecast_dir=f_dir, now=now_ts) is None
 
 
 class TestForecastTrainingAndEvaluation:
@@ -458,3 +514,32 @@ class TestForecastBotIntegration:
         # Выключенный forecast_enabled -> False
         bot.s.forecast_enabled = False
         assert bot._should_run_forecast_training() is False
+
+    def test_collect_forecast_data_fallback(self, tmp_path):
+        """Когда отчёта ещё нет, bot._collect_forecast_data() возвращает вердикт «рано» и число вылетов."""
+        from avia.bot import Bot
+        from avia.config import Settings
+        from avia.history import PriceHistory
+        settings = Settings(
+            sites=[],
+            tg_token="dummy",
+            tg_allowed_ids={1},
+            storage_dir=tmp_path / "storage",
+            forecast_dir=tmp_path / "forecast",
+            forecast_enabled=True,
+        )
+        settings.storage_dir.mkdir(parents=True, exist_ok=True)
+        bot = Bot(settings)
+        bot.history = PriceHistory(tmp_path / "storage" / "history.sqlite")
+
+        # Добавим один вылетевший рейс в price_history
+        ts = datetime(2026, 10, 1).timestamp()
+        _insert_price_raw(bot.history, "MOW", "LED", "2026-10-15", None, 1, 5000, ts, "s1")
+
+        data = bot._collect_forecast_data()
+        assert "forecast" in data
+        fc = data["forecast"]
+        assert fc is not None
+        assert fc["verdict"] == "рано: нужно ещё 500 ответов"
+        assert fc["departed_flights_count"] == 1
+        assert fc["trained_at"] is None

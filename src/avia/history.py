@@ -302,19 +302,14 @@ class PriceHistory:
         today_str = today_date.isoformat()
         with self._connect() as db:
             row = db.execute(
-                "SELECT COUNT(DISTINCT origin || '|' || destination || '|' || depart || '|' || return_date || '|' || adults) "
-                "FROM route_daily WHERE depart < ?",
-                (today_str,),
+                "SELECT COUNT(*) FROM ("
+                "  SELECT origin, destination, depart, return_date, adults FROM route_daily WHERE depart < ? "
+                "  UNION "
+                "  SELECT origin, destination, depart, COALESCE(return_date, '') AS return_date, adults FROM price_history WHERE depart < ?"
+                ")",
+                (today_str, today_str),
             ).fetchone()
-            cnt = int(row[0]) if row and row[0] is not None else 0
-            if cnt == 0:
-                row2 = db.execute(
-                    "SELECT COUNT(DISTINCT origin || '|' || destination || '|' || depart || '|' || COALESCE(return_date, '') || '|' || adults) "
-                    "FROM price_history WHERE depart < ?",
-                    (today_str,),
-                ).fetchone()
-                cnt = int(row2[0]) if row2 and row2[0] is not None else 0
-            return cnt
+            return int(row[0]) if row and row[0] is not None else 0
 
     def prune(self, keep_days: int = 45, now: float | None = None) -> int:
         """Сворачивает старые дни в route_daily и удаляет сырые записи старше keep_days."""
