@@ -11,6 +11,15 @@ from avia.models import Offer, Query, SiteResult
 from avia.store import ResultStore
 
 
+@pytest.fixture(autouse=True)
+def _isolated_metrics(tmp_path, monkeypatch):
+    """Изолируем MetricsStore в тестах бота, чтобы они не писали в реальный state."""
+    import avia.bot
+    from avia.metrics import MetricsStore
+
+    monkeypatch.setattr(avia.bot, "MetricsStore", lambda _path: MetricsStore(tmp_path / "metrics.sqlite"))
+
+
 class RecordingBot(Bot):
     def __init__(self, settings: Settings, **kwargs):
         super().__init__(settings, **kwargs)

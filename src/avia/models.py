@@ -65,3 +65,4 @@ class SiteResult:
     elapsed: float = 0.0
     partial: bool = False
     cached: bool = False
+    captcha: bool = False

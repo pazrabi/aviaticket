@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from . import advice, analytics, charts
+from .backup import backup_all
 from .bg_collector import BackgroundCollector
 from .config import Settings, load_settings
 from .dialog import (
@@ -29,6 +30,7 @@ from .filters import apply_criteria
 from .formatting import build_compact_report, build_report, date_ru, format_details
 from .guard import friendly_error
 from .history import PriceHistory
+from .metrics import MetricsStore
 from .models import Query
 from .offers import assign_ids, filter_by_baggage
 from .parsing import city_name
@@ -54,9 +56,16 @@ class Bot:
         if not settings.tg_allowed_ids and not settings.tg_open:
             raise SystemExit("Задайте TG_ALLOWED_IDS в .env (ваш Telegram id) или TG_OPEN=1, иначе некому отвечать")
         self.s = settings
+        self.started_at: float = time.time()
         self.http = httpx.AsyncClient(timeout=70)
         self.busy: set[int] = set()
         self.users = UserStore(settings.storage_dir / "users.sqlite")
+        try:
+            self.metrics: MetricsStore | None = MetricsStore(settings.storage_dir / "metrics.sqlite")
+        except Exception:
+            log.exception("метрики недоступны")
+            self.metrics = None
+        self.last_backup_at: float | None = self._find_last_backup_time()
         self._search_sem = asyncio.Semaphore(settings.max_parallel_searches)
         self._active_searches: int = 0
         self.history = PriceHistory(settings.storage_dir / "history.sqlite")
@@ -306,6 +315,7 @@ class Bot:
                     results = await search(q, self.s)
             finally:
                 self._active_searches -= 1
+            self._record_metrics("user", results)
             results = assign_ids(results)
             try:
                 await asyncio.to_thread(self.history.annotate, q, results)
@@ -559,21 +569,60 @@ class Bot:
                 except Exception:
                     pass
 
+    def _record_metrics(self, source: str, results: Any) -> None:
+        if self.metrics is None or not results:
+            return
+        try:
+            self.metrics.record_results(source, results)
+        except Exception:
+            log.exception("ошибка записи метрик")
+
+    def _find_last_backup_time(self) -> float | None:
+        try:
+            if not self.s.backup_dir.exists():
+                return None
+            files = [p for p in self.s.backup_dir.glob("*.sqlite.gz") if p.is_file()]
+            if not files:
+                return None
+            return max(p.stat().st_mtime for p in files)
+        except Exception:
+            return None
+
+    def _should_run_daily_backup(self, now: datetime | None = None) -> bool:
+        dt = now if now is not None else datetime.now()
+        if dt.hour < self.s.backup_hour:
+            return False
+        today_cutoff = dt.replace(hour=self.s.backup_hour, minute=0, second=0, microsecond=0).timestamp()
+        last_time = self._find_last_backup_time()
+        if last_time is not None and last_time >= today_cutoff:
+            return False
+        return True
+
+    def backup_now(self) -> list[Path]:
+        """Создаёт бэкап всех баз SQLite сейчас."""
+        files = backup_all(self.s.storage_dir, self.s.backup_dir, self.s.backup_keep)
+        self.last_backup_at = self._find_last_backup_time()
+        return files
+
     def _is_idle(self) -> bool:
         return not self.busy and self._active_searches == 0
 
     async def _bg_search(self, q: Query):
         async with self._search_sem:
-            return await search(q, self.s)
+            results = await search(q, self.s)
+        self._record_metrics("bg", results)
+        return results
 
     async def _scheduler_search(self, q):
         # телефоны общие: фоновый опрос стоит в той же очереди, что и поиски людей
         self._active_searches += 1
         try:
             async with self._search_sem:
-                return await search(q, self.s)
+                results = await search(q, self.s)
         finally:
             self._active_searches -= 1
+        self._record_metrics("sub", results)
+        return results
 
     async def _scheduler_notify(self, chat_id: int, text: str, reply_markup: dict | None) -> None:
         await self.send(chat_id, text, reply_markup=reply_markup)
@@ -587,7 +636,15 @@ class Bot:
                 if time.time() - last_prune >= 86400:
                     await asyncio.to_thread(self.history.rebuild_route_daily)
                     await asyncio.to_thread(self.history.prune)
+                    if self.metrics is not None:
+                        await asyncio.to_thread(self.metrics.prune)
                     last_prune = time.time()
+
+                if self._should_run_daily_backup():
+                    try:
+                        await asyncio.to_thread(self.backup_now)
+                    except Exception:
+                        log.exception("ошибка ежедневного бэкапа")
             except asyncio.CancelledError:
                 raise
             except Exception:

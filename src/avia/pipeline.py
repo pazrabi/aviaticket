@@ -310,6 +310,7 @@ async def _run_site(
         )
     except DroidhubError as e:
         log.warning("Ошибка droidhub на сайте %s: %s", site.name, e)
+        is_captcha = "капч" in str(e).lower() or "блокировк" in str(e).lower()
         return SiteResult(
             site=site.name,
             ok=False,
@@ -319,6 +320,7 @@ async def _run_site(
             elapsed=time.monotonic() - t0,
             partial=False,
             cached=False,
+            captcha=is_captcha,
         )
     except ParserEmptyError as e:
         log.warning("Парсер сайта %s вернул 0 вариантов: %s", site.name, e)
@@ -331,10 +333,12 @@ async def _run_site(
             elapsed=time.monotonic() - t0,
             partial=False,
             cached=False,
+            captcha=False,
         )
     except Exception as e:
         log.exception("Ошибка при поиске на сайте %s: %s", site.name, e)
         err_msg = str(e) if "TP_TOKEN" in str(e) else friendly_error(e)
+        is_captcha = "капч" in str(e).lower() or "блокировк" in str(e).lower() or "капч" in err_msg.lower()
         return SiteResult(
             site=site.name,
             ok=False,
@@ -344,6 +348,7 @@ async def _run_site(
             elapsed=time.monotonic() - t0,
             partial=False,
             cached=False,
+            captcha=is_captcha,
         )
 
 
