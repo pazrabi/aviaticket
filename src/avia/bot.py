@@ -5,6 +5,7 @@ import asyncio
 from html import escape
 import logging
 import secrets
+import time
 
 import httpx
 
@@ -343,9 +344,26 @@ class Bot:
     async def _scheduler_notify(self, chat_id: int, text: str, reply_markup: dict | None) -> None:
         await self.send(chat_id, text, reply_markup=reply_markup)
 
+    async def _maintenance_loop(self, tick_seconds: float = 300.0) -> None:
+        """Отмечает, что бот жив (для учёта пропусков), и раз в сутки сворачивает и чистит историю цен."""
+        last_prune = 0.0
+        while True:
+            try:
+                await asyncio.to_thread(self.history.record_heartbeat)
+                if time.time() - last_prune >= 86400:
+                    await asyncio.to_thread(self.history.rebuild_route_daily)
+                    await asyncio.to_thread(self.history.prune)
+                    last_prune = time.time()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("обслуживание истории цен")
+            await asyncio.sleep(tick_seconds)
+
     async def run(self):
         offset = 0
         log.info("bot started")
+        self._maintenance_task = asyncio.create_task(self._maintenance_loop())
         if self.subs is not None:
             scheduler = Scheduler(
                 self.subs,
