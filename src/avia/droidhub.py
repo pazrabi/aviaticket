@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
+from dataclasses import dataclass
 import json
 import logging
+import time
 from typing import Any
 
 import httpx
@@ -13,6 +16,26 @@ from .config import Settings, SiteConfig
 
 logger = logging.getLogger(__name__)
 
+
+class PreferenceList(list):
+    """Список устройств с фиксированным порядком предпочтения (не round-robin)."""
+    prefer_order: bool = True
+
+
+@dataclass
+class _Waiter:
+    priority: int
+    weight: int
+    seq: int
+    candidates: list[str]
+    prefer_order: bool
+    fut: asyncio.Future[str]
+
+    @property
+    def key(self) -> tuple[int, int, int]:
+        return (self.priority, -self.weight, self.seq)
+
+
 # Блокировки по device_id для сериализации запросов к каждому конкретному телефону
 _device_locks: dict[str, asyncio.Lock] = {}
 
@@ -21,6 +44,8 @@ _busy_devices: set[str] = set()
 _pool_condition: asyncio.Condition | None = None
 _pool_loop: asyncio.AbstractEventLoop | None = None
 _rr_counter: int = 0
+_seq_counter: int = 0
+_waiters: list[_Waiter] = []
 
 
 class DroidhubError(Exception):
@@ -34,7 +59,7 @@ class DroidhubError(Exception):
 
 def _sync_loop_state() -> asyncio.AbstractEventLoop | None:
     """Синхронизирует блокировки и состояние пула с текущим циклом событий."""
-    global _pool_condition, _pool_loop, _busy_devices, _device_locks
+    global _pool_condition, _pool_loop, _busy_devices, _device_locks, _seq_counter, _waiters
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -44,6 +69,8 @@ def _sync_loop_state() -> asyncio.AbstractEventLoop | None:
         _pool_loop = loop
         _busy_devices.clear()
         _device_locks.clear()
+        _seq_counter = 0
+        _waiters.clear()
     return loop
 
 
@@ -69,77 +96,178 @@ def _get_pool_condition() -> asyncio.Condition:
 
 def _reset_pool() -> None:
     """Сброс состояния пула (для изоляции тестов)."""
-    global _pool_condition, _pool_loop, _rr_counter
+    global _pool_condition, _pool_loop, _rr_counter, _seq_counter, _waiters
     _busy_devices.clear()
     _device_locks.clear()
     _pool_condition = None
     _pool_loop = None
     _rr_counter = 0
+    _seq_counter = 0
+    for w in _waiters:
+        if not w.fut.done():
+            w.fut.cancel()
+    _waiters.clear()
 
 
 def candidates(settings: Settings, site: SiteConfig) -> list[str]:
     """Возвращает список идентификаторов устройств для сайта.
 
     Для 'auto' возвращает список устройств из настроек, иначе [site.phone].
+    Если site.phone содержит запятую — упорядоченный список предпочтений.
     """
     phone = (getattr(site, "phone", None) or "").strip()
+    if not phone:
+        return []
     if phone == "auto":
         devs = getattr(settings, "droidhub_devices", None) or []
         return [d.strip() for d in devs if d and d.strip()]
-    return [phone] if phone else []
+    if "," in phone:
+        clean: list[str] = []
+        for p in phone.split(","):
+            s = p.strip()
+            if s and s not in clean:
+                clean.append(s)
+        return PreferenceList(clean)
+    return [phone]
 
 
 def phone_enabled(settings: Settings, site: SiteConfig) -> bool:
     """True, если заданы droidhub_url и droidhub_token, site.phone непустой и
     (site.phone != 'auto' или settings.droidhub_devices непустой).
+    Для списка предпочтений: True, если заданы url/token и список не пуст.
     """
     phone = (getattr(site, "phone", None) or "").strip()
     url = (getattr(settings, "droidhub_url", None) or "").strip()
     token = (getattr(settings, "droidhub_token", None) or "").strip()
     if not (phone and url and token):
         return False
-    if phone == "auto":
+    if phone == "auto" or "," in phone:
         return bool(candidates(settings, site))
     return True
 
 
-async def acquire(candidates: list[str]) -> str:
-    """Ожидает, пока не освободится хотя бы одно устройство из списка кандидатов.
-
-    Берёт первое свободное устройство, начиная со смещения round-robin,
-    помечает его занятым и продвигает счётчик round-robin.
-    """
+def _clean_candidates(candidates: list[str]) -> list[str]:
     clean: list[str] = []
     for c in candidates:
         s = c.strip()
         if s and s not in clean:
             clean.append(s)
+    return clean
+
+
+def _is_device_available(dev: str) -> bool:
+    lock = _device_locks.get(dev)
+    is_locked = lock.locked() if lock is not None else False
+    return dev not in _busy_devices and not is_locked
+
+
+def _try_acquire(clean: list[str], prefer_order: bool) -> str | None:
+    global _rr_counter
+    if prefer_order:
+        for dev in clean:
+            if _is_device_available(dev):
+                _busy_devices.add(dev)
+                return dev
+        return None
+    else:
+        n = len(clean)
+        offset = _rr_counter % n
+        for i in range(n):
+            dev = clean[(offset + i) % n]
+            if _is_device_available(dev):
+                _busy_devices.add(dev)
+                _rr_counter = (_rr_counter + 1) % 1_000_000
+                return dev
+        return None
+
+
+def _dispatch() -> None:
+    """Проверяет очередь ожидающих и назначает свободные устройства."""
+    if not _waiters:
+        return
+    i = 0
+    while i < len(_waiters):
+        waiter = _waiters[i]
+        if waiter.fut.done():
+            _waiters.pop(i)
+            continue
+        dev = _try_acquire(waiter.candidates, waiter.prefer_order)
+        if dev is not None:
+            _waiters.pop(i)
+            if not waiter.fut.done():
+                waiter.fut.set_result(dev)
+        else:
+            i += 1
+
+
+async def acquire(
+    candidates: list[str],
+    priority: int = 0,
+    weight: int = 0,
+    *,
+    prefer_order: bool | None = None,
+) -> str:
+    """Ожидает, пока не освободится подходящее устройство из списка кандидатов.
+
+    Очередь ожидающих упорядочена по ключу (priority, -weight, seq):
+    - priority: int (0 — человек, 1 — подписка, 2 — фон);
+    - weight: int (тяжесть сайта, больше значит раньше);
+    - seq: int (порядковый номер прихода).
+
+    Для prefer_order=True устройства проверяются в порядке списка;
+    для round-robin (auto) — начиная со смещения счётчика round-robin.
+    """
+    _sync_loop_state()
+    clean = _clean_candidates(candidates)
     if not clean:
         raise ValueError("список устройств-кандидатов пуст")
 
-    cond = _get_pool_condition()
-    async with cond:
-        while True:
-            global _rr_counter
-            n = len(clean)
-            offset = _rr_counter % n
-            for i in range(n):
-                dev = clean[(offset + i) % n]
-                lock = _device_locks.get(dev)
-                is_locked = lock.locked() if lock is not None else False
-                if dev not in _busy_devices and not is_locked:
-                    _busy_devices.add(dev)
-                    _rr_counter = (_rr_counter + 1) % 1_000_000
-                    return dev
-            await cond.wait()
+    if prefer_order is None:
+        prefer_order = getattr(candidates, "prefer_order", False)
+
+    global _seq_counter
+    _seq_counter += 1
+    loop = asyncio.get_running_loop()
+    fut: asyncio.Future[str] = loop.create_future()
+    waiter = _Waiter(
+        priority=priority,
+        weight=weight,
+        seq=_seq_counter,
+        candidates=clean,
+        prefer_order=bool(prefer_order),
+        fut=fut,
+    )
+
+    # Вставляем в очередь с сохранением сортировки по (priority, -weight, seq)
+    keys = [w.key for w in _waiters]
+    idx = bisect.bisect_right(keys, waiter.key)
+    _waiters.insert(idx, waiter)
+
+    _dispatch()
+
+    if fut.done() and not fut.cancelled():
+        return fut.result()
+
+    try:
+        return await fut
+    except asyncio.CancelledError:
+        if fut.done() and not fut.cancelled():
+            dev = fut.result()
+            await release(dev)
+        else:
+            if waiter in _waiters:
+                _waiters.remove(waiter)
+        raise
 
 
 async def release(device_id: str) -> None:
-    """Освобождает устройство и будит ожидающие запросы."""
+    """Освобождает устройство и будит ожидающие запросы в порядке приоритета."""
     clean = device_id.strip()
+    _sync_loop_state()
+    _busy_devices.discard(clean)
+    _dispatch()
     cond = _get_pool_condition()
     async with cond:
-        _busy_devices.discard(clean)
         cond.notify_all()
 
 
@@ -273,6 +401,10 @@ async def fetch_page_snapshot_any(
     capture_json: list[str] | None = None,
     wait_for: str = "",
     client: httpx.AsyncClient | None = None,
+    priority: int = 0,
+    weight: int = 0,
+    stats: dict | None = None,
+    prefer_order: bool | None = None,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на любом свободном телефоне из candidates.
 
@@ -283,24 +415,36 @@ async def fetch_page_snapshot_any(
     Ошибки авторизации (401/403) пробрасываются сразу.
     Капча не считается исключением и не повторяется.
     """
-    clean_candidates: list[str] = []
-    for c in candidates:
-        s = c.strip()
-        if s and s not in clean_candidates:
-            clean_candidates.append(s)
-
+    clean_candidates = _clean_candidates(candidates)
     if not clean_candidates:
         raise DroidhubError("список устройств пуст")
 
+    if prefer_order is None:
+        prefer_order = getattr(candidates, "prefer_order", False)
+
     tried: set[str] = set()
     last_exc: Exception | None = None
+    total_queue_wait: float = 0.0
+    attempts: int = 0
 
     while len(tried) < len(clean_candidates):
         remaining = [c for c in clean_candidates if c not in tried]
         if not remaining:
             break
-        dev = await acquire(remaining)
+
+        t_acq_start = time.monotonic()
+        dev = await acquire(remaining, priority=priority, weight=weight, prefer_order=prefer_order)
+        t_acq = time.monotonic() - t_acq_start
+        total_queue_wait += t_acq
+        attempts += 1
         tried.add(dev)
+
+        if stats is not None:
+            stats["device"] = dev
+            stats["queue_wait"] = total_queue_wait
+            stats["attempts"] = attempts
+
+        t_fetch_start = time.monotonic()
         try:
             snap, finished = await _fetch_device_snapshot(
                 settings,
@@ -311,8 +455,14 @@ async def fetch_page_snapshot_any(
                 wait_for=wait_for,
                 client=client,
             )
+            fetch_sec = time.monotonic() - t_fetch_start
+            if stats is not None:
+                stats["fetch_seconds"] = fetch_sec
             return snap, finished
         except Exception as exc:
+            fetch_sec = time.monotonic() - t_fetch_start
+            if stats is not None:
+                stats["fetch_seconds"] = fetch_sec
             last_exc = exc
             if not _is_retryable_error(exc):
                 raise
@@ -340,6 +490,10 @@ async def fetch_page_snapshot(
     capture_json: list[str] | None = None,
     wait_for: str = "",
     client: httpx.AsyncClient | None = None,
+    priority: int = 0,
+    weight: int = 0,
+    stats: dict | None = None,
+    prefer_order: bool | None = None,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на телефоне через droidhub и возвращает (Snapshot, finished).
 
@@ -355,6 +509,10 @@ async def fetch_page_snapshot(
             capture_json=capture_json,
             wait_for=wait_for,
             client=client,
+            priority=priority,
+            weight=weight,
+            stats=stats,
+            prefer_order=prefer_order,
         )
     return await fetch_page_snapshot_any(
         settings,
@@ -364,4 +522,8 @@ async def fetch_page_snapshot(
         capture_json=capture_json,
         wait_for=wait_for,
         client=client,
+        priority=priority,
+        weight=weight,
+        stats=stats,
+        prefer_order=prefer_order,
     )

@@ -13,16 +13,19 @@ log = logging.getLogger("avia.metrics")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS site_runs (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts       REAL NOT NULL,
-    source   TEXT NOT NULL,
-    site     TEXT NOT NULL,
-    ok       INTEGER NOT NULL,
-    partial  INTEGER NOT NULL,
-    captcha  INTEGER NOT NULL,
-    error    TEXT,
-    offers   INTEGER NOT NULL,
-    elapsed  REAL NOT NULL
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            REAL NOT NULL,
+    source        TEXT NOT NULL,
+    site          TEXT NOT NULL,
+    ok            INTEGER NOT NULL,
+    partial       INTEGER NOT NULL,
+    captcha       INTEGER NOT NULL,
+    error         TEXT,
+    offers        INTEGER NOT NULL,
+    elapsed       REAL NOT NULL,
+    device        TEXT,
+    queue_wait    REAL,
+    fetch_seconds REAL
 );
 CREATE INDEX IF NOT EXISTS ix_site_runs_ts ON site_runs (ts);
 CREATE INDEX IF NOT EXISTS ix_site_runs_site_ts ON site_runs (site, ts);
@@ -43,6 +46,14 @@ class MetricsStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.path, timeout=10) as conn:
             conn.executescript(SCHEMA)
+            # Миграция: проверяем и добавляем недостающие колонки (идемпотентно)
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(site_runs)").fetchall()}
+            if "device" not in cols:
+                conn.execute("ALTER TABLE site_runs ADD COLUMN device TEXT")
+            if "queue_wait" not in cols:
+                conn.execute("ALTER TABLE site_runs ADD COLUMN queue_wait REAL")
+            if "fetch_seconds" not in cols:
+                conn.execute("ALTER TABLE site_runs ADD COLUMN fetch_seconds REAL")
         self._initialized = True
 
     def _connect(self) -> sqlite3.Connection:
@@ -62,16 +73,25 @@ class MetricsStore:
         offers: int,
         elapsed: float,
         ts: float | None = None,
+        device: str | None = None,
+        queue_wait: float | None = None,
+        fetch_seconds: float | None = None,
     ) -> None:
         """Записывает результат отдельного запуска сайта."""
         try:
             record_ts = time.time() if ts is None else float(ts)
             err_str = str(error)[:300] if error else None
+            dev_str = str(device).strip() if device and str(device).strip() else None
+            qw_val = float(queue_wait) if queue_wait is not None else None
+            fs_val = float(fetch_seconds) if fetch_seconds is not None else None
             with self._connect() as db:
                 db.execute(
                     """
-                    INSERT INTO site_runs (ts, source, site, ok, partial, captcha, error, offers, elapsed)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO site_runs (
+                        ts, source, site, ok, partial, captcha, error, offers, elapsed,
+                        device, queue_wait, fetch_seconds
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record_ts,
@@ -83,6 +103,9 @@ class MetricsStore:
                         err_str,
                         int(offers),
                         float(elapsed),
+                        dev_str,
+                        qw_val,
+                        fs_val,
                     ),
                 )
         except Exception:
@@ -105,6 +128,12 @@ class MetricsStore:
                         is_captcha = True
                 offers_count = len(r.offers) if r.offers is not None else 0
                 err_str = str(r.error)[:300] if r.error else None
+                dev = getattr(r, "device", None)
+                dev_str = str(dev).strip() if dev and str(dev).strip() else None
+                qw = getattr(r, "queue_wait", None)
+                qw_val = float(qw) if qw is not None else None
+                fs = getattr(r, "fetch_seconds", None)
+                fs_val = float(fs) if fs is not None else None
                 rows.append((
                     batch_ts,
                     source,
@@ -115,13 +144,19 @@ class MetricsStore:
                     err_str,
                     offers_count,
                     float(r.elapsed),
+                    dev_str,
+                    qw_val,
+                    fs_val,
                 ))
             if rows:
                 with self._connect() as db:
                     db.executemany(
                         """
-                        INSERT INTO site_runs (ts, source, site, ok, partial, captcha, error, offers, elapsed)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO site_runs (
+                            ts, source, site, ok, partial, captcha, error, offers, elapsed,
+                            device, queue_wait, fetch_seconds
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         rows,
                     )
@@ -231,6 +266,103 @@ class MetricsStore:
             "last_error": tot_err_row["error"] if tot_err_row else None,
             "last_error_ts": float(tot_err_row["ts"]) if tot_err_row else None,
         }
+        return result
+
+    def summary_by_device(
+        self,
+        since_ts: float,
+        source: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Сводка по каждому телефону за период since_ts."""
+        query_parts = ["WHERE ts >= ? AND device IS NOT NULL AND device != ''"]
+        params: list[Any] = [float(since_ts)]
+        if source is not None:
+            query_parts.append("AND source = ?")
+            params.append(source)
+        where_clause = " ".join(query_parts)
+
+        with self._connect() as db:
+            cur = db.execute(
+                f"""
+                SELECT
+                    device,
+                    COUNT(*) AS runs,
+                    SUM(ok) AS ok_cnt,
+                    SUM(partial) AS partial_cnt,
+                    SUM(captcha) AS captcha_cnt,
+                    SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed_cnt,
+                    AVG(fetch_seconds) AS avg_fetch,
+                    AVG(queue_wait) AS avg_queue_wait
+                FROM site_runs
+                {where_clause}
+                GROUP BY device
+                ORDER BY device
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+        result: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            dev = str(row["device"])
+            result[dev] = {
+                "runs": int(row["runs"]),
+                "ok": int(row["ok_cnt"] or 0),
+                "partial": int(row["partial_cnt"] or 0),
+                "captcha": int(row["captcha_cnt"] or 0),
+                "failed": int(row["failed_cnt"] or 0),
+                "avg_fetch": round(float(row["avg_fetch"]), 2) if row["avg_fetch"] is not None else 0.0,
+                "avg_queue_wait": round(float(row["avg_queue_wait"]), 2) if row["avg_queue_wait"] is not None else 0.0,
+            }
+        return result
+
+    def summary_by_site_device(
+        self,
+        since_ts: float,
+        source: str | None = None,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """Сводка по парам (сайт, телефон) за период since_ts."""
+        query_parts = ["WHERE ts >= ? AND device IS NOT NULL AND device != ''"]
+        params: list[Any] = [float(since_ts)]
+        if source is not None:
+            query_parts.append("AND source = ?")
+            params.append(source)
+        where_clause = " ".join(query_parts)
+
+        with self._connect() as db:
+            cur = db.execute(
+                f"""
+                SELECT
+                    site,
+                    device,
+                    COUNT(*) AS runs,
+                    SUM(ok) AS ok_cnt,
+                    SUM(partial) AS partial_cnt,
+                    SUM(captcha) AS captcha_cnt,
+                    SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END) AS failed_cnt,
+                    AVG(fetch_seconds) AS avg_fetch,
+                    AVG(queue_wait) AS avg_queue_wait
+                FROM site_runs
+                {where_clause}
+                GROUP BY site, device
+                ORDER BY runs DESC, site, device
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+
+        result: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            key = (str(row["site"]), str(row["device"]))
+            result[key] = {
+                "runs": int(row["runs"]),
+                "ok": int(row["ok_cnt"] or 0),
+                "partial": int(row["partial_cnt"] or 0),
+                "captcha": int(row["captcha_cnt"] or 0),
+                "failed": int(row["failed_cnt"] or 0),
+                "avg_fetch": round(float(row["avg_fetch"]), 2) if row["avg_fetch"] is not None else 0.0,
+                "avg_queue_wait": round(float(row["avg_queue_wait"]), 2) if row["avg_queue_wait"] is not None else 0.0,
+            }
         return result
 
     def recent_errors(self, limit: int = 10, since_ts: float | None = None) -> list[dict[str, Any]]:

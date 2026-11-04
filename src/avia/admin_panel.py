@@ -218,6 +218,52 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
     lines.append("<b>Источники:</b>")
     lines.append(f"Люди: {u_c} · Подписки: {s_c} · Фон: {b_c}")
 
+    devs = ctx.get("devices_summary") or ctx.get("by_device") or {}
+    site_devs = ctx.get("site_devices_summary") or ctx.get("by_site_device") or {}
+
+    lines.append("")
+    if not devs:
+        lines.append("Телефоны: данных пока нет")
+    else:
+        lines.append("<b>Телефоны:</b>")
+        for dev, item in sorted(devs.items()):
+            runs = item.get("runs", 0)
+            ok = item.get("ok", 0)
+            pct = round(ok / runs * 100) if runs > 0 else 0
+            part = item.get("partial", 0)
+            capt = item.get("captcha", 0)
+            t = item.get("avg_fetch", 0.0)
+            w = item.get("avg_queue_wait", 0.0)
+            lines.append(
+                f"{escape(str(dev))}: {runs} запусков · ок {pct}% · "
+                f"неполных {part} · капч {capt} · ср. запрос {t:.1f} с · ср. ожидание {w:.1f} с"
+            )
+
+        pairs = [
+            (k, v) for k, v in site_devs.items()
+            if isinstance(v, dict) and v.get("runs", 0) >= 3
+        ]
+        if pairs:
+            pairs.sort(key=lambda item: item[1].get("runs", 0), reverse=True)
+            lines.append("")
+            lines.append("<b>Сайт × телефон:</b>")
+            for (s_name, dev_name), item in pairs:
+                runs = item.get("runs", 0)
+                ok = item.get("ok", 0)
+                pct = round(ok / runs * 100) if runs > 0 else 0
+                part = item.get("partial", 0)
+                capt = item.get("captcha", 0)
+                t = item.get("avg_fetch", 0.0)
+                w = item.get("avg_queue_wait", 0.0)
+                pair_line = (
+                    f"{escape(str(s_name))} × {escape(str(dev_name))}: {runs} запусков · "
+                    f"ок {pct}% · неполных {part} · капч {capt} · "
+                    f"ср. запрос {t:.1f} с · ср. ожидание {w:.1f} с"
+                )
+                if len("\n".join(lines)) + len(pair_line) + 2 > 3700:
+                    break
+                lines.append(pair_line)
+
     errors = ctx.get("recent_errors", [])
     lines.append("")
     lines.append("<b>Последние ошибки:</b>")

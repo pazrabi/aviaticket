@@ -211,7 +211,15 @@ async def _process_snapshot(
     return sorted(offers, key=lambda o: o.price), snap.url, partial
 
 
-async def _from_browser(site: SiteConfig, q: Query, settings: Settings) -> tuple[list[Offer], str | None, bool]:
+async def _from_browser(
+    site: SiteConfig,
+    q: Query,
+    settings: Settings,
+    *,
+    priority: int = 0,
+    weight: int = 0,
+    stats: dict | None = None,
+) -> tuple[list[Offer], str | None, bool]:
     extra = await resolve_extra(site, q)
     url = build_url(site, q, extra=extra)
 
@@ -223,6 +231,9 @@ async def _from_browser(site: SiteConfig, q: Query, settings: Settings) -> tuple
             wait_seconds=site.phone_wait_seconds,
             capture_json=site.phone_capture_json,
             wait_for=site.phone_wait_for,
+            priority=priority,
+            weight=weight,
+            stats=stats,
         )
         if snap.blocked:
             raise RuntimeError("сайт показал капчу на телефоне")
@@ -258,6 +269,7 @@ async def _run_site(
     q: Query,
     settings: Settings,
     *,
+    priority: int = 0,
     guard: SearchGuard | None = None,
 ) -> SiteResult:
     if q.return_date and not site.url_template_rt:
@@ -269,6 +281,21 @@ async def _run_site(
         )
     t0 = time.monotonic()
     g = guard if guard is not None else globals()["guard"]
+    stats: dict[str, Any] = {}
+    weight = int(getattr(site, "phone_wait_seconds", 0) or 0)
+
+    async def _fetch_browser() -> tuple[list[Offer], str | None, bool]:
+        try:
+            return await _from_browser(
+                site,
+                q,
+                settings,
+                priority=priority,
+                weight=weight,
+                stats=stats,
+            )
+        except TypeError:
+            return await _from_browser(site, q, settings)
 
     async def _fetch() -> tuple[list[Offer], str | None, bool]:
         if site.source == "api":
@@ -276,7 +303,7 @@ async def _run_site(
             return offers, page_url, False
         else:
             try:
-                return await _from_browser(site, q, settings)
+                return await _fetch_browser()
             except ParserEmptyError as exc:
                 if exc.snapshot_path and exc.snapshot_path.exists():
                     try:
@@ -290,7 +317,7 @@ async def _run_site(
                     EMPTY_RETRY_DELAY,
                 )
                 await asyncio.sleep(EMPTY_RETRY_DELAY)
-                return await _from_browser(site, q, settings)
+                return await _fetch_browser()
 
     try:
         (offers, page_url, partial), from_cache = await g.run(
@@ -307,6 +334,9 @@ async def _run_site(
             elapsed=time.monotonic() - t0,
             partial=partial,
             cached=from_cache,
+            device=stats.get("device"),
+            queue_wait=stats.get("queue_wait"),
+            fetch_seconds=stats.get("fetch_seconds"),
         )
     except DroidhubError as e:
         log.warning("Ошибка droidhub на сайте %s: %s", site.name, e)
@@ -321,6 +351,9 @@ async def _run_site(
             partial=False,
             cached=False,
             captcha=is_captcha,
+            device=stats.get("device"),
+            queue_wait=stats.get("queue_wait"),
+            fetch_seconds=stats.get("fetch_seconds"),
         )
     except ParserEmptyError as e:
         log.warning("Парсер сайта %s вернул 0 вариантов: %s", site.name, e)
@@ -334,6 +367,9 @@ async def _run_site(
             partial=False,
             cached=False,
             captcha=False,
+            device=stats.get("device"),
+            queue_wait=stats.get("queue_wait"),
+            fetch_seconds=stats.get("fetch_seconds"),
         )
     except Exception as e:
         log.exception("Ошибка при поиске на сайте %s: %s", site.name, e)
@@ -349,6 +385,9 @@ async def _run_site(
             partial=False,
             cached=False,
             captcha=is_captcha,
+            device=stats.get("device"),
+            queue_wait=stats.get("queue_wait"),
+            fetch_seconds=stats.get("fetch_seconds"),
         )
 
 
@@ -356,6 +395,7 @@ async def search(
     q: Query,
     settings: Settings,
     *,
+    priority: int = 0,
     guard: SearchGuard | None = None,
 ) -> list[SiteResult]:
     sites = [s for s in settings.sites if s.enabled]
@@ -372,6 +412,6 @@ async def search(
                 error="для этого сайта обратные билеты пока не поддерживаются",
             )
         async with sem:
-            return await _run_site(s, q, settings, guard=g)
+            return await _run_site(s, q, settings, priority=priority, guard=g)
 
     return await asyncio.gather(*(guarded(s) for s in sites))

@@ -586,3 +586,74 @@ async def test_edit_message_not_modified_handled(tmp_path):
     ans = [p for m, p in bot.calls if m == "answerCallbackQuery"]
     assert len(ans) == 1
     assert ans[0]["callback_query_id"] == "cq_not_mod"
+
+
+def test_build_parse_telephones_and_site_device():
+    """Раздел Парсинг корректно отображает блоки Телефоны и Сайт × телефон."""
+    ctx = {
+        "summary": {
+            "_total": {"runs": 20, "ok": 18, "partial": 1, "captcha": 1, "failed": 2, "avg_elapsed": 3.0, "avg_offers": 10.0},
+            "tutu": {"runs": 10, "ok": 9, "partial": 0, "captcha": 1, "failed": 1, "avg_elapsed": 3.5, "avg_offers": 12.0},
+            "onetwotrip": {"runs": 10, "ok": 9, "partial": 1, "captcha": 0, "failed": 1, "avg_elapsed": 2.5, "avg_offers": 8.0},
+        },
+        "devices_summary": {
+            "realme": {
+                "runs": 12,
+                "ok": 10,
+                "partial": 1,
+                "captcha": 1,
+                "failed": 2,
+                "avg_fetch": 3.2,
+                "avg_queue_wait": 0.4,
+            },
+            "redmi": {
+                "runs": 8,
+                "ok": 8,
+                "partial": 0,
+                "captcha": 0,
+                "failed": 0,
+                "avg_fetch": 2.1,
+                "avg_queue_wait": 0.1,
+            },
+        },
+        "site_devices_summary": {
+            ("tutu", "realme"): {
+                "runs": 10,
+                "ok": 9,
+                "partial": 0,
+                "captcha": 1,
+                "failed": 1,
+                "avg_fetch": 3.5,
+                "avg_queue_wait": 0.4,
+            },
+            ("onetwotrip", "redmi"): {
+                "runs": 8,
+                "ok": 8,
+                "partial": 0,
+                "captcha": 0,
+                "failed": 0,
+                "avg_fetch": 2.1,
+                "avg_queue_wait": 0.1,
+            },
+            ("onetwotrip", "realme"): {
+                "runs": 2,  # < 3 запусков, не должно попасть в список
+                "ok": 1,
+                "partial": 1,
+                "captcha": 0,
+                "failed": 1,
+                "avg_fetch": 2.0,
+                "avg_queue_wait": 0.5,
+            },
+        },
+        "counts_by_source": {"user": 15, "sub": 5, "bg": 0},
+        "recent_errors": [],
+    }
+
+    txt = admin_panel.build_parse(ctx, "24h")
+    assert "realme: 12 запусков · ок 83% · неполных 1 · капч 1 · ср. запрос 3.2 с · ср. ожидание 0.4 с" in txt
+    assert "redmi: 8 запусков · ок 100% · неполных 0 · капч 0 · ср. запрос 2.1 с · ср. ожидание 0.1 с" in txt
+    assert "tutu × realme: 10 запусков · ок 90% · неполных 0 · капч 1 · ср. запрос 3.5 с · ср. ожидание 0.4 с" in txt
+    assert "onetwotrip × redmi: 8 запусков · ок 100% · неполных 0 · капч 0 · ср. запрос 2.1 с · ср. ожидание 0.1 с" in txt
+    # Пара с 2 запусками не должна отображаться
+    assert "onetwotrip × realme" not in txt
+    assert len(txt) <= 3800
