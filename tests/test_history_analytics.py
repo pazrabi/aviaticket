@@ -972,3 +972,97 @@ def test_price_curve_multi_route_and_baskets(tmp_path):
     assert curve["0-7"]["samples"] == 2
     assert curve["8-14"]["samples"] == 2
 
+
+def test_collect_candidates_filters_and_sorting(tmp_path):
+    """collect_candidates фильтрует по depart, seen_days, recheck_seconds и сортирует по популярности/давности."""
+    h = PriceHistory(tmp_path / "h.sqlite")
+    now_ts = datetime(2026, 11, 20, 12, 0).timestamp()
+    today = date(2026, 11, 20)
+
+    # 1. Маршрут в прошлом (depart < today): должен быть исключён
+    q_past = Query(origin="MOW", destination="AER", depart=date(2026, 11, 19))
+    h.annotate(q_past, _make_res([Offer("s", 5000, offer_id="past1")]), now=now_ts - 86400, search_id="spast")
+
+    # 2. Маршрут старше seen_days (14 дней): должен быть исключён
+    q_old = Query(origin="MOW", destination="KZN", depart=date(2026, 12, 1))
+    h.annotate(q_old, _make_res([Offer("s", 4000, offer_id="old1")]), now=now_ts - 15 * 86400, search_id="sold")
+
+    # 3. Маршрут слишком свежий (< recheck_seconds = 6ч): должен быть исключён
+    q_fresh = Query(origin="MOW", destination="OVB", depart=date(2026, 12, 5))
+    h.annotate(q_fresh, _make_res([Offer("s", 9000, offer_id="fresh1")]), now=now_ts - 2 * 3600, search_id="sfresh")
+
+    # 4. Валидный маршрут A: 1 поиск, проверен 10 часов назад
+    q_a = Query(origin="MOW", destination="LED", depart=date(2026, 12, 1))
+    h.annotate(q_a, _make_res([Offer("s", 3000, offer_id="a1")]), now=now_ts - 10 * 3600, search_id="sa1")
+
+    # 5. Валидный маршрут B: 3 поиска, последний проверен 8 часов назад (более популярный, чем A)
+    q_b = Query(origin="KUF", destination="EVN", depart=date(2026, 12, 10), return_date=date(2026, 12, 20), adults=2)
+    h.annotate(q_b, _make_res([Offer("s", 15000, offer_id="b1")]), now=now_ts - 20 * 3600, search_id="sb1")
+    h.annotate(q_b, _make_res([Offer("s", 16000, offer_id="b2")]), now=now_ts - 15 * 3600, search_id="sb2")
+    h.annotate(q_b, _make_res([Offer("s", 15500, offer_id="b3")]), now=now_ts - 8 * 3600, search_id="sb3")
+
+    # 6. Валидный маршрут C: 1 поиск, проверен 20 часов назад (такая же популярность как A, но обновлялся давнее)
+    q_c = Query(origin="SVX", destination="AER", depart=date(2026, 12, 15))
+    h.annotate(q_c, _make_res([Offer("s", 7000, offer_id="c1")]), now=now_ts - 20 * 3600, search_id="sc1")
+
+    # Запрашиваем кандидатов
+    candidates = h.collect_candidates(limit=5, today=today, now=now_ts, recheck_seconds=6 * 3600, seen_days=14)
+
+    # Проверяем, что невалидные исключены
+    destinations = [c.destination for c in candidates]
+    assert "AER" not in destinations or "MOW" not in [c.origin for c in candidates if c.destination == "AER"]
+    assert "KZN" not in destinations
+    assert "OVB" not in destinations
+
+    # Ожидаемый порядок:
+    # 1-й: B (3 поиска)
+    # 2-й: C (1 поиск, last_obs 20ч назад)
+    # 3-й: A (1 поиск, last_obs 10ч назад)
+    assert len(candidates) == 3
+    assert candidates[0].destination == "EVN"
+    assert candidates[0].origin == "KUF"
+    assert candidates[0].return_date == date(2026, 12, 20)
+    assert candidates[0].adults == 2
+    assert candidates[0].currency == "RUB"
+
+    assert candidates[1].destination == "AER"
+    assert candidates[1].origin == "SVX"
+
+    assert candidates[2].destination == "LED"
+    assert candidates[2].origin == "MOW"
+
+    # Проверяем limit
+    limited = h.collect_candidates(limit=1, today=today, now=now_ts, recheck_seconds=6 * 3600, seen_days=14)
+    assert len(limited) == 1
+    assert limited[0].destination == "EVN"
+
+
+def test_count_searches_since(tmp_path):
+    """count_searches_since считает уникальные замеры (по search_id и минутам) с указанной отсечки."""
+    h = PriceHistory(tmp_path / "h.sqlite")
+    now_ts = 100000.0
+    q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 1))
+
+    # Поиск 1: 2 билета с search_id="s1"
+    h.annotate(
+        q,
+        _make_res([Offer("s", 3000, offer_id="o1"), Offer("s", 3200, offer_id="o2")]),
+        now=now_ts - 500,
+        search_id="s1",
+    )
+
+    # Поиск 2: search_id="s2"
+    h.annotate(q, _make_res([Offer("s", 3100, offer_id="o3")]), now=now_ts - 300, search_id="s2")
+
+    # Поиск 3: без search_id (группировка по минуте)
+    h.annotate(q, _make_res([Offer("s", 3300, offer_id="o4")]), now=now_ts - 100, search_id=None)
+
+    # Поиск 4: старый (до отсечки)
+    h.annotate(q, _make_res([Offer("s", 3000, offer_id="o0")]), now=now_ts - 2000, search_id="sold")
+
+    assert h.count_searches_since(now_ts - 1000) == 3
+    assert h.count_searches_since(now_ts - 400) == 2
+    assert h.count_searches_since(now_ts - 50) == 0
+    assert h.count_searches_since(0) == 4
+
+

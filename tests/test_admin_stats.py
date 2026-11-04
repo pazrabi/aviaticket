@@ -239,3 +239,52 @@ async def test_admin_stats_error_resilience(tmp_path, monkeypatch):
     assert "Мак работал сегодня:" in text
     # Сбойный блок не выведен, но команда не упала
     assert "Популярные маршруты" not in text
+
+
+@pytest.mark.asyncio
+async def test_admin_stats_bg_collect_disabled(tmp_path):
+    """При bg_collect=False в /stats выводится 'Фоновый сбор: выключен'."""
+    bot = make_bot(tmp_path, allowed_ids={1})
+    bot.users.register(1, username="admin_user")
+
+    msg = {
+        "chat": {"id": 1, "type": "private"},
+        "from": {"id": 1, "username": "admin_user"},
+        "text": "/stats",
+    }
+    await bot.handle(msg)
+
+    send_calls = [p for m, p in bot.calls if m == "sendMessage"]
+    assert len(send_calls) == 1
+    assert "Фоновый сбор: выключен" in send_calls[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_admin_stats_bg_collect_enabled(tmp_path):
+    """При bg_collect=True в /stats выводится 'Фоновый сбор: сегодня N из M'."""
+    storage = tmp_path / "storage"
+    storage.mkdir(parents=True, exist_ok=True)
+    settings = Settings(
+        sites=[],
+        tg_token="secret_token_123",
+        tg_allowed_ids={1},
+        storage_dir=storage,
+        bg_collect=True,
+        bg_collect_max_per_day=50,
+    )
+    bot = FakeBot(settings)
+    bot.users.register(1, username="admin_user")
+    assert bot.bg_collector is not None
+    bot.bg_collector._done_today = 7
+
+    msg = {
+        "chat": {"id": 1, "type": "private"},
+        "from": {"id": 1, "username": "admin_user"},
+        "text": "/stats",
+    }
+    await bot.handle(msg)
+
+    send_calls = [p for m, p in bot.calls if m == "sendMessage"]
+    assert len(send_calls) == 1
+    assert "Фоновый сбор: сегодня 7 из 50" in send_calls[0]["text"]
+
