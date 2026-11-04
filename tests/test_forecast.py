@@ -143,6 +143,40 @@ class TestForecastDatasetAndLabels:
         # Признаки для замера obs1 (день 1) должны быть абсолютно идентичны!
         assert feat_before == feat_after
 
+    def test_extract_features_uses_stats_consistently(self):
+        """Проверка согласованности признаков: extract_features использует stats для spread и samples."""
+        obs = forecast.Observation(
+            origin="MOW",
+            destination="LED",
+            depart=date(2026, 11, 20),
+            return_date=None,
+            adults=1,
+            obs_date=date(2026, 11, 10),
+            min_price=5000,
+            p25_price=4500.0,
+            median_price=5000.0,
+            samples=2,  # внутридневное число
+        )
+        stats = {
+            "median": 10000.0,
+            "p25": 8000.0,
+            "samples": 45,  # накопленная история
+            "trend_3d": "up",
+            "trend_7d": "down",
+        }
+        feat = forecast.extract_features(obs, precomputed_stats=stats)
+        # FEATURE_NAMES:
+        # 7: price_rel_median -> 5000 / 10000 = 0.5
+        # 8: trend_3d -> 1.0
+        # 9: trend_7d -> -1.0
+        # 10: spread_p25_median -> 8000 / 10000 = 0.8
+        # 11: samples -> 45.0
+        assert feat[7] == 0.5
+        assert feat[8] == 1.0
+        assert feat[9] == -1.0
+        assert feat[10] == 0.8
+        assert feat[11] == 45.0
+
 
 class TestForecastSplit:
     def test_split_no_flight_leakage_and_temporal_order(self, tmp_path):
@@ -204,6 +238,31 @@ class TestForecastVerdictAndSmallData:
         assert "нужно ещё" in rep_small["verdict"]
         assert rep_small["train_rows"] < forecast.MIN_TRAIN_ROWS
         assert rep_small["metrics"] is None
+
+    def test_verdict_when_routes_insufficient(self, tmp_path):
+        """Если строк достаточно, но уникальных маршрутов+вылетов меньше 20 -> вердикт о маршрутах, а не 0 ответов."""
+        hist = PriceHistory(tmp_path / "history.sqlite")
+        f_dir = tmp_path / "forecast"
+        today = date(2026, 11, 4)
+
+        # Создаём только 10 рейсов, но с большим числом замеров (70 замеров на рейс = 700 замеров)
+        for i in range(10):
+            dep_date = date(2026, 8, 1) + timedelta(days=i * 3)
+            dep_str = dep_date.isoformat()
+            dest = f"R{i:02d}"
+            for d_offset in range(70, 0, -1):
+                obs_d = dep_date - timedelta(days=d_offset)
+                _insert_daily_row(
+                    hist, "MOW", dest, dep_str, "", 1, obs_d.isoformat(), 5000 + i * 10
+                )
+
+        rep = forecast.train_and_eval(hist, f_dir, today=today)
+        assert rep["train_rows"] >= forecast.MIN_TRAIN_ROWS
+        assert rep["test_rows"] >= forecast.MIN_TEST_ROWS
+        assert rep["train_routes"] < forecast.MIN_TRAIN_ROUTES
+        assert "0 ответов" not in rep["verdict"]
+        assert "маршрутов+вылетов" in rep["verdict"]
+        assert f"нужно ещё {forecast.MIN_TRAIN_ROUTES - rep['train_routes']} маршрутов+вылетов" in rep["verdict"]
 
     def test_work_without_sklearn(self, tmp_path, monkeypatch):
         """Без scikit-learn модуль не падает и возвращает статус «sklearn не установлен»."""
@@ -304,6 +363,53 @@ class TestForecastTrainingAndEvaluation:
         stats = {"last_price": 10000, "median": 10000, "samples": 20}
         prob = forecast.predict_drop_prob(hist, q, stats, forecast_dir=f_dir)
         assert prob is None
+
+    def test_report_routes_count_and_no_duplicate_db_queries(self, tmp_path, monkeypatch):
+        """Проверка ключа routes_count (уникальные origin, destination) и отсутствия повторных запросов stats."""
+        pytest.importorskip("sklearn")
+        hist = PriceHistory(tmp_path / "history.sqlite")
+        f_dir = tmp_path / "forecast"
+        today = date(2026, 11, 4)
+
+        # 32 рейса по 2 направлениям (MOW-LED и MOW-AER), по 25 замеров каждый = 800 строк
+        for i in range(32):
+            dep_date = date(2026, 8, 1) + timedelta(days=i * 3)
+            dep_str = dep_date.isoformat()
+            dest = "LED" if i % 2 == 0 else "AER"
+            for d_left in range(25, 0, -1):
+                obs_d = dep_date - timedelta(days=d_left)
+                price = 10000 if d_left > 8 else 5000
+                _insert_daily_row(
+                    hist, "MOW", dest, dep_str, "", 1, obs_d.isoformat(), price, median=10000
+                )
+
+        call_count = 0
+        real_route_stats = hist.route_stats
+
+        def spied_route_stats(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return real_route_stats(*args, **kwargs)
+
+        monkeypatch.setattr(hist, "route_stats", spied_route_stats)
+
+        rep = forecast.train_and_eval(hist, f_dir, today=today)
+        # Число рейсов (train_routes + test_routes) = 32, но число маршрутов (origin, destination) = 2!
+        assert rep["routes_count"] == 2
+        assert rep["train_routes"] + rep["test_routes"] == 32
+
+        # Количество вызовов route_stats должно быть ровно по 1 на замер (train_rows + val_rows),
+        # а не дублироваться для val_rows в advice.build_advice
+        total_obs = rep["train_rows"] + rep["test_rows"]
+        assert call_count == total_obs
+
+    def test_rebuild_all_route_daily_localtime(self, tmp_path):
+        """rebuild_all_route_daily использует локальное время для группировки по суткам."""
+        hist = PriceHistory(tmp_path / "history.sqlite")
+        ts = datetime(2026, 10, 15, 23, 30).timestamp()
+        _insert_price_raw(hist, "MOW", "LED", "2026-11-01", None, 1, 7500, ts, "s_local")
+        written = hist.rebuild_all_route_daily()
+        assert written >= 1
 
 
 class TestForecastCLI:

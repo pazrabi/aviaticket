@@ -61,10 +61,31 @@ class Observation:
         return (self.origin, self.destination, self.depart.isoformat(), ret_str, self.adults)
 
 
+def _query_route_stats(history: PriceHistory | None, obs: Observation) -> dict | None:
+    """Запрашивает срез статистики маршрута на момент замера obs без утечки будущего."""
+    if history is None:
+        return None
+    q = Query(
+        origin=obs.origin,
+        destination=obs.destination,
+        depart=obs.depart,
+        return_date=obs.return_date,
+        adults=obs.adults,
+    )
+    obs_ts = datetime.combine(obs.obs_date, dt_time(23, 59, 59)).timestamp()
+    try:
+        return history.route_stats(q, now=obs_ts)
+    except Exception:
+        return None
+
+
+_UNSET = object()
+
+
 def extract_features(
     obs: Observation,
     history: PriceHistory | None = None,
-    precomputed_stats: dict | None = None,
+    precomputed_stats: Any = _UNSET,
 ) -> list[float]:
     """Извлекает числовые признаки для замера строго без утечки будущих данных."""
     days_to_dep = (obs.depart - obs.obs_date).days
@@ -75,28 +96,26 @@ def extract_features(
     is_w_dep = 1.0 if dep_w >= 5 else 0.0
     is_w_obs = 1.0 if obs_w >= 5 else 0.0
 
-    # Медиана и тренды маршрута на момент замера (без заглядывания в будущее)
-    stats = precomputed_stats
-    if stats is None and history is not None:
-        q = Query(
-            origin=obs.origin,
-            destination=obs.destination,
-            depart=obs.depart,
-            return_date=obs.return_date,
-            adults=obs.adults,
-        )
-        obs_ts = datetime.combine(obs.obs_date, dt_time(23, 59, 59)).timestamp()
-        try:
-            stats = history.route_stats(q, now=obs_ts)
-        except Exception:
-            stats = None
+    # Медиана, тренды, разброс и число замеров маршрута на момент замера (без заглядывания в будущее)
+    if precomputed_stats is not _UNSET:
+        stats = precomputed_stats
+    elif history is not None:
+        stats = _query_route_stats(history, obs)
+    else:
+        stats = None
 
     if stats and stats.get("median") and stats["median"] > 0:
         price_rel_med = float(obs.min_price) / float(stats["median"])
+        p25_val = stats.get("p25")
+        if p25_val is None or p25_val <= 0:
+            p25_val = stats["median"]
+        spread = float(p25_val) / float(stats["median"])
     elif obs.median_price > 0:
         price_rel_med = float(obs.min_price) / float(obs.median_price)
+        spread = float(obs.p25_price) / float(obs.median_price)
     else:
         price_rel_med = 1.0
+        spread = 1.0
 
     t3 = stats.get("trend_3d") if stats else None
     trend_3d = 1.0 if t3 == "up" else (-1.0 if t3 == "down" else 0.0)
@@ -104,8 +123,10 @@ def extract_features(
     t7 = stats.get("trend_7d") if stats else None
     trend_7d = 1.0 if t7 == "up" else (-1.0 if t7 == "down" else 0.0)
 
-    spread = (obs.p25_price / obs.median_price) if obs.median_price > 0 else 1.0
-    samples_val = float(max(1, obs.samples))
+    if stats and stats.get("samples") is not None:
+        samples_val = float(max(1, stats["samples"]))
+    else:
+        samples_val = float(max(1, obs.samples))
 
     if obs.return_date:
         trip_days = float(max(0, (obs.return_date - obs.depart).days))
@@ -355,6 +376,7 @@ def train_and_eval(
             "test_rows": 0,
             "train_routes": 0,
             "test_routes": 0,
+            "routes_count": 0,
             "departed_flights_count": departed_cnt,
             "verdict": "sklearn не установлен",
             "metrics": None,
@@ -370,14 +392,19 @@ def train_and_eval(
     val_rows = len(val_obs)
     train_routes = len({obs.flight_key for obs in train_obs})
     val_routes = len({obs.flight_key for obs in val_obs})
+    routes_count = len({(obs.origin, obs.destination) for obs in observations})
     departed_cnt = history.count_departed_flights(today_d)
 
     # 3. Проверка порогов достаточности данных
     if train_rows < MIN_TRAIN_ROWS or train_routes < MIN_TRAIN_ROUTES or val_rows < MIN_TEST_ROWS:
-        needed = max(0, MIN_TRAIN_ROWS - train_rows)
-        if needed == 0 and val_rows < MIN_TEST_ROWS:
-            needed = max(0, MIN_TEST_ROWS - val_rows)
-        verdict = f"рано: нужно ещё {needed} ответов"
+        if train_rows < MIN_TRAIN_ROWS:
+            verdict = f"рано: нужно ещё {MIN_TRAIN_ROWS - train_rows} ответов"
+        elif val_rows < MIN_TEST_ROWS:
+            verdict = f"рано: нужно ещё {MIN_TEST_ROWS - val_rows} ответов в проверке"
+        elif train_routes < MIN_TRAIN_ROUTES:
+            verdict = f"рано: нужно ещё {MIN_TRAIN_ROUTES - train_routes} маршрутов+вылетов"
+        else:
+            verdict = "рано: недостаточно данных"
         report = {
             "trained_at": datetime.now().isoformat(timespec="seconds"),
             "samples_total": len(observations),
@@ -385,6 +412,7 @@ def train_and_eval(
             "test_rows": val_rows,
             "train_routes": train_routes,
             "test_routes": val_routes,
+            "routes_count": routes_count,
             "departed_flights_count": departed_cnt,
             "verdict": verdict,
             "metrics": None,
@@ -393,11 +421,19 @@ def train_and_eval(
         _remove_model(f_dir)
         return report
 
-    # 4. Извлекаем признаки
-    X_train = [extract_features(obs, history=history) for obs in train_obs]
+    # 4. Извлекаем признаки (предварительный расчёт stats без дублирования запросов)
+    train_stats = [_query_route_stats(history, obs) for obs in train_obs]
+    X_train = [
+        extract_features(obs, history=history, precomputed_stats=st)
+        for obs, st in zip(train_obs, train_stats)
+    ]
     y_train = [obs.label for obs in train_obs]
 
-    X_val = [extract_features(obs, history=history) for obs in val_obs]
+    val_stats = [_query_route_stats(history, obs) for obs in val_obs]
+    X_val = [
+        extract_features(obs, history=history, precomputed_stats=st)
+        for obs, st in zip(val_obs, val_stats)
+    ]
     y_val = [obs.label for obs in val_obs]
 
     # 5. Обучаем HistGradientBoostingClassifier
@@ -415,25 +451,13 @@ def train_and_eval(
     # Базовая 1: «всегда брать сейчас» (прогноз «не упадёт» -> 0)
     y_pred_b1 = [0] * len(val_obs)
 
-    # Базовая 2: правила из advice.py
+    # Базовая 2: правила из advice.py (используем уже вычисленный val_stats)
     from . import advice
 
     y_pred_b2: list[int] = []
-    for obs in val_obs:
-        q = Query(
-            origin=obs.origin,
-            destination=obs.destination,
-            depart=obs.depart,
-            return_date=obs.return_date,
-            adults=obs.adults,
-        )
-        obs_ts = datetime.combine(obs.obs_date, dt_time(23, 59, 59)).timestamp()
-        try:
-            stats = history.route_stats(q, now=obs_ts)
-        except Exception:
-            stats = None
+    for obs, st in zip(val_obs, val_stats):
         d = (obs.depart - obs.obs_date).days
-        adv = advice.build_advice(stats, d)
+        adv = advice.build_advice(st, d)
         # Переводим совет «ждать» в 1 («упадёт»), остальное — 0
         if adv and adv.verdict == "wait":
             y_pred_b2.append(1)
@@ -459,6 +483,7 @@ def train_and_eval(
         "test_rows": val_rows,
         "train_routes": train_routes,
         "test_routes": val_routes,
+        "routes_count": routes_count,
         "departed_flights_count": departed_cnt,
         "verdict": verdict,
         "metrics": {
@@ -514,6 +539,12 @@ def predict_drop_prob(
     if dep_d is None:
         return None
     ret_d = _normalize_date(q.return_date)
+
+    if stats is None and history is not None:
+        try:
+            stats = history.route_stats(q, now=now_ts)
+        except Exception:
+            stats = None
 
     min_p = stats.get("last_price") or stats.get("min") or 0 if stats else 0
     p25_p = float(stats.get("p25") or min_p) if stats else float(min_p)

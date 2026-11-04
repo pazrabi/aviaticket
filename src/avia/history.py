@@ -284,7 +284,7 @@ class PriceHistory:
         """Пересчитывает сводки route_daily для всех дней, встречающихся в price_history."""
         with self._connect() as db:
             rows = db.execute(
-                "SELECT DISTINCT DATE(observed_at, 'unixepoch') FROM price_history"
+                "SELECT DISTINCT DATE(observed_at, 'unixepoch', 'localtime') FROM price_history"
             ).fetchall()
         total = 0
         for r in rows:
