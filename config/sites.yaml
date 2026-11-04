@@ -74,7 +74,8 @@ sites:
     id_resolver: yandex
     enabled: true
     phone: realme
-    phone_wait_seconds: 30
+    phone_wait_seconds: 45
+    phone_wait_for: '"cont":null'   # Яндекс отдаёт выдачу кусками; хаб сам считает конец раньше времени, ждём финальный кусок
     phone_capture_json: ["/api/avia/search/results"]
     url_template: "https://travel.yandex.ru/avia/search/result/?adult_seats={adults}&children_seats=0&fromId={origin_id}&infant_seats=0&klass=economy&oneway=1&salesChannel=B2C&toId={destination_id}&when={date_iso}"
     url_template_rt: "https://travel.yandex.ru/avia/search/result/?adult_seats={adults}&children_seats=0&fromId={origin_id}&infant_seats=0&klass=economy&oneway=2&return_date={date_iso_ret}&salesChannel=B2C&toId={destination_id}&when={date_iso}"
