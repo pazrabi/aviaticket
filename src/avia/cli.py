@@ -13,6 +13,16 @@ from .pipeline import search
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "forecast-train":
+        import json
+        from . import forecast
+        from .history import PriceHistory
+        s = load_settings()
+        hist = PriceHistory(s.storage_dir / "history.sqlite")
+        rep = forecast.train_and_eval(hist, s.forecast_dir)
+        print(json.dumps(rep, indent=2, ensure_ascii=False))
+        return
+
     try:
         q = parse_query(" ".join(a for a in sys.argv[1:] if not a.startswith("--")))
     except ParseError as e:

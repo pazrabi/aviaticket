@@ -280,6 +280,42 @@ class PriceHistory:
 
         return total_written
 
+    def rebuild_all_route_daily(self) -> int:
+        """Пересчитывает сводки route_daily для всех дней, встречающихся в price_history."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT DISTINCT DATE(observed_at, 'unixepoch') FROM price_history"
+            ).fetchall()
+        total = 0
+        for r in rows:
+            if r and r[0]:
+                try:
+                    d = date.fromisoformat(r[0])
+                    total += self.rebuild_route_daily(d)
+                except Exception:
+                    pass
+        return total
+
+    def count_departed_flights(self, today: date | None = None) -> int:
+        """Число различных рейсов (маршрут+вылет) с depart < today в route_daily/price_history."""
+        today_date = _normalize_date(today) or date.today()
+        today_str = today_date.isoformat()
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT COUNT(DISTINCT origin || '|' || destination || '|' || depart || '|' || return_date || '|' || adults) "
+                "FROM route_daily WHERE depart < ?",
+                (today_str,),
+            ).fetchone()
+            cnt = int(row[0]) if row and row[0] is not None else 0
+            if cnt == 0:
+                row2 = db.execute(
+                    "SELECT COUNT(DISTINCT origin || '|' || destination || '|' || depart || '|' || COALESCE(return_date, '') || '|' || adults) "
+                    "FROM price_history WHERE depart < ?",
+                    (today_str,),
+                ).fetchone()
+                cnt = int(row2[0]) if row2 and row2[0] is not None else 0
+            return cnt
+
     def prune(self, keep_days: int = 45, now: float | None = None) -> int:
         """Сворачивает старые дни в route_daily и удаляет сырые записи старше keep_days."""
         now = time.time() if now is None else float(now)
@@ -401,7 +437,7 @@ class PriceHistory:
             "gaps": merged_gaps,
         }
 
-    def route_stats(self, q: Query) -> dict | None:
+    def route_stats(self, q: Query, now: float | None = None) -> dict | None:
         """Возвращает аналитику по маршруту: samples, min, median, p25, last_price, percentile_of_last, trends, volatility."""
         depart_d = _normalize_date(q.depart)
         depart_str = depart_d.isoformat() if depart_d else str(q.depart)
@@ -409,29 +445,48 @@ class PriceHistory:
         ret_str = ret_d.isoformat() if ret_d else None
         ret_daily = ret_str or ""
 
+        now_ts = float(now) if now is not None else None
+        day_limit = datetime.fromtimestamp(now_ts).date().isoformat() if now_ts is not None else None
+
         with self._connect() as db:
             if ret_str is None:
                 cond_ret = "return_date IS NULL"
+                params: list[object] = [q.origin, q.destination, depart_str, q.adults]
+                time_cond = ""
+                if now_ts is not None:
+                    time_cond = " AND observed_at <= ?"
+                    params.append(now_ts)
                 raw_rows = db.execute(
                     "SELECT price, search_id, observed_at FROM price_history "
-                    f"WHERE origin = ? AND destination = ? AND depart = ? AND {cond_ret} AND adults = ? "
+                    f"WHERE origin = ? AND destination = ? AND depart = ? AND {cond_ret} AND adults = ?{time_cond} "
                     "ORDER BY observed_at ASC",
-                    (q.origin, q.destination, depart_str, q.adults),
+                    tuple(params),
                 ).fetchall()
             else:
                 cond_ret = "return_date = ?"
+                params = [q.origin, q.destination, depart_str, ret_str, q.adults]
+                time_cond = ""
+                if now_ts is not None:
+                    time_cond = " AND observed_at <= ?"
+                    params.append(now_ts)
                 raw_rows = db.execute(
                     "SELECT price, search_id, observed_at FROM price_history "
-                    f"WHERE origin = ? AND destination = ? AND depart = ? AND {cond_ret} AND adults = ? "
+                    f"WHERE origin = ? AND destination = ? AND depart = ? AND {cond_ret} AND adults = ?{time_cond} "
                     "ORDER BY observed_at ASC",
-                    (q.origin, q.destination, depart_str, ret_str, q.adults),
+                    tuple(params),
                 ).fetchall()
+
+            daily_params: list[object] = [q.origin, q.destination, depart_str, ret_daily, q.adults]
+            daily_time_cond = ""
+            if day_limit is not None:
+                daily_time_cond = " AND day <= ?"
+                daily_params.append(day_limit)
 
             daily_rows = db.execute(
                 "SELECT day, min_price, p25_price, median_price, samples FROM route_daily "
-                "WHERE origin = ? AND destination = ? AND depart = ? AND return_date = ? AND adults = ? "
+                f"WHERE origin = ? AND destination = ? AND depart = ? AND return_date = ? AND adults = ?{daily_time_cond} "
                 "ORDER BY day ASC",
-                (q.origin, q.destination, depart_str, ret_daily, q.adults),
+                tuple(daily_params),
             ).fetchall()
 
         # Группируем сырые строки по замерам поиска

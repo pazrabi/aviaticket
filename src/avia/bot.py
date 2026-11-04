@@ -13,7 +13,7 @@ from typing import Any
 
 import httpx
 
-from . import admin_panel, advice, analytics, charts
+from . import admin_panel, advice, analytics, charts, forecast
 from .backup import backup_all, list_backups
 from .bg_collector import BackgroundCollector
 from .config import Settings, load_settings
@@ -78,6 +78,7 @@ class Bot:
             log.exception("метрики недоступны")
             self.metrics = None
         self.last_backup_at: float | None = self._find_last_backup_time()
+        self._last_forecast_train: float = 0.0
         self._gate = PriorityGate(settings.max_parallel_searches)
         self._active_searches: int = 0
         self.history = PriceHistory(settings.storage_dir / "history.sqlite")
@@ -236,6 +237,13 @@ class Bot:
                             dep_d = None
                     d = (dep_d - date.today()).days if dep_d is not None else None
                     adv = advice.build_advice(stats, d, curve=curve)
+                    if adv is not None and self.s.forecast_enabled and self.history:
+                        try:
+                            prob = forecast.predict_drop_prob(self.history, q, stats, self.s.forecast_dir)
+                            if prob is not None:
+                                adv.model_prob = prob
+                        except Exception:
+                            log.exception("ошибка прогноза модели")
                 except Exception:
                     adv = None
 
@@ -669,6 +677,9 @@ class Bot:
             elif section == "backup":
                 ctx = await asyncio.to_thread(self._collect_backup_data)
                 text = admin_panel.build_backups(ctx)
+            elif section == "forecast":
+                fc = forecast.load_report(self.s.forecast_dir) if self.s.forecast_enabled else None
+                text = admin_panel.build_forecast({"forecast": fc})
             else:
                 text = admin_panel.build_home()
                 keyboard = admin_panel.make_home_keyboard()
@@ -682,6 +693,7 @@ class Bot:
                 "tickets": "🎫 <b>Билеты</b>",
                 "subs": "🔔 <b>Подписки</b>",
                 "backup": "🛟 <b>Бэкапы</b>",
+                "forecast": "🔮 <b>Прогноз</b>",
             }
             title = headers.get(section, "🛠 <b>Панель разработчика</b>")
             text = f"{title}\n\n⚠️ данные недоступны"
@@ -857,6 +869,24 @@ class Bot:
 
         sites = self.history.site_share(days=7, now=now) if self.history else []
 
+        fc = None
+        if self.s.forecast_enabled:
+            try:
+                fc = forecast.load_report(self.s.forecast_dir)
+                if fc is None and self.history:
+                    departed = self.history.count_departed_flights()
+                    fc = {
+                        "trained_at": None,
+                        "train_rows": 0,
+                        "test_rows": 0,
+                        "routes_count": 0,
+                        "departed_flights_count": departed,
+                        "verdict": "рано: нужно ещё 500 ответов",
+                        "metrics": None,
+                    }
+            except Exception:
+                fc = None
+
         return {
             "routes_count": t_overview.get("routes_count", 0),
             "searches_count": t_overview.get("searches_count", 0),
@@ -869,6 +899,7 @@ class Bot:
                 "total": t_overview.get("baggage_total", 0),
             },
             "site_share": sites,
+            "forecast": fc,
         }
 
     def _collect_subs_data(self) -> dict[str, Any]:
@@ -1027,11 +1058,43 @@ class Bot:
                         await asyncio.to_thread(self.backup_now)
                     except Exception:
                         log.exception("ошибка ежедневного бэкапа")
+
+                if self.s.forecast_enabled and self.history:
+                    if self._should_run_forecast_training():
+                        try:
+                            await asyncio.to_thread(
+                                forecast.train_and_eval,
+                                self.history,
+                                self.s.forecast_dir,
+                            )
+                            self._last_forecast_train = time.time()
+                        except Exception:
+                            log.exception("ошибка обучения модели прогноза")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("обслуживание истории цен")
             await asyncio.sleep(tick_seconds)
+
+    def _should_run_forecast_training(self) -> bool:
+        if not self.s.forecast_enabled or not self.history:
+            return False
+        retrain_seconds = self.s.forecast_retrain_days * 86400.0
+        now = time.time()
+        if self._last_forecast_train > 0:
+            return (now - self._last_forecast_train) >= retrain_seconds
+
+        report_path = self.s.forecast_dir / "report.json"
+        if not report_path.exists():
+            return True
+        try:
+            mtime = report_path.stat().st_mtime
+            if (now - mtime) >= retrain_seconds:
+                return True
+            self._last_forecast_train = mtime
+            return False
+        except Exception:
+            return True
 
     async def run(self):
         offset = 0

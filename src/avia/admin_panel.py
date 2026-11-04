@@ -453,6 +453,84 @@ def build_tickets(ctx: dict[str, Any]) -> str:
     else:
         lines.append("—")
 
+    fc = ctx.get("forecast")
+    if fc is not None or "forecast" in ctx:
+        lines.append("")
+        lines.extend(format_forecast_block(fc))
+
+    return truncate_text("\n".join(lines))
+
+
+def format_forecast_block(fc: dict[str, Any] | None) -> list[str]:
+    """Форматирует блок «Прогноз» для панели администратора."""
+    lines = ["<b>Прогноз:</b>"]
+    if not fc:
+        lines.append("Модель ещё не обучалась")
+        return lines
+
+    trained_at = fc.get("trained_at")
+    if trained_at:
+        try:
+            dt = datetime.fromisoformat(str(trained_at))
+            trained_str = dt.strftime("%d.%m %H:%M")
+        except Exception:
+            trained_str = str(trained_at)
+    else:
+        trained_str = "—"
+
+    train_rows = fc.get("train_rows", 0)
+    test_rows = fc.get("test_rows", 0)
+    routes_cnt = fc.get("routes_count")
+    if routes_cnt is None:
+        tr = fc.get("train_routes", 0)
+        te = fc.get("test_routes", 0)
+        routes_cnt = tr + te if (tr + te) > 0 else 0
+    departed_flights = fc.get("departed_flights_count", 0)
+    verdict = fc.get("verdict", "—")
+
+    lines.append(f"• Обучение: {escape(str(trained_str))}")
+    lines.append(f"• Строк: обучение {train_rows:,} · проверка {test_rows:,}".replace(",", " "))
+    lines.append(f"• Маршрутов: {routes_cnt} · Вылетевших рейсов с ответами: {departed_flights}")
+
+    v_raw = str(verdict)
+    if v_raw in ("лучше правил", "модель лучше"):
+        v_text = "лучше правил"
+    elif v_raw in ("не лучше правил", "модель не лучше правил"):
+        v_text = "не лучше правил"
+    else:
+        v_text = v_raw
+    lines.append(f"• Вердикт: {escape(v_text)}")
+
+    metrics = fc.get("metrics")
+    if metrics and isinstance(metrics, dict):
+        m = metrics.get("model")
+        b1 = metrics.get("baseline_always_buy")
+        b2 = metrics.get("baseline_rules")
+        if m:
+            acc = round(m.get("accuracy", 0.0) * 100)
+            prec = round(m.get("precision", 0.0) * 100)
+            rec = round(m.get("recall", 0.0) * 100)
+            miss = m.get("missed_opportunity_pct", 0.0)
+            lines.append(
+                f"• Модель: точность {acc}% · точность/полнота {prec}%/{rec}% · упущенная выгода {miss:.1f}%"
+            )
+        if b1 and b2:
+            acc1 = round(b1.get("accuracy", 0.0) * 100)
+            miss1 = b1.get("missed_opportunity_pct", 0.0)
+            acc2 = round(b2.get("accuracy", 0.0) * 100)
+            miss2 = b2.get("missed_opportunity_pct", 0.0)
+            lines.append(
+                f"• Базовые: «всегда брать» {acc1}% (упущ. {miss1:.1f}%), правила {acc2}% (упущ. {miss2:.1f}%)"
+            )
+
+    return lines
+
+
+def build_forecast(ctx: dict[str, Any]) -> str:
+    """Раздел / блок: 🔮 Прогноз."""
+    lines = ["🔮 <b>Прогноз</b>", ""]
+    fc = ctx.get("forecast", ctx)
+    lines.extend(format_forecast_block(fc))
     return truncate_text("\n".join(lines))
 
 

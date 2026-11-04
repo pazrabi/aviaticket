@@ -28,6 +28,7 @@ class Advice:
     verdict: str
     text: str
     confidence: str
+    model_prob: float | None = None
 
 
 def confidence_level(samples: int) -> str:
@@ -147,4 +148,10 @@ def format_advice(advice: Advice | None) -> list[str]:
         return []
     header = VERDICT_TITLES.get(advice.verdict, f"💡 <b>Совет: {html.escape(advice.verdict)}</b>")
     body = f"{html.escape(advice.text.rstrip('.'))}. Уверенность: {html.escape(advice.confidence)}."
-    return [header, body, DISCLAIMER_HTML]
+    lines = [header, body]
+    if getattr(advice, "model_prob", None) is not None:
+        p = advice.model_prob
+        pct = int(round(p * 100)) if p <= 1.0 else int(round(p))
+        lines.append(f"Модель: вероятность, что подешевеет, {pct}%")
+    lines.append(DISCLAIMER_HTML)
+    return lines
