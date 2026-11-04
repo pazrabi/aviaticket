@@ -72,3 +72,4 @@
 - С 2026-11-04 бот работает на сервере Aeza (Амстердам, 193.41.86.92) как systemd-служба `avia-bot` (пользователь avia, каталог /home/avia/avia-bot, юнит в deploy/avia-bot.service). Парсинг идёт через телефоны (droidhub), Chromium не нужен.
 - Обновление: rsync кода (без .env, state, .venv) на сервер и `systemctl restart avia-bot`; логи `journalctl -u avia-bot`.
 - Базы в state/ на сервере; ежедневный бэкап в state/backups (14 копий). Копия бота на Маке остановлена: два бота на один токен мешают друг другу, на Маке НЕ запускать.
+- Управление с Мака: `./deploy/botctl.sh status|logs [N]|restart|stop|start|deploy|backup` (deploy = тесты, rsync кода, перезапуск службы). Нужен ключ ~/.ssh/aeza_pool.
