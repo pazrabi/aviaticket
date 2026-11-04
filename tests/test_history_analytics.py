@@ -555,3 +555,156 @@ def test_route_stats_with_round_trip_and_pruned_daily(tmp_path):
     assert stats["last_price"] == 22000
     # Дороже 22000 оба других замера (25000 и 24000) -> 2/3 * 100 = 66.7%
     assert stats["percentile_of_last"] == pytest.approx(66.7, abs=0.1)
+
+
+def test_prune_aligns_to_calendar_day_and_prevents_partial_day_corruption(tmp_path):
+    """prune выравнивает границу по началу календарного дня и не повреждает данные частичным удалением."""
+    h = PriceHistory(tmp_path / "h_prune.sqlite")
+    now_ts = datetime(2026, 11, 20, 14, 0, 0).timestamp()
+
+    # d_46 (46 дней назад): 2026-10-05
+    d_46 = date(2026, 11, 20) - timedelta(days=46)
+    t_46_morning = datetime.combine(d_46, datetime.min.time()).replace(hour=10).timestamp()
+    t_46_evening = datetime.combine(d_46, datetime.min.time()).replace(hour=18).timestamp()
+
+    # d_45 (45 дней назад): 2026-10-06
+    d_45 = date(2026, 11, 20) - timedelta(days=45)
+    t_45_morning = datetime.combine(d_45, datetime.min.time()).replace(hour=10).timestamp()
+    t_45_evening = datetime.combine(d_45, datetime.min.time()).replace(hour=18).timestamp()
+
+    h.annotate(Q, _make_res([Offer(site="s", price=10000, offer_id="d46_m")]), now=t_46_morning)
+    h.annotate(Q, _make_res([Offer(site="s", price=8000, offer_id="d46_e")]), now=t_46_evening)
+    h.annotate(Q, _make_res([Offer(site="s", price=9000, offer_id="d45_m")]), now=t_45_morning)
+    h.annotate(Q, _make_res([Offer(site="s", price=7000, offer_id="d45_e")]), now=t_45_evening)
+
+    # Запуск чистки в 14:00 с keep_days=45:
+    # Граница чистки: начало дня 2026-10-06 (00:00:00).
+    # d_45 не должен удаляться вовсе (ни утренние, ни вечерние записи).
+    # d_46 целиком старше границы: он сворачивается в route_daily и удаляется из price_history.
+    deleted = h.prune(keep_days=45, now=now_ts)
+    assert deleted == 2
+
+    with h._connect() as db:
+        # В price_history остались ОБЕ записи за d_45 (10:00 и 18:00)
+        remaining = db.execute("SELECT offer_id FROM price_history ORDER BY observed_at").fetchall()
+        assert [r[0] for r in remaining] == ["d45_m", "d45_e"]
+
+        # В route_daily свернулся день d_46 с полной статистикой (2 замера, мин. цена 8000)
+        daily_d46 = db.execute("SELECT samples, min_price FROM route_daily WHERE day = ?", (d_46.isoformat(),)).fetchone()
+        assert daily_d46 == (2, 8000)
+
+    # На следующий день (2026-11-21 14:00) снова запускаем prune
+    next_day_ts = datetime(2026, 11, 21, 14, 0, 0).timestamp()
+    deleted_next = h.prune(keep_days=45, now=next_day_ts)
+    assert deleted_next == 2
+
+    with h._connect() as db:
+        # Сырых записей больше нет
+        assert db.execute("SELECT COUNT(*) FROM price_history").fetchone()[0] == 0
+
+        # В route_daily теперь есть и d_45 с полной статистикой (2 замера, мин. цена 7000)
+        daily_d45 = db.execute("SELECT samples, min_price FROM route_daily WHERE day = ?", (d_45.isoformat(),)).fetchone()
+        assert daily_d45 == (2, 7000)
+
+        # d_46 остался без изменений
+        daily_d46_after = db.execute("SELECT samples, min_price FROM route_daily WHERE day = ?", (d_46.isoformat(),)).fetchone()
+        assert daily_d46_after == (2, 8000)
+
+
+def test_route_stats_uses_p25_and_preserves_distribution(tmp_path):
+    """route_stats использует p25_price из route_daily при моделировании распределения."""
+    h = PriceHistory(tmp_path / "h_p25.sqlite")
+    d_str = "2026-09-01"
+
+    # Создаём сводку дня в route_daily: min=10000, p25=12000, median=20000, samples=4
+    with h._connect() as db:
+        db.execute(
+            "INSERT INTO route_daily "
+            "(origin, destination, depart, return_date, adults, day, min_price, p25_price, median_price, samples) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("KUF", "EVN", "2026-12-01", "", 1, d_str, 10000, 12000.0, 20000.0, 4),
+        )
+
+    # Добавляем один свежий замер в сырые записи
+    now_ts = datetime(2026, 11, 20, 12, 0, 0).timestamp()
+    h.annotate(Q, _make_res([Offer(site="s", price=11000, offer_id="rec1")]), now=now_ts)
+
+    stats = h.route_stats(Q)
+    assert stats is not None
+    assert stats["samples"] == 5
+    assert stats["min"] == 10000
+    # p25 должен отражать значение p25 (12000), а не вырождаться в медиану (20000)
+    assert stats["p25"] < 15000
+    # Волатильность не занижена до нуля
+    assert stats["volatility_pct"] is not None and stats["volatility_pct"] > 10.0
+
+
+def test_trend_requires_sufficient_history_span(tmp_path):
+    """_trend возвращает None, если охват истории недостаточен (меньше ~2.5 суток для 3d-тренда)."""
+    h = PriceHistory(tmp_path / "h_trend.sqlite")
+    now_ts = datetime(2026, 11, 20, 14, 0, 0).timestamp()
+
+    # Замеры только за вчера (30 часов назад) и сегодня: охват ~1.25 суток
+    t_yesterday = now_ts - 30 * 3600
+    h.annotate(Q, _make_res([Offer(site="s", price=10000, offer_id="y1")]), now=t_yesterday)
+    h.annotate(Q, _make_res([Offer(site="s", price=10500, offer_id="y2")]), now=t_yesterday + 600)
+    h.annotate(Q, _make_res([Offer(site="s", price=15000, offer_id="tod")]), now=now_ts)
+
+    stats = h.route_stats(Q)
+    assert stats is not None
+    assert stats["samples"] == 3
+    # Для 3d-тренда требуется охват не менее 3 * 0.8 = 2.4 суток. При 1.25 сутках trend_3d должен быть None!
+    assert stats["trend_3d"] is None
+
+    # Добавляем замер ровно 3 дня назад
+    t_3d = now_ts - 3 * 86400
+    h.annotate(Q, _make_res([Offer(site="s", price=10000, offer_id="old_3d")]), now=t_3d)
+
+    stats_with_3d = h.route_stats(Q)
+    assert stats_with_3d is not None
+    assert stats_with_3d["trend_3d"] == "up"
+
+
+def test_annotate_and_route_stats_accept_datetime_and_strings(tmp_path):
+    """annotate и route_stats корректно работают с объектами datetime и строками в depart/return_date."""
+    h = PriceHistory(tmp_path / "h_types.sqlite")
+    now_ts = datetime(2026, 11, 20, 12, 0, 0).timestamp()
+
+    # Query с объектом datetime в depart и строкой в return_date
+    q_dt = Query(
+        origin="KUF",
+        destination="EVN",
+        depart=datetime(2026, 12, 1, 15, 30),  # datetime!
+        return_date="2026-12-10",  # str!
+    )
+
+    o = Offer(
+        site="s",
+        price=10000,
+        offer_id="o_dt",
+        baggage="С багажом",
+    )
+
+    # Не должно упасть с TypeError или AttributeError
+    h.annotate(q_dt, _make_res([o]), now=now_ts)
+
+    with h._connect() as db:
+        row = db.execute(
+            "SELECT depart, return_date, days_to_departure FROM price_history WHERE offer_id = 'o_dt'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "2026-12-01"
+        assert row[1] == "2026-12-10"
+        # 2026-12-01 - 2026-11-20 = 11 дней
+        assert row[2] == 11
+
+    # Добавим ещё 2 замера, чтобы проверить route_stats
+    h.annotate(q_dt, _make_res([Offer(site="s", price=9500, offer_id="o_dt2")]), now=now_ts + 3600)
+    h.annotate(q_dt, _make_res([Offer(site="s", price=9000, offer_id="o_dt3")]), now=now_ts + 7200)
+
+    stats = h.route_stats(q_dt)
+    assert stats is not None
+    assert stats["samples"] == 3
+    assert stats["min"] == 9000
+    assert stats["last_price"] == 9000
+

@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS price_history (
 );
 CREATE INDEX IF NOT EXISTS ix_price_offer ON price_history (offer_id, observed_at);
 CREATE INDEX IF NOT EXISTS ix_price_route ON price_history (origin, destination, depart, return_date);
+CREATE INDEX IF NOT EXISTS ix_price_observed_at ON price_history (observed_at);
 
 CREATE TABLE IF NOT EXISTS route_daily (
     origin       TEXT NOT NULL,
@@ -58,6 +59,58 @@ CREATE TABLE IF NOT EXISTS scheduler_heartbeat (
 );
 CREATE INDEX IF NOT EXISTS ix_heartbeat_ts ON scheduler_heartbeat (ts);
 """
+
+
+def _normalize_date(val: date | datetime | str | None) -> date | None:
+    """Приводит date, datetime или ISO-строку к объекту date."""
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.date()
+    if isinstance(val, date):
+        return val
+    if isinstance(val, str):
+        val_str = val.strip()
+        if not val_str:
+            return None
+        if "T" in val_str or " " in val_str:
+            return datetime.fromisoformat(val_str).date()
+        return date.fromisoformat(val_str)
+    return date.fromisoformat(str(val))
+
+
+def _model_day_prices(min_p: float, p25_p: float, med_p: float, count: int) -> list[int]:
+    """Моделирует распределение цен за день по min, p25, median и количеству замеров."""
+    if count <= 0:
+        return []
+    if count == 1:
+        return [int(round(min_p))]
+    if count == 2:
+        p2 = max(min_p, 2.0 * med_p - min_p)
+        return [int(round(min_p)), int(round(p2))]
+
+    iqr = max(0.0, med_p - p25_p)
+    p75_est = med_p + iqr
+    spread = max(0.0, med_p - min_p)
+    max_est = max(p75_est, med_p + spread)
+
+    prices: list[int] = []
+    for i in range(count):
+        frac = i / (count - 1)
+        if frac <= 0.25:
+            t = frac / 0.25
+            val = min_p + t * (p25_p - min_p)
+        elif frac <= 0.5:
+            t = (frac - 0.25) / 0.25
+            val = p25_p + t * (med_p - p25_p)
+        elif frac <= 0.75:
+            t = (frac - 0.5) / 0.25
+            val = med_p + t * (p75_est - med_p)
+        else:
+            t = (frac - 0.75) / 0.25
+            val = p75_est + t * (max_est - p75_est)
+        prices.append(int(round(val)))
+    return prices
 
 
 class PriceHistory:
@@ -94,6 +147,10 @@ class PriceHistory:
             "CREATE INDEX IF NOT EXISTS ix_price_search_id "
             "ON price_history (search_id)"
         )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_price_observed_at "
+            "ON price_history (observed_at)"
+        )
 
     def annotate(
         self,
@@ -109,10 +166,13 @@ class PriceHistory:
         if not offers:
             return
 
-        depart_date = q.depart if isinstance(q.depart, date) else date.fromisoformat(str(q.depart))
+        depart_date = _normalize_date(q.depart)
+        if depart_date is None:
+            return
         obs_date = datetime.fromtimestamp(now).date()
         days_to_dep = (depart_date - obs_date).days
-        ret = q.return_date.isoformat() if q.return_date else None
+        ret_date = _normalize_date(q.return_date)
+        ret = ret_date.isoformat() if ret_date else None
 
         with self._connect() as db:
             for o in offers:
@@ -167,12 +227,14 @@ class PriceHistory:
         with self._connect() as db:
             for d in target_days:
                 day_str = d.isoformat()
+                start_ts = datetime.combine(d, dt_time.min).timestamp()
+                end_ts = datetime.combine(d + timedelta(days=1), dt_time.min).timestamp()
                 rows = db.execute(
                     "SELECT origin, destination, depart, COALESCE(return_date, ''), adults, "
                     "price, search_id, observed_at "
                     "FROM price_history "
-                    "WHERE date(observed_at, 'unixepoch', 'localtime') = ?",
-                    (day_str,),
+                    "WHERE observed_at >= ? AND observed_at < ?",
+                    (start_ts, end_ts),
                 ).fetchall()
                 if not rows:
                     continue
@@ -217,19 +279,61 @@ class PriceHistory:
     def prune(self, keep_days: int = 45, now: float | None = None) -> int:
         """Сворачивает старые дни в route_daily и удаляет сырые записи старше keep_days."""
         now = time.time() if now is None else float(now)
-        cutoff_ts = now - keep_days * 86400.0
+        # Выравниваем границу чистки по началу календарного дня, чтобы дни не удалялись частично
+        cutoff_day = datetime.fromtimestamp(now).date() - timedelta(days=keep_days)
+        cutoff_ts = datetime.combine(cutoff_day, dt_time.min).timestamp()
 
         with self._connect() as db:
-            days_to_rollup_rows = db.execute(
-                "SELECT DISTINCT date(observed_at, 'unixepoch', 'localtime') FROM price_history "
-                "WHERE observed_at < ?",
+            min_row = db.execute(
+                "SELECT MIN(observed_at) FROM price_history WHERE observed_at < ?",
                 (cutoff_ts,),
-            ).fetchall()
+            ).fetchone()
+            if not min_row or min_row[0] is None:
+                return 0
+            min_day = datetime.fromtimestamp(min_row[0]).date()
 
-        for row in days_to_rollup_rows:
-            if row[0]:
-                d = date.fromisoformat(row[0])
-                self.rebuild_route_daily(d)
+            existing_daily_rows = db.execute(
+                "SELECT DISTINCT day FROM route_daily WHERE day < ?",
+                (cutoff_day.isoformat(),),
+            ).fetchall()
+            existing_days = {r[0] for r in existing_daily_rows}
+
+            # Находим дни старше порога, которые ещё не свёрнуты
+            cur_day = min_day
+            days_to_rebuild = []
+            while cur_day < cutoff_day:
+                day_str = cur_day.isoformat()
+                day_start = datetime.combine(cur_day, dt_time.min).timestamp()
+                day_end = datetime.combine(cur_day + timedelta(days=1), dt_time.min).timestamp()
+                if day_str not in existing_days:
+                    has_records = db.execute(
+                        "SELECT 1 FROM price_history WHERE observed_at >= ? AND observed_at < ? LIMIT 1",
+                        (day_start, day_end),
+                    ).fetchone()
+                    if has_records:
+                        days_to_rebuild.append(cur_day)
+                else:
+                    # Если день есть в route_daily, проверяем, нет ли несвёрнутых маршрутов за этот день
+                    has_unrolled = db.execute(
+                        "SELECT 1 FROM price_history p "
+                        "WHERE p.observed_at >= ? AND p.observed_at < ? "
+                        "AND NOT EXISTS ("
+                        "    SELECT 1 FROM route_daily r "
+                        "    WHERE r.origin = p.origin "
+                        "      AND r.destination = p.destination "
+                        "      AND r.depart = p.depart "
+                        "      AND r.return_date = COALESCE(p.return_date, '') "
+                        "      AND r.adults = p.adults "
+                        "      AND r.day = ?"
+                        ") LIMIT 1",
+                        (day_start, day_end, day_str),
+                    ).fetchone()
+                    if has_unrolled:
+                        days_to_rebuild.append(cur_day)
+                cur_day += timedelta(days=1)
+
+        for d in days_to_rebuild:
+            self.rebuild_route_daily(d)
 
         with self._connect() as db:
             cursor = db.execute("DELETE FROM price_history WHERE observed_at < ?", (cutoff_ts,))
@@ -316,8 +420,10 @@ class PriceHistory:
 
     def route_stats(self, q: Query) -> dict | None:
         """Возвращает аналитику по маршруту: samples, min, median, p25, last_price, percentile_of_last, trends, volatility."""
-        depart_str = q.depart.isoformat() if isinstance(q.depart, date) else str(q.depart)
-        ret_str = q.return_date.isoformat() if isinstance(q.return_date, date) else (str(q.return_date) if q.return_date else None)
+        depart_d = _normalize_date(q.depart)
+        depart_str = depart_d.isoformat() if depart_d else str(q.depart)
+        ret_d = _normalize_date(q.return_date)
+        ret_str = ret_d.isoformat() if ret_d else None
         ret_daily = ret_str or ""
 
         with self._connect() as db:
@@ -370,11 +476,9 @@ class PriceHistory:
             if day_val not in raw_days:
                 d_obj = date.fromisoformat(day_val)
                 day_ts = datetime.combine(d_obj, dt_time(12, 0)).timestamp()
-                min_i = int(min_p)
-                med_i = int(round(med_p))
-                older_samples.append((day_ts, min_i))
-                for _ in range(count - 1):
-                    older_samples.append((day_ts, med_i))
+                day_prices = _model_day_prices(float(min_p), float(p25_p), float(med_p), int(count))
+                for p in day_prices:
+                    older_samples.append((day_ts, p))
 
         combined: list[tuple[float, int]] = older_samples + [(s[0], s[1]) for s in raw_samples]
         combined.sort(key=lambda x: x[0])
@@ -418,13 +522,18 @@ class PriceHistory:
     def _trend(samples_with_ts: list[tuple[float, int]], days: int) -> str | None:
         if not samples_with_ts:
             return None
+        first_ts = samples_with_ts[0][0]
         last_ts, last_price = samples_with_ts[-1]
+        # Проверяем, что временной охват достаточен для оценки тренда
+        if (last_ts - first_ts) < days * 0.8 * 86400.0:
+            return None
+
         target_ts = last_ts - days * 86400.0
         past = [s for s in samples_with_ts if s[0] < last_ts]
         if not past:
             return None
         best = min(past, key=lambda s: abs(s[0] - target_ts))
-        max_dist = max(1.8 * 86400.0, days * 0.4 * 86400.0)
+        max_dist = min(0.8 * 86400.0, days * 0.25 * 86400.0)
         if abs(best[0] - target_ts) > max_dist:
             return None
         old_price = best[1]
