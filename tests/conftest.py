@@ -21,10 +21,26 @@ def _isolated_price_history(tmp_path, monkeypatch):
     except ImportError:
         pass
     monkeypatch.setattr(avia.bot, "SubscriptionStore", lambda _path: SubscriptionStore(tmp_path / "subscriptions.sqlite"))
+    try:
+        from avia.phones import PhoneRegistry
+
+        def _make_isolated_registry(*args, **kwargs):
+            kwargs["storage_dir"] = tmp_path
+            kwargs["path"] = tmp_path / "phones.json"
+            return PhoneRegistry(**kwargs)
+
+        monkeypatch.setattr(
+            avia.bot,
+            "PhoneRegistry",
+            _make_isolated_registry,
+            raising=False,
+        )
+    except ImportError:
+        pass
 
 
 @pytest.fixture(autouse=True)
 def _no_real_droidhub(monkeypatch):
     """Тесты не ходят на телефоны: пустые значения из окружения load_dotenv из .env не перетирает."""
-    for name in ("DROIDHUB_URL", "DROIDHUB_TOKEN", "DROIDHUB_DEVICES"):
+    for name in ("DROIDHUB_URL", "DROIDHUB_TOKEN", "DROIDHUB_DEVICES", "PHONES_HOLD", "PHONES_NEW_POLICY"):
         monkeypatch.setenv(name, "")

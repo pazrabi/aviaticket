@@ -87,7 +87,10 @@ def make_home_keyboard() -> dict[str, Any]:
                 {"text": "🔔 Подписки", "callback_data": "adm:subs"},
             ],
             [
+                {"text": "📱 Телефоны", "callback_data": "adm:ph"},
                 {"text": "🛟 Бэкапы", "callback_data": "adm:backup"},
+            ],
+            [
                 {"text": "🔄 Обновить", "callback_data": "adm:home"},
             ],
         ]
@@ -96,6 +99,15 @@ def make_home_keyboard() -> dict[str, Any]:
 
 def make_section_keyboard(section: str, period: str = "24h") -> dict[str, Any]:
     """Inline-кнопки внутри раздела."""
+    if section in ("ph", "phones"):
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "◀ Назад", "callback_data": "adm:home"},
+                    {"text": "🔄 Обновить", "callback_data": "adm:ph"},
+                ],
+            ]
+        }
     if section == "parse":
         p24 = "• 24 ч •" if period == "24h" else "24 ч"
         p7 = "• 7 дн •" if period == "7d" else "7 дн"
@@ -651,3 +663,100 @@ def build_backups(ctx: dict[str, Any]) -> str:
         lines.append("Копий пока нет")
 
     return truncate_text("\n".join(lines))
+
+
+def build_phones(ctx: dict[str, Any]) -> str:
+    """Раздел: 📱 Телефоны хаба."""
+    lines = ["📱 <b>Телефоны хаба</b>", ""]
+    phones = ctx.get("phones", [])
+    if not phones:
+        lines.append("Телефонов пока нет в реестре.")
+    else:
+        for p in phones:
+            p_id = escape(str(p.get("id", "")))
+            p_name = escape(str(p.get("name", p_id)))
+            lines.append(f"<b>{p_name}</b> (<code>{p_id}</code>)")
+
+            # Статус
+            if p.get("is_hold_env"):
+                st_str = "заморожен (env) ❄️"
+            elif p.get("status") == "active":
+                st_str = "в работе ✅"
+            else:
+                st_str = "заморожен ⏸"
+            lines.append(f"• Статус: {st_str}")
+
+            # Связь
+            online = p.get("online")
+            is_fresh = p.get("is_online_fresh", False)
+            if online is True:
+                conn_str = "онлайн 🟢"
+            elif online is False and is_fresh:
+                conn_str = "офлайн 🔴"
+            elif online is False:
+                conn_str = "офлайн (снимок устарел)"
+            else:
+                conn_str = "неизвестно"
+            lines.append(f"• Связь: {conn_str}")
+
+            # Батарея
+            batt = p.get("battery")
+            batt_str = f"{batt}%" if batt is not None else "—"
+            lines.append(f"• Батарея: {batt_str}")
+
+            # Сайты
+            allow = p.get("sites_allow")
+            deny = p.get("sites_deny")
+            if allow:
+                lines.append(f"• Разрешены сайты: {escape(', '.join(allow))}")
+            elif deny:
+                lines.append(f"• Запрещены сайты: {escape(', '.join(deny))}")
+            else:
+                lines.append("• Сайты: все")
+
+            # Когда добавлен
+            first_seen = p.get("first_seen")
+            if isinstance(first_seen, (int, float)) and first_seen > 0:
+                dt_str = datetime.fromtimestamp(first_seen).strftime("%d.%m %H:%M")
+            elif first_seen:
+                dt_str = escape(str(first_seen))
+            else:
+                dt_str = "—"
+            lines.append(f"• Добавлен: {dt_str}")
+            lines.append("")
+
+    lines.append("Команды: <code>/phone &lt;id&gt; hold|on|all|allow s1,s2|deny s1</code>")
+    return truncate_text("\n".join(lines))
+
+
+def make_phones_keyboard(phones: list[dict[str, Any]]) -> dict[str, Any]:
+    """Inline-кнопки управления телефонами: переключение статуса и назад."""
+    rows: list[list[dict[str, str]]] = []
+    for p in phones:
+        p_id = str(p.get("id", "")).strip()
+        p_name = str(p.get("name", p_id)).strip() or p_id
+        is_hold_env = bool(p.get("is_hold_env", False))
+        status = str(p.get("status", "active"))
+        if is_hold_env:
+            # Для заморозки через env кнопку возврата не показываем
+            continue
+        if status == "active":
+            btn = {
+                "text": f"❄️ Заморозить {p_name}",
+                "callback_data": f"adm:ph:hold:{p_id}",
+            }
+        else:
+            btn = {
+                "text": f"▶️ В работу {p_name}",
+                "callback_data": f"adm:ph:on:{p_id}",
+            }
+        rows.append([btn])
+
+    rows.append(
+        [
+            {"text": "◀ Назад", "callback_data": "adm:home"},
+            {"text": "🔄 Обновить", "callback_data": "adm:ph"},
+        ]
+    )
+    return {"inline_keyboard": rows}
+

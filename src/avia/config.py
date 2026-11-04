@@ -30,6 +30,7 @@ class SiteConfig:
     # replay_post: конфигурация повтора POST-запроса {"url_contains": "...", "set": {...}}
     replay_post: dict | None = None
     phone: str = ""
+    phone_extend: bool = True
     phone_capture_json: list[str] = field(default_factory=list)
     phone_wait_seconds: int = 40
     # подстрока в ответе, по которой видно конец выдачи (хаб ждёт её появления)
@@ -43,6 +44,8 @@ class SiteConfig:
     def __post_init__(self) -> None:
         if self.phone_patience_seconds < 0:
             raise ValueError("phone_patience_seconds must be >= 0")
+        if not isinstance(self.phone_extend, bool):
+            raise TypeError("phone_extend must be a boolean")
 
 
 @dataclass
@@ -53,6 +56,11 @@ class Settings:
     droidhub_url: str = ""        # адрес сервиса droidhub (HTTP API)
     droidhub_token: str = ""      # токен авторизации droidhub
     droidhub_devices: list[str] = field(default_factory=list)  # пул телефонов droidhub
+    phones_new_policy: str = "active"  # "active" (автоматически брать в работу) или "hold"
+    phones_hold: list[str] = field(default_factory=list)      # телефоны на жёсткой заморозке
+    phones_refresh_seconds: int = 60   # интервал опроса хаба (сек)
+    phones_snapshot_ttl_seconds: int = 180  # TTL актуальности снимка состояния (сек)
+    phones: Any = None                 # объект PhoneRegistry (опционально)
     # llm_backend нужен только сайтам с use_llm: true
     # "agy_ssh" (аккаунт пула на VPS через SSH) или "gemini_local" (локальный gemini CLI)
     llm_backend: str = "gemini_local"
@@ -125,6 +133,18 @@ def load_settings(path: Path | None = None) -> Settings:
     droidhub_devices = [
         x.strip() for x in os.getenv("DROIDHUB_DEVICES", "").split(",") if x.strip()
     ]
+    phones_new_policy = os.getenv("PHONES_NEW_POLICY", "active").strip() or "active"
+    phones_hold = [
+        x.strip() for x in os.getenv("PHONES_HOLD", "").split(",") if x.strip()
+    ]
+    try:
+        phones_refresh_sec = int(os.getenv("PHONES_REFRESH_SECONDS", "60"))
+    except ValueError:
+        phones_refresh_sec = 60
+    try:
+        phones_snapshot_ttl = int(os.getenv("PHONES_SNAPSHOT_TTL_SECONDS", "180"))
+    except ValueError:
+        phones_snapshot_ttl = 180
     env_seed = os.getenv("BG_COLLECT_SEED_ROUTES")
     if env_seed is not None:
         bg_seed_routes = [x.strip() for x in env_seed.split(",") if x.strip()]
@@ -144,6 +164,10 @@ def load_settings(path: Path | None = None) -> Settings:
         droidhub_url=os.getenv("DROIDHUB_URL", ""),
         droidhub_token=os.getenv("DROIDHUB_TOKEN", ""),
         droidhub_devices=droidhub_devices,
+        phones_new_policy=phones_new_policy,
+        phones_hold=phones_hold,
+        phones_refresh_seconds=phones_refresh_sec,
+        phones_snapshot_ttl_seconds=phones_snapshot_ttl,
         llm_backend=os.getenv("LLM_BACKEND", "gemini_local"),
         gemini_cmd=os.getenv("GEMINI_CMD", "gemini"),
         gemini_model=os.getenv("GEMINI_MODEL") or None,

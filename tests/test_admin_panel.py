@@ -75,10 +75,10 @@ async def test_admin_access_command_allowed(tmp_path):
     assert len(send_calls) == 1
     assert "🛠 <b>Панель разработчика</b>" in send_calls[0]["text"]
     kb = send_calls[0]["reply_markup"]["inline_keyboard"]
-    # 4 ряда по 2 кнопки
-    assert len(kb) == 4
-    for row in kb:
+    assert len(kb) == 5
+    for row in kb[:-1]:
         assert len(row) == 2
+    assert len(kb[-1]) == 1
 
 
 @pytest.mark.asyncio
@@ -152,9 +152,11 @@ def test_build_home_keyboard_and_limits():
     """Главная клавиатура: кнопки по 2 в ряд, callback_data <= 64 байт."""
     kb = admin_panel.make_home_keyboard()
     rows = kb["inline_keyboard"]
-    assert len(rows) == 4
-    for row in rows:
+    assert len(rows) == 5
+    for row in rows[:-1]:
         assert len(row) == 2
+    assert len(rows[-1]) == 1
+    for row in rows:
         for btn in row:
             assert len(btn["callback_data"].encode("utf-8")) <= 64
 

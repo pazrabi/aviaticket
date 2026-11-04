@@ -6,6 +6,8 @@ import bisect
 from dataclasses import dataclass
 import json
 import logging
+import os
+from pathlib import Path
 import time
 from typing import Any, Callable
 
@@ -144,42 +146,155 @@ def _reset_pool() -> None:
     _waiters.clear()
 
 
-def candidates(settings: Settings, site: SiteConfig) -> list[str]:
+def _get_registry(settings: Settings) -> Any | None:
+    reg = getattr(settings, "phones", None)
+    if reg is not None:
+        return reg
+    storage_dir = getattr(settings, "storage_dir", None)
+    if storage_dir is not None:
+        phones_path = Path(storage_dir) / "phones.json"
+        if phones_path.exists():
+            try:
+                from .phones import PhoneRegistry
+
+                reg = PhoneRegistry(
+                    storage_dir,
+                    phones_new_policy=getattr(settings, "phones_new_policy", "active"),
+                    phones_snapshot_ttl_seconds=getattr(settings, "phones_snapshot_ttl_seconds", 180),
+                    phones_hold=getattr(settings, "phones_hold", None),
+                )
+                return reg
+            except Exception as e:
+                logger.warning("Не удалось загрузить PhoneRegistry: %s", e)
+    return None
+
+
+def _get_phones_hold(settings: Settings) -> set[str]:
+    hold_set: set[str] = set()
+    env_hold = os.getenv("PHONES_HOLD")
+    if env_hold:
+        for x in env_hold.split(","):
+            s = x.strip()
+            if s:
+                hold_set.add(s)
+    s_hold = getattr(settings, "phones_hold", None)
+    if s_hold:
+        for x in s_hold:
+            s = str(x).strip()
+            if s:
+                hold_set.add(s)
+    return hold_set
+
+
+def candidates(
+    settings: Settings,
+    site: SiteConfig,
+    registry: Any | None = None,
+) -> list[str]:
     """Возвращает список идентификаторов устройств для сайта.
 
-    Для 'auto' возвращает список устройств из настроек, иначе [site.phone].
-    Если site.phone содержит запятую — упорядоченный список предпочтений.
+    Итоговый список для сайта:
+    [телефоны из site.phone в заданном порядке, которые is_usable] +
+    [остальные is_usable телефоны реестра, не перечисленные в site.phone — в конце как запасные;
+    порядок — по first_seen].
+
+    Расширение применяется только для списков «a,b» и «auto» (для «auto» — все пригодные телефоны).
+    Одиночный phone остаётся закреплённым за этим телефоном без расширения (при заморозке не используется).
+    Поле phone_extend: false отключает добавление запасных.
+    При пустом/недоступном реестре — прежнее поведение по site.phone и DROIDHUB_DEVICES.
     """
     phone = (getattr(site, "phone", None) or "").strip()
     if not phone:
         return []
+
+    reg = registry if registry is not None else _get_registry(settings)
+    phones_hold = _get_phones_hold(settings)
+    site_name = getattr(site, "name", "")
+    phone_extend = getattr(site, "phone_extend", True)
+    if phone_extend is None:
+        phone_extend = True
+
+    def is_usable_phone(dev_id: str) -> bool:
+        if dev_id in phones_hold:
+            return False
+        if reg is not None and dev_id in reg:
+            return bool(reg.is_usable(dev_id, site_name))
+        # Телефоны, которых нет в реестре, но перечислены в site.phone,
+        # остаются пригодными (обратная совместимость), если не заморожены.
+        return True
+
+    def get_other_usable_phones(exclude: set[str]) -> list[str]:
+        if reg is None or len(reg) == 0:
+            return []
+        all_phones = reg.all()
+
+        def sort_key(item: tuple[str, dict[str, Any]]) -> tuple:
+            fs = item[1].get("first_seen")
+            if isinstance(fs, (int, float)):
+                return (0, float(fs))
+            if isinstance(fs, str):
+                try:
+                    return (0, float(fs))
+                except ValueError:
+                    return (1, fs)
+            return (2, str(fs or ""))
+
+        sorted_items = sorted(all_phones.items(), key=sort_key)
+        others: list[str] = []
+        for dev_id, _ in sorted_items:
+            clean_id = dev_id.strip()
+            if (
+                clean_id not in exclude
+                and clean_id not in phones_hold
+                and reg.is_usable(clean_id, site_name)
+            ):
+                others.append(clean_id)
+        return others
+
+    # Случай 1: auto
     if phone == "auto":
         devs = getattr(settings, "droidhub_devices", None) or []
-        return [d.strip() for d in devs if d and d.strip()]
+        listed = [d.strip() for d in devs if d and d.strip()]
+        usable_listed = [d for d in listed if is_usable_phone(d)]
+        if phone_extend:
+            others = get_other_usable_phones(set(usable_listed))
+            return usable_listed + others
+        return usable_listed
+
+    # Случай 2: список через запятую
     if "," in phone:
-        clean: list[str] = []
+        clean_site: list[str] = []
         for p in phone.split(","):
             s = p.strip()
-            if s and s not in clean:
-                clean.append(s)
+            if s and s not in clean_site:
+                clean_site.append(s)
+
+        usable_listed = [p for p in clean_site if is_usable_phone(p)]
+        if phone_extend:
+            others = get_other_usable_phones(set(usable_listed))
+            clean = usable_listed + others
+        else:
+            clean = usable_listed
+
         patience = float(getattr(site, "phone_patience_seconds", 0) or 0)
         return PreferenceList(clean, patience=patience)
+
+    # Случай 3: одиночный телефон
+    if not is_usable_phone(phone):
+        return []
     return [phone]
 
 
 def phone_enabled(settings: Settings, site: SiteConfig) -> bool:
     """True, если заданы droidhub_url и droidhub_token, site.phone непустой и
-    (site.phone != 'auto' или settings.droidhub_devices непустой).
-    Для списка предпочтений: True, если заданы url/token и список не пуст.
+    есть хотя бы один пригодный телефон в candidates(settings, site).
     """
     phone = (getattr(site, "phone", None) or "").strip()
     url = (getattr(settings, "droidhub_url", None) or "").strip()
     token = (getattr(settings, "droidhub_token", None) or "").strip()
     if not (phone and url and token):
         return False
-    if phone == "auto" or "," in phone:
-        return bool(candidates(settings, site))
-    return True
+    return bool(candidates(settings, site))
 
 
 def _clean_candidates(candidates: list[str]) -> list[str]:

@@ -36,6 +36,7 @@ from .metrics import MetricsStore
 from .models import Query
 from .offers import assign_ids, filter_by_baggage
 from .parsing import city_name
+from .phones import PhoneRegistry
 from .pipeline import search
 from .prio_gate import PriorityGate
 from .scheduler import Scheduler
@@ -75,6 +76,15 @@ class Bot:
         self.http = httpx.AsyncClient(timeout=70)
         self.busy: set[int] = set()
         self.users = UserStore(settings.storage_dir / "users.sqlite")
+        self.phones = PhoneRegistry(
+            storage_dir=settings.storage_dir,
+            phones_new_policy=getattr(settings, "phones_new_policy", "active"),
+            phones_snapshot_ttl_seconds=getattr(settings, "phones_snapshot_ttl_seconds", 180),
+            phones_hold=getattr(settings, "phones_hold", None),
+        )
+        self.s.phones = self.phones
+        self._phones_fail_count: int = 0
+        self._phones_task: asyncio.Task | None = None
         try:
             self.metrics: MetricsStore | None = MetricsStore(settings.storage_dir / "metrics.sqlite")
         except Exception:
@@ -453,6 +463,10 @@ class Bot:
             if msg.get("from", {}).get("id") in self.s.tg_allowed_ids:
                 await self._show_admin_panel(chat_id, section="home")
             return
+        if cmd == "/phone":
+            if msg.get("from", {}).get("id") in self.s.tg_allowed_ids:
+                await self._phone_command(chat_id, text)
+            return
         if text.startswith(("/stats", "/block", "/unblock")):
             if msg.get("from", {}).get("id") in self.s.tg_allowed_ids:
                 await self._admin_command(chat_id, text)
@@ -573,6 +587,89 @@ class Bot:
         else:
             await self.send(chat_id, f"{target}: {'заблокирован' if cmd == '/block' else 'разблокирован'}")
 
+    async def _phone_command(self, chat_id: int, text: str) -> None:
+        """Обрабатывает /phone <id> allow site1,site2 | deny site1 | all | hold | on."""
+        parts = text.strip().split(maxsplit=2)
+        if len(parts) < 3:
+            await self.send(
+                chat_id,
+                "Формат: <code>/phone &lt;id&gt; allow s1,s2 | deny s1 | all | hold | on</code>",
+            )
+            return
+
+        phone_id = parts[1].strip()
+        subcmd_raw = parts[2].strip()
+        subparts = subcmd_raw.split(maxsplit=1)
+        subcmd = subparts[0].lower()
+        subargs = subparts[1].strip() if len(subparts) > 1 else ""
+
+        all_phones = self.phones.all()
+        if phone_id not in all_phones:
+            await self.send(chat_id, f"⚠️ Телефон <code>{escape(phone_id)}</code> не найден в реестре.")
+            return
+
+        valid_sites = {s.name for s in self.s.sites}
+
+        if subcmd == "hold":
+            self.phones.set_status(phone_id, "hold")
+            await self.send(chat_id, f"❄️ Телефон <code>{escape(phone_id)}</code>: статус изменён на <b>hold</b> (заморожен).")
+            return
+
+        if subcmd in ("on", "active"):
+            self.phones.set_status(phone_id, "active")
+            await self.send(chat_id, f"✅ Телефон <code>{escape(phone_id)}</code>: статус изменён на <b>active</b> (в работе).")
+            return
+
+        if subcmd == "all":
+            self.phones.set_sites(phone_id, allow=None, deny=[])
+            await self.send(chat_id, f"🌐 Телефон <code>{escape(phone_id)}</code>: разрешены <b>все сайты</b>.")
+            return
+
+        if subcmd == "allow":
+            if not subargs:
+                await self.send(chat_id, "Укажите сайты: <code>/phone &lt;id&gt; allow site1,site2</code>")
+                return
+            sites = [s.strip() for s in subargs.split(",") if s.strip()]
+            invalid = [s for s in sites if s not in valid_sites]
+            if invalid:
+                avail = ", ".join(sorted(valid_sites))
+                await self.send(
+                    chat_id,
+                    f"⚠️ Неизвестные сайты: <code>{escape(', '.join(invalid))}</code>\nДоступны: {escape(avail)}",
+                )
+                return
+            self.phones.set_sites(phone_id, allow=sites, deny=[])
+            await self.send(
+                chat_id,
+                f"✅ Телефон <code>{escape(phone_id)}</code>: разрешены сайты: <b>{escape(', '.join(sites))}</b>",
+            )
+            return
+
+        if subcmd == "deny":
+            if not subargs:
+                await self.send(chat_id, "Укажите сайты: <code>/phone &lt;id&gt; deny site1,site2</code>")
+                return
+            sites = [s.strip() for s in subargs.split(",") if s.strip()]
+            invalid = [s for s in sites if s not in valid_sites]
+            if invalid:
+                avail = ", ".join(sorted(valid_sites))
+                await self.send(
+                    chat_id,
+                    f"⚠️ Неизвестные сайты: <code>{escape(', '.join(invalid))}</code>\nДоступны: {escape(avail)}",
+                )
+                return
+            self.phones.set_sites(phone_id, allow=None, deny=sites)
+            await self.send(
+                chat_id,
+                f"🚫 Телефон <code>{escape(phone_id)}</code>: запрещены сайты: <b>{escape(', '.join(sites))}</b>",
+            )
+            return
+
+        await self.send(
+            chat_id,
+            "Неизвестное действие. Формат: <code>/phone &lt;id&gt; allow s1,s2 | deny s1 | all | hold | on</code>",
+        )
+
     async def _handle_admin_callback(self, cq: dict, data: str) -> None:
         cq_id = cq.get("id")
         msg = cq.get("message") or {}
@@ -623,6 +720,27 @@ class Bot:
                 self._backup_in_progress = False
 
             await self._show_admin_panel(chat_id, section="backup", message_id=message_id)
+            return
+
+        if section == "ph":
+            # Callback-запросы раздела Телефоны: adm:ph или adm:ph:hold:<id> или adm:ph:on:<id>
+            if len(parts) >= 4:
+                action = parts[2]
+                phone_id = parts[3]
+                if action == "hold":
+                    await asyncio.to_thread(self.phones.set_status, phone_id, "hold")
+                    if cq_id:
+                        await self.call("answerCallbackQuery", callback_query_id=cq_id, text=f"Заморожен: {phone_id}")
+                elif action in ("on", "active"):
+                    await asyncio.to_thread(self.phones.set_status, phone_id, "active")
+                    if cq_id:
+                        await self.call("answerCallbackQuery", callback_query_id=cq_id, text=f"В работе: {phone_id}")
+            elif cq_id:
+                try:
+                    await self.call("answerCallbackQuery", callback_query_id=cq_id)
+                except Exception:
+                    pass
+            await self._show_admin_panel(chat_id, section="ph", message_id=message_id)
             return
 
         if cq_id:
@@ -693,6 +811,10 @@ class Bot:
             elif section == "backup":
                 ctx = await asyncio.to_thread(self._collect_backup_data)
                 text = admin_panel.build_backups(ctx)
+            elif section == "ph":
+                ctx = await asyncio.to_thread(self._collect_phones_data)
+                text = admin_panel.build_phones(ctx)
+                keyboard = admin_panel.make_phones_keyboard(ctx.get("phones", []))
             elif section == "forecast":
                 ctx = await asyncio.to_thread(self._collect_forecast_data)
                 text = admin_panel.build_forecast(ctx)
@@ -709,12 +831,27 @@ class Bot:
                 "tickets": "🎫 <b>Билеты</b>",
                 "subs": "🔔 <b>Подписки</b>",
                 "backup": "🛟 <b>Бэкапы</b>",
+                "ph": "📱 <b>Телефоны</b>",
                 "forecast": "🔮 <b>Прогноз</b>",
             }
             title = headers.get(section, "🛠 <b>Панель разработчика</b>")
             text = f"{title}\n\n⚠️ данные недоступны"
 
         return text, keyboard
+
+    def _collect_phones_data(self) -> dict[str, Any]:
+        if not hasattr(self, "phones") or self.phones is None:
+            return {"phones": []}
+        all_p = self.phones.all()
+
+        def sort_key(item: tuple[str, dict[str, Any]]) -> Any:
+            fs = item[1].get("first_seen")
+            if isinstance(fs, (int, float)):
+                return (0, float(fs))
+            return (1, str(fs or ""))
+
+        sorted_p = [v for _, v in sorted(all_p.items(), key=sort_key)]
+        return {"phones": sorted_p}
 
     def _collect_overview_data(self) -> dict[str, Any]:
         now = time.time()
@@ -1096,15 +1233,85 @@ class Bot:
     async def _scheduler_notify(self, chat_id: int, text: str, reply_markup: dict | None) -> None:
         await self.send(chat_id, text, reply_markup=reply_markup)
 
-    async def _notify_admins(self, text: str) -> None:
+    async def _notify_admins(self, text: str, reply_markup: dict | None = None) -> None:
         """Отправляет сообщение всем администраторам из tg_allowed_ids."""
         if not self.s.tg_allowed_ids:
             return
         for admin_id in self.s.tg_allowed_ids:
             try:
-                await self.send(admin_id, text)
+                await self.send(admin_id, text, reply_markup=reply_markup)
             except Exception:
                 log.exception("ошибка отправки сообщения администратору %s", admin_id)
+
+    async def _fetch_hub_devices(self) -> list[dict[str, Any]]:
+        """Запрашивает список устройств из хаба GET /api/devices."""
+        url = self.s.droidhub_url.strip().rstrip("/") + "/api/devices"
+        headers = {}
+        if self.s.droidhub_token:
+            headers["Authorization"] = f"Bearer {self.s.droidhub_token.strip()}"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                raise RuntimeError(f"HTTP {resp.status_code}")
+            data = resp.json()
+            if not isinstance(data, list):
+                raise ValueError("Ответ /api/devices не является списком")
+            return data
+
+    async def _check_hub_devices_once(self) -> list[Any]:
+        """Один шаг опроса хаба и обновления реестра. Не падает при ошибках."""
+        try:
+            devices = await self._fetch_hub_devices()
+            self._phones_fail_count = 0
+            if not isinstance(devices, list):
+                return []
+            new_devs = await asyncio.to_thread(self.phones.refresh, devices)
+            for dev in new_devs:
+                await self._notify_new_phone(dev)
+            return new_devs
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self._phones_fail_count += 1
+            if self._phones_fail_count == 1 or self._phones_fail_count % 5 == 0:
+                log.warning("Ошибка опроса хаба телефонов (попытка %d): %s", self._phones_fail_count, e)
+            return []
+
+    async def _phones_refresh_loop(self) -> None:
+        """Периодическое автообнаружение телефонов из хаба."""
+        interval = max(5.0, float(getattr(self.s, "phones_refresh_seconds", 60)))
+        while True:
+            try:
+                await self._check_hub_devices_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+            await asyncio.sleep(interval)
+
+    async def _notify_new_phone(self, dev: Any) -> None:
+        """Оповещает администраторов о новом телефоне в хабе."""
+        dev_id = getattr(dev, "id", None) or (dev.get("id") if isinstance(dev, dict) else str(dev))
+        name = getattr(dev, "name", None) or (dev.get("name") if isinstance(dev, dict) else dev_id)
+        status = getattr(dev, "status", None) or (dev.get("status") if isinstance(dev, dict) else "active")
+
+        safe_name = escape(str(name))
+        safe_id = escape(str(dev_id))
+        status_text = "взят в работу" if status == "active" else "заморожен (ожидает одобрения)"
+
+        msg = (
+            f"📱 Новый телефон в хабе: {safe_name} ({safe_id}). "
+            f"Статус: {status_text}…\n\n"
+            f"Управление: /admin → «Телефоны» (кнопки в панели) или команда <code>/phone {safe_id} hold|on|all|allow|deny</code>"
+        )
+        reply_markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "📱 Телефоны в панели", "callback_data": "adm:ph"},
+                ]
+            ]
+        }
+        await self._notify_admins(msg, reply_markup=reply_markup)
 
     async def _maintenance_loop(self, tick_seconds: float = 300.0) -> None:
         """Отмечает, что бот жив (для учёта пропусков), и раз в сутки сворачивает и чистит историю цен."""
@@ -1198,6 +1405,8 @@ class Bot:
         offset = 0
         log.info("bot started")
         self._maintenance_task = asyncio.create_task(self._maintenance_loop())
+        if self.s.droidhub_url and self.s.droidhub_token:
+            self._phones_task = asyncio.create_task(self._phones_refresh_loop())
         if self.subs is not None:
             scheduler = Scheduler(
                 self.subs,
