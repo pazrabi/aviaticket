@@ -21,7 +21,7 @@ from .guard import SearchGuard, friendly_error
 from .models import Offer, Query, SiteResult
 from .parsers import PARSERS
 from .parsers.travelpayouts import fetch_travelpayouts, search_url
-from .sites import build_url
+from .sites import build_url, SiteConfig
 from .tutu_ids import resolve_city
 from .yandex_ids import city_id
 
@@ -223,17 +223,31 @@ async def _from_browser(
     extra = await resolve_extra(site, q)
     url = build_url(site, q, extra=extra)
 
+    if priority > 0 and getattr(site, "phone_full_wait_seconds", None) is not None:
+        wait_seconds = site.phone_full_wait_seconds
+    else:
+        wait_seconds = getattr(site, "phone_wait_seconds", 40)
+
+    if priority > 0 and getattr(site, "phone_full_wait_for", None) is not None:
+        wait_for = site.phone_full_wait_for
+    else:
+        wait_for = getattr(site, "phone_wait_for", "")
+
+    effective_weight = weight if weight > 0 else int(wait_seconds or 0)
+    patience = getattr(site, "phone_patience_seconds", 0) or 0
+
     if phone_enabled(settings, site):
         snap, finished = await fetch_page_snapshot_any(
             settings,
             candidates(settings, site),
             url,
-            wait_seconds=site.phone_wait_seconds,
+            wait_seconds=wait_seconds,
             capture_json=site.phone_capture_json,
-            wait_for=site.phone_wait_for,
+            wait_for=wait_for,
             priority=priority,
-            weight=weight,
+            weight=effective_weight,
             stats=stats,
+            patience=patience,
         )
         if snap.blocked:
             raise RuntimeError("сайт показал капчу на телефоне")
@@ -282,7 +296,11 @@ async def _run_site(
     t0 = time.monotonic()
     g = guard if guard is not None else globals()["guard"]
     stats: dict[str, Any] = {}
-    weight = int(getattr(site, "phone_wait_seconds", 0) or 0)
+    if priority > 0 and getattr(site, "phone_full_wait_seconds", None) is not None:
+        actual_wait_sec = site.phone_full_wait_seconds
+    else:
+        actual_wait_sec = getattr(site, "phone_wait_seconds", 0) or 0
+    weight = int(actual_wait_sec or 0)
 
     async def _fetch_browser() -> tuple[list[Offer], str | None, bool]:
         try:

@@ -25,6 +25,7 @@ sites:
     parser: aviasales
     enabled: true
     phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu, Яндекса и OneTwoTrip
+    phone_patience_seconds: 10
     phone_capture_json: ["/search/v3.2/results"]
     phone_wait_seconds: 45
     phone_wait_for: '"last_update_timestamp":0'
@@ -40,6 +41,7 @@ sites:
     parser: kupibilet
     enabled: true
     phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu, Яндекса и OneTwoTrip
+    phone_patience_seconds: 15
     phone_wait_seconds: 30
     phone_capture_json: ["/frontend_search"]
     url_template: "https://www.kupibilet.ru/search?route%5B0%5D=iatax%3A{origin}_{date_iso}_date_{date_iso}_iatax%3A{destination}&adult={adults}&child=0&infant=0&childrenAges=%5B%5D&cabinClass=Y&v=2&filter=%7B%22transportKind%22%3A%7B%22Airplane%22%3Atrue%2C%22Train%22%3Afalse%7D%7D"
@@ -54,6 +56,7 @@ sites:
     id_resolver: tutu
     enabled: true
     phone: "realme,redmi"   # realme первым; redmi подхватывает, когда realme занят (замеры 2026-11-04)
+    phone_patience_seconds: 5
     phone_wait_seconds: 25
     phone_capture_json: ["/avia/offers/v2"]
     url_template: "https://avia.tutu.ru/f/{origin_seo}/{destination_seo}/?class=Y&travelers={adults}&route[0]={origin_id}-{ddmmyyyy}-{destination_id}"
@@ -73,8 +76,11 @@ sites:
     parser: yandex_travel
     id_resolver: yandex
     enabled: true
-    phone: realme
+    phone: "realme,redmi"
+    phone_patience_seconds: 5
     phone_wait_seconds: 30
+    phone_full_wait_seconds: 45
+    phone_full_wait_for: '"cont":null'
     phone_capture_json: ["/api/avia/search/results"]
     url_template: "https://travel.yandex.ru/avia/search/result/?adult_seats={adults}&children_seats=0&fromId={origin_id}&infant_seats=0&klass=economy&oneway=1&salesChannel=B2C&toId={destination_id}&when={date_iso}"
     url_template_rt: "https://travel.yandex.ru/avia/search/result/?adult_seats={adults}&children_seats=0&fromId={origin_id}&infant_seats=0&klass=economy&oneway=2&return_date={date_iso_ret}&salesChannel=B2C&toId={destination_id}&when={date_iso}"
@@ -88,6 +94,7 @@ sites:
     parser: onetwotrip
     enabled: true
     phone: "realme,redmi"   # realme первым; redmi подхватывает, когда realme занят (замеры 2026-11-04)
+    phone_patience_seconds: 5
     phone_wait_seconds: 30
     phone_capture_json: ["/search/v3"]
     url_template: "https://www.onetwotrip.com/ru/f/search/{ddmm}{origin}{destination}?sc=E&p={adults}_0_0"
@@ -102,6 +109,7 @@ sites:
     parser: ozon_travel
     enabled: true
     phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu, Яндекса и OneTwoTrip
+    phone_patience_seconds: 10
     phone_wait_seconds: 30
     phone_capture_json: ["aviaSearchResult"]
     url_template: "https://www.ozon.ru/travel/flight/search?Children=0&Dlts={adults}&Infants=0&ServiceClass=ECONOMY&dates=d{date_iso}&route={origin}{destination}"
