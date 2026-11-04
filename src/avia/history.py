@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time as dt_time, timedelta
+import os
 from pathlib import Path
 import sqlite3
 import statistics
 import time
-from typing import Iterable
+from typing import Any, Iterable
 import uuid
 
+from .config import Settings
 from .models import Offer, Query, SiteResult
 from .offers import baggage_state
 
@@ -156,12 +158,52 @@ def parse_seed_routes(seed_routes: list[str] | list[tuple[str, str]] | None) -> 
 
 class PriceHistory:
     parse_seed_routes = staticmethod(parse_seed_routes)
-    def __init__(self, path: Path | str):
+    def __init__(
+        self,
+        path: Path | str,
+        max_offers_per_site: int | Any = None,
+        history_max_offers_per_site: int | None = None,
+    ):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        if history_max_offers_per_site is not None:
+            self._max_offers_per_site: int | None = int(history_max_offers_per_site)
+        elif hasattr(max_offers_per_site, "history_max_offers_per_site"):
+            self._max_offers_per_site = int(max_offers_per_site.history_max_offers_per_site)
+        elif max_offers_per_site is not None:
+            self._max_offers_per_site = int(max_offers_per_site)
+        else:
+            self._max_offers_per_site = None
         with self._connect() as db:
             db.executescript(SCHEMA)
             self._migrate(db)
+
+    def _get_max_offers_per_site(self) -> int:
+        if self._max_offers_per_site is not None:
+            return self._max_offers_per_site
+        env_val = os.getenv("HISTORY_MAX_OFFERS_PER_SITE", "").strip()
+        if env_val:
+            try:
+                return int(env_val)
+            except ValueError:
+                pass
+        return getattr(Settings, "history_max_offers_per_site", 15)
+
+    @property
+    def history_max_offers_per_site(self) -> int:
+        return self._get_max_offers_per_site()
+
+    @history_max_offers_per_site.setter
+    def history_max_offers_per_site(self, val: int) -> None:
+        self._max_offers_per_site = int(val)
+
+    @property
+    def max_offers_per_site(self) -> int:
+        return self._get_max_offers_per_site()
+
+    @max_offers_per_site.setter
+    def max_offers_per_site(self, val: int) -> None:
+        self._max_offers_per_site = int(val)
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path, timeout=10)
@@ -204,11 +246,14 @@ class PriceHistory:
         results: Iterable[SiteResult],
         now: float | None = None,
         search_id: str | None = None,
+        max_offers_per_site: int | None = None,
+        history_max_offers_per_site: int | None = None,
     ) -> None:
         """Проставляет prev_price/prev_at/min_price у билетов и записывает текущие цены."""
         now = time.time() if now is None else float(now)
         search_id = search_id or uuid.uuid4().hex[:12]
-        offers = [o for r in results if r.ok for o in r.offers if o.offer_id]
+        res_list = list(results)
+        offers = [o for r in res_list if r.ok for o in r.offers if o.offer_id]
         if not offers:
             return
 
@@ -219,6 +264,32 @@ class PriceHistory:
         days_to_dep = (depart_date - obs_date).days
         ret_date = _normalize_date(q.return_date)
         ret = ret_date.isoformat() if ret_date else None
+
+        # Лимит предложений на один сайт для записи в историю (0 = без ограничения)
+        if history_max_offers_per_site is not None:
+            cap = int(history_max_offers_per_site)
+        elif max_offers_per_site is not None:
+            cap = int(max_offers_per_site)
+        else:
+            cap = self.history_max_offers_per_site
+
+        # Отбираем самые дешёвые билеты по каждому сайту (SiteResult.site) для записи в историю
+        to_record_ids: set[int] = set()
+        by_site: dict[str, list[Offer]] = {}
+        for r in res_list:
+            if not r.ok:
+                continue
+            site_offers = [o for o in r.offers if o.offer_id]
+            if site_offers:
+                by_site.setdefault(r.site, []).extend(site_offers)
+
+        for site_offers in by_site.values():
+            if cap > 0:
+                cheapest = sorted(site_offers, key=lambda o: o.price)[:cap]
+            else:
+                cheapest = site_offers
+            for o in cheapest:
+                to_record_ids.add(id(o))
 
         with self._connect() as db:
             for o in offers:
@@ -239,6 +310,11 @@ class PriceHistory:
                 if last is not None:
                     o.prev_price, o.prev_at = int(last[0]), float(last[1])
                     o.min_price = int(low[0]) if low and low[0] is not None else None
+
+                # В историю пишем только самые дешёвые варианты сайта в этом поиске
+                if id(o) not in to_record_ids:
+                    continue
+
                 fresh_same = last is not None and int(last[0]) == o.price and now - float(last[1]) < SAME_PRICE_TTL
                 if fresh_same:
                     continue
@@ -300,6 +376,11 @@ class PriceHistory:
                     routes[route_key][sample_key].append(int(price))
 
                 for (origin, destination, depart, ret, adults), samples_dict in routes.items():
+                    # samples, min_price, p25_price и median_price рассчитываются по реально записанным
+                    # в price_history строкам: для каждого замера (search_id) берётся минимум цен среди
+                    # сохранённых офферов. Так как annotate сохраняет самые дешёвые варианты каждого сайта
+                    # (до history_max_offers_per_site), минимум замера min(prices) и дневной min_p не искажаются,
+                    # а samples отражает число замеров маршрута за день.
                     best_prices = [min(prices) for prices in samples_dict.values()]
                     if not best_prices:
                         continue

@@ -81,6 +81,7 @@ class Settings:
     forecast_enabled: bool = True
     forecast_retrain_days: int = 7
     forecast_dir: Path | None = None
+    history_max_offers_per_site: int = 15
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -157,4 +158,5 @@ def load_settings(path: Path | None = None) -> Settings:
         forecast_enabled=os.getenv("FORECAST_ENABLED", "1") != "0",
         forecast_retrain_days=int(os.getenv("FORECAST_RETRAIN_DAYS", "7")),
         forecast_dir=Path(os.environ["FORECAST_DIR"]) if os.getenv("FORECAST_DIR") else None,
+        history_max_offers_per_site=int(os.getenv("HISTORY_MAX_OFFERS_PER_SITE", "15")),
     )
