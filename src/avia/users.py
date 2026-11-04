@@ -120,3 +120,25 @@ class UserStore:
         with self._connect() as db:
             rows = db.execute("SELECT * FROM users ORDER BY last_seen_at DESC LIMIT ?", (int(limit),)).fetchall()
         return [self._row(r) for r in rows]
+
+    def count_since_created(self, ts: float) -> int:
+        """Число пользователей, созданных начиная с ts."""
+        with self._connect() as db:
+            row = db.execute("SELECT COUNT(*) FROM users WHERE created_at >= ?", (float(ts),)).fetchone()
+            return int(row[0]) if row else 0
+
+    def count_active_since(self, ts: float) -> int:
+        """Число пользователей, заходивших начиная с ts."""
+        with self._connect() as db:
+            row = db.execute("SELECT COUNT(*) FROM users WHERE last_seen_at >= ?", (float(ts),)).fetchone()
+            return int(row[0]) if row else 0
+
+    def top_searchers(self, limit: int = 5) -> list[User]:
+        """Топ пользователей по суммарному числу поисков."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM users ORDER BY total_searches DESC, last_seen_at DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            return [self._row(r) for r in rows]
+

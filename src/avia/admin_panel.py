@@ -1,0 +1,451 @@
+"""Панель разработчика: формирование текстов и inline-клавиатур."""
+from __future__ import annotations
+
+from datetime import date, datetime
+from html import escape
+from pathlib import Path
+import subprocess
+import time
+from typing import Any
+
+from .parsing import city_name
+
+
+def get_git_commit(cwd: Path | str | None = None) -> str:
+    """Возвращает короткий хэш git-коммита проекта (2 с таймаут) или '—'."""
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2.0,
+            cwd=cwd or Path(__file__).resolve().parents[2],
+        )
+        if res.returncode == 0:
+            val = res.stdout.strip()
+            return val if val else "—"
+        return "—"
+    except Exception:
+        return "—"
+
+
+def format_uptime(seconds: float) -> str:
+    """Форматирует аптайм вида '2 дн 3 ч' или '4 ч 15 мин'."""
+    s = max(0, int(seconds))
+    days = s // 86400
+    hours = (s % 86400) // 3600
+    minutes = (s % 3600) // 60
+    if days > 0:
+        return f"{days} дн {hours} ч"
+    if hours > 0:
+        return f"{hours} ч {minutes} мин"
+    return f"{minutes} мин"
+
+
+def format_backup_time(ts: float | None, now: float | None = None) -> str:
+    """Форматирует время бэкапа и 'N ч назад'."""
+    if ts is None:
+        return "—"
+    now_ts = time.time() if now is None else float(now)
+    diff = max(0.0, now_ts - ts)
+    dt_str = datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+    hours = int(diff // 3600)
+    if hours >= 24:
+        days = hours // 24
+        return f"{dt_str} ({days} дн назад)"
+    if hours > 0:
+        return f"{dt_str} ({hours} ч назад)"
+    mins = max(1, int(diff // 60))
+    return f"{dt_str} ({mins} мин назад)"
+
+
+def truncate_text(text: str, max_chars: int = 3800) -> str:
+    """Укорачивает текст до max_chars с сохранением читаемости."""
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    last_nl = cut.rfind("\n")
+    if last_nl > max_chars // 2:
+        cut = cut[:last_nl]
+    return cut + "\n\n… [часть данных обрезана]"
+
+
+def make_home_keyboard() -> dict[str, Any]:
+    """Inline-кнопки главного меню (по 2 в ряд)."""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📊 Обзор", "callback_data": "adm:over"},
+                {"text": "🌐 Парсинг", "callback_data": "adm:parse:24h"},
+            ],
+            [
+                {"text": "👥 Пользователи", "callback_data": "adm:users"},
+                {"text": "🗄 База", "callback_data": "adm:db"},
+            ],
+            [
+                {"text": "🎫 Билеты", "callback_data": "adm:tickets"},
+                {"text": "🔔 Подписки", "callback_data": "adm:subs"},
+            ],
+            [
+                {"text": "🛟 Бэкапы", "callback_data": "adm:backup"},
+                {"text": "🔄 Обновить", "callback_data": "adm:home"},
+            ],
+        ]
+    }
+
+
+def make_section_keyboard(section: str, period: str = "24h") -> dict[str, Any]:
+    """Inline-кнопки внутри раздела."""
+    if section == "parse":
+        p24 = "• 24 ч •" if period == "24h" else "24 ч"
+        p7 = "• 7 дн •" if period == "7d" else "7 дн"
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": p24, "callback_data": "adm:parse:24h"},
+                    {"text": p7, "callback_data": "adm:parse:7d"},
+                ],
+                [
+                    {"text": "◀ Назад", "callback_data": "adm:home"},
+                    {"text": "🔄 Обновить", "callback_data": f"adm:parse:{period}"},
+                ],
+            ]
+        }
+    if section == "backup":
+        return {
+            "inline_keyboard": [
+                [{"text": "💾 Сделать бэкап сейчас", "callback_data": "adm:backup_now"}],
+                [
+                    {"text": "◀ Назад", "callback_data": "adm:home"},
+                    {"text": "🔄 Обновить", "callback_data": "adm:backup"},
+                ],
+            ]
+        }
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "◀ Назад", "callback_data": "adm:home"},
+                {"text": "🔄 Обновить", "callback_data": f"adm:{section}"},
+            ],
+        ]
+    }
+
+
+def build_home() -> str:
+    """Главный экран панели разработчика."""
+    return (
+        "🛠 <b>Панель разработчика</b>\n\n"
+        "Выберите раздел для просмотра информации:"
+    )
+
+
+def build_overview(ctx: dict[str, Any]) -> str:
+    """Раздел 1: 📊 Обзор."""
+    lines = ["📊 <b>Обзор</b>", ""]
+
+    uptime_s = ctx.get("uptime_seconds", 0.0)
+    lines.append(f"Аптайм: {format_uptime(uptime_s)}")
+
+    git_ver = ctx.get("git_version") or "—"
+    lines.append(f"Версия: {escape(str(git_ver))}")
+
+    u_tot = ctx.get("users_total", 0)
+    u_24 = ctx.get("users_active_24h", 0)
+    u_7d = ctx.get("users_active_7d", 0)
+    u_new = ctx.get("users_new_24h", 0)
+    lines.append(
+        f"Людей: {u_tot} всего · активных 24 ч: {u_24} · 7 дн: {u_7d} · новых 24 ч: {u_new}"
+    )
+
+    s_today = ctx.get("searches_today", 0)
+    bg_info = ctx.get("bg_searches", "выключен")
+    lines.append(f"Поисков сегодня: людей — {s_today}, фоновых — {bg_info}")
+
+    active_subs = ctx.get("active_subs", 0)
+    lines.append(f"Активных подписок: {active_subs}")
+
+    busy_cnt = ctx.get("busy_searches", 0)
+    lines.append(f"Поисков сейчас: {busy_cnt}")
+
+    last_b = ctx.get("last_backup_at")
+    now_ts = ctx.get("now", time.time())
+    lines.append(f"Последний бэкап: {format_backup_time(last_b, now_ts)}")
+
+    state_mb = ctx.get("state_size_mb", 0.0)
+    lines.append(f"Папка state: {state_mb:.1f} МБ")
+
+    return truncate_text("\n".join(lines))
+
+
+def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
+    """Раздел 2: 🌐 Парсинг."""
+    period_title = "7 дн" if period == "7d" else "24 ч"
+    lines = [f"🌐 <b>Парсинг</b> ({period_title})", ""]
+
+    summary = ctx.get("summary")
+    if not summary or summary.get("_total", {}).get("runs", 0) == 0:
+        lines.append("Данных пока нет: метрики копятся с момента включения")
+        return "\n".join(lines)
+
+    def _fmt_site(name: str, item: dict[str, Any]) -> str:
+        runs = item.get("runs", 0)
+        ok = item.get("ok", 0)
+        pct = round(ok / runs * 100) if runs > 0 else 0
+        part = item.get("partial", 0)
+        capt = item.get("captcha", 0)
+        fail = item.get("failed", 0)
+        t = item.get("avg_elapsed", 0.0)
+        v = item.get("avg_offers", 0.0)
+        return (
+            f"{escape(name)}: {runs} запусков · ок {pct}% · "
+            f"неполных {part} · капч {capt} · ошибок {fail} · "
+            f"ср. время {t:.1f} с · ср. вариантов {v:.1f}"
+        )
+
+    tot = summary.get("_total")
+    if tot:
+        lines.append(_fmt_site("Итого", tot))
+
+    sites = [k for k in sorted(summary.keys()) if k != "_total"]
+    for s in sites:
+        lines.append(_fmt_site(s, summary[s]))
+
+    counts = ctx.get("counts_by_source", {})
+    u_c = counts.get("user", 0)
+    s_c = counts.get("sub", 0)
+    b_c = counts.get("bg", 0)
+    lines.append("")
+    lines.append("<b>Источники:</b>")
+    lines.append(f"Люди: {u_c} · Подписки: {s_c} · Фон: {b_c}")
+
+    errors = ctx.get("recent_errors", [])
+    lines.append("")
+    lines.append("<b>Последние ошибки:</b>")
+    if errors:
+        for err in errors[:5]:
+            ts = err.get("ts", 0.0)
+            time_str = datetime.fromtimestamp(ts).strftime("%H:%M")
+            site_name = escape(str(err.get("site", "—")))
+            raw_err = str(err.get("error", "—"))
+            if len(raw_err) > 80:
+                raw_err = raw_err[:80] + "…"
+            lines.append(f"• {time_str} {site_name}: {escape(raw_err)}")
+    else:
+        lines.append("—")
+
+    return truncate_text("\n".join(lines))
+
+
+def build_users(ctx: dict[str, Any]) -> str:
+    """Раздел 3: 👥 Пользователи."""
+    lines = ["👥 <b>Пользователи</b>", ""]
+
+    tot = ctx.get("total", 0)
+    blocked = ctx.get("blocked", 0)
+    new_24 = ctx.get("new_24h", 0)
+    new_7d = ctx.get("new_7d", 0)
+    act_24 = ctx.get("active_24h", 0)
+    act_7d = ctx.get("active_7d", 0)
+    searches = ctx.get("searches", 0)
+
+    lines.append(f"Всего: {tot}")
+    lines.append(f"Заблокировано: {blocked}")
+    lines.append(f"Новых: за 24 ч — {new_24}, за 7 дн — {new_7d}")
+    lines.append(f"Активных: за 24 ч — {act_24}, за 7 дн — {act_7d}")
+    lines.append(f"Поисков всего: {searches}")
+
+    top = ctx.get("top_searchers", [])
+    lines.append("")
+    lines.append("<b>Топ-5 по числу поисков:</b>")
+    if top:
+        for u in top[:5]:
+            name = f"@{escape(u.username)}" if u.username else escape(u.first_name or "—")
+            mark = " 🚫" if u.blocked else ""
+            lines.append(f"• {u.tg_id} {name}: {u.total_searches}{mark}")
+    else:
+        lines.append("—")
+
+    recent = ctx.get("recent_users", [])
+    lines.append("")
+    lines.append("<b>Последние 5:</b>")
+    if recent:
+        for u in recent[:5]:
+            name = f"@{escape(u.username)}" if u.username else escape(u.first_name or "—")
+            time_str = datetime.fromtimestamp(u.last_seen_at).strftime("%d.%m %H:%M")
+            mark = " 🚫" if u.blocked else ""
+            lines.append(f"• {u.tg_id} {name} · {time_str} · поисков: {u.total_searches}{mark}")
+    else:
+        lines.append("—")
+
+    return truncate_text("\n".join(lines))
+
+
+def build_db(ctx: dict[str, Any]) -> str:
+    """Раздел 4: 🗄 База."""
+    lines = ["🗄 <b>База</b>", ""]
+
+    lines.append("<b>Размер файлов:</b>")
+    db_files = ctx.get("db_files", [])
+    if db_files:
+        for f in db_files:
+            lines.append(f"• {escape(f['name'])}: {f['size_mb']:.1f} МБ")
+    else:
+        lines.append("—")
+
+    lines.append("")
+    lines.append("<b>Строк в таблицах:</b>")
+    h_stats = ctx.get("history_stats", {})
+    ph_cnt = h_stats.get("price_history", 0)
+    rd_cnt = h_stats.get("route_daily", 0)
+    hb_cnt = h_stats.get("scheduler_heartbeat", 0)
+    lines.append(f"• price_history: {ph_cnt:,} (route_daily: {rd_cnt:,}, heartbeat: {hb_cnt:,})".replace(",", " "))
+
+    s_stats = ctx.get("subscriptions_stats", {})
+    sub_tot = s_stats.get("subscriptions", 0)
+    sub_act = s_stats.get("active_subscriptions", 0)
+    sp_cnt = s_stats.get("sub_prices", 0)
+    not_cnt = s_stats.get("notifications", 0)
+    lines.append(
+        f"• subscriptions: {sub_tot:,} (активных {sub_act:,}), "
+        f"sub_prices: {sp_cnt:,}, notifications: {not_cnt:,}".replace(",", " ")
+    )
+
+    u_cnt = ctx.get("users_count", 0)
+    lines.append(f"• users: {u_cnt:,}".replace(",", " "))
+
+    m_cnt = ctx.get("metrics_runs_count", 0)
+    lines.append(f"• site_runs: {m_cnt:,}".replace(",", " "))
+
+    lines.append("")
+    lines.append("<b>История цен:</b>")
+    e_date = h_stats.get("earliest_date")
+    l_date = h_stats.get("latest_date")
+    if e_date and l_date:
+        lines.append(f"• Период: с {e_date.strftime('%d.%m.%Y')} по {l_date.strftime('%d.%m.%Y')}")
+    else:
+        lines.append("• Период: —")
+
+    growth_24 = ctx.get("history_growth_24h", 0)
+    growth_mb = ctx.get("growth_mb_day", 0.0)
+    lines.append(f"• Прирост за 24 ч: +{growth_24} строк (~{growth_mb:.2f} МБ/сут)")
+
+    disk_free = ctx.get("disk_free_gb", 0.0)
+    lines.append("")
+    lines.append(f"Свободно на диске: {disk_free:.1f} ГБ")
+
+    return truncate_text("\n".join(lines))
+
+
+def build_tickets(ctx: dict[str, Any]) -> str:
+    """Раздел 5: 🎫 Билеты."""
+    lines = ["🎫 <b>Билеты</b> (7 дней)", ""]
+
+    r_cnt = ctx.get("routes_count", 0)
+    s_cnt = ctx.get("searches_count", 0)
+    lines.append(f"Маршрутов: {r_cnt} · Замеров: {s_cnt}")
+
+    avg_days = ctx.get("avg_days_to_departure")
+    avg_str = f"{avg_days:.1f} дн" if avg_days is not None else "—"
+    lines.append(f"Ср. дней до вылета: {avg_str}")
+
+    top_routes = ctx.get("popular_routes", [])
+    lines.append("")
+    lines.append("<b>Топ-5 популярных маршрутов:</b>")
+    if top_routes:
+        for r in top_routes[:5]:
+            orig = escape(city_name(r["origin"]))
+            dest = escape(city_name(r["destination"]))
+            cnt = r["count"]
+            min_p = r.get("min_price")
+            p_str = f"от {min_p:,} ₽".replace(",", " ") if min_p is not None else "цена —"
+            lines.append(f"• {orig} → {dest}: {cnt} замеров ({p_str})")
+    else:
+        lines.append("—")
+
+    bg = ctx.get("baggage", {})
+    tot_bg = bg.get("total", 0)
+    lines.append("")
+    lines.append("<b>Багаж:</b>")
+    if tot_bg > 0:
+        w_pct = round(bg.get("with", 0) / tot_bg * 100)
+        wo_pct = round(bg.get("without", 0) / tot_bg * 100)
+        un_pct = round(bg.get("unknown", 0) / tot_bg * 100)
+        lines.append(f"С багажом {w_pct}% · Без багажа {wo_pct}% · Неизвестно {un_pct}%")
+    else:
+        lines.append("—")
+
+    sites = ctx.get("site_share", [])
+    lines.append("")
+    lines.append("<b>Распределение по сайтам:</b>")
+    if sites:
+        for site, rows, wins in sites:
+            lines.append(f"• {escape(site)}: {rows} записей · {wins} раз мин. цена")
+    else:
+        lines.append("—")
+
+    return truncate_text("\n".join(lines))
+
+
+def build_subs(ctx: dict[str, Any]) -> str:
+    """Раздел 6: 🔔 Подписки."""
+    lines = ["🔔 <b>Подписки</b>", ""]
+
+    act = ctx.get("active_count", 0)
+    groups = ctx.get("groups_count", 0)
+    lines.append(f"Активных: {act} (на {groups} маршрутов)")
+
+    n_24 = ctx.get("notifications_24h", 0)
+    lines.append(f"Уведомлений за 24 ч: {n_24}")
+
+    top = ctx.get("top_routes", [])
+    lines.append("")
+    lines.append("<b>Топ-5 маршрутов:</b>")
+    if top:
+        for orig, dest, cnt in top[:5]:
+            lines.append(f"• {escape(city_name(orig))} → {escape(city_name(dest))}: {cnt}")
+    else:
+        lines.append("—")
+
+    ov = ctx.get("overdue", {})
+    lines.append("")
+    lines.append("<b>Очередь проверок:</b>")
+    lines.append(
+        f"Всего: {ov.get('total', 0)} · Просрочено: {ov.get('overdue', 0)} · "
+        f"Макс. отставание: {ov.get('max_lag_minutes', 0)} мин"
+    )
+
+    reasons = ctx.get("reasons", {})
+    lines.append("")
+    lines.append("<b>Уведомления за 7 дней по причинам:</b>")
+    if reasons:
+        for r_name, r_cnt in reasons.items():
+            lines.append(f"• {escape(r_name)}: {r_cnt}")
+    else:
+        lines.append("—")
+
+    return truncate_text("\n".join(lines))
+
+
+def build_backups(ctx: dict[str, Any]) -> str:
+    """Раздел 7: 🛟 Бэкапы."""
+    lines = ["🛟 <b>Бэкапы</b>", ""]
+
+    keep = ctx.get("keep", 14)
+    hour = ctx.get("hour", 3)
+    lines.append(f"<b>Политика:</b>\nХранится копий: {keep} · Автобэкап в {hour:02d}:00")
+
+    lines.append("")
+    lines.append("<b>Последние копии:</b>")
+    backups = ctx.get("backups", [])
+    if backups:
+        for b in backups[:6]:
+            db_name = escape(str(b.get("db", b.get("name", "db"))))
+            size = b.get("size", 0)
+            size_mb = size / (1024 * 1024)
+            size_str = f"{size_mb:.1f} МБ" if size_mb >= 0.1 else f"{size / 1024:.0f} КБ"
+            time_str = datetime.fromtimestamp(b.get("created_at", 0)).strftime("%d.%m %H:%M")
+            lines.append(f"• {db_name} ({size_str}, {time_str})")
+    else:
+        lines.append("Копий пока нет")
+
+    return truncate_text("\n".join(lines))

@@ -492,6 +492,63 @@ class SubscriptionStore:
             "max_lag": max_lag_minutes,
         }
 
+    def notifications_since(self, ts: float) -> int:
+        """Число уведомлений, отправленных начиная с ts."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT COUNT(*) FROM notifications WHERE sent_at >= ?",
+                (float(ts),),
+            ).fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    def table_stats(self) -> dict[str, int]:
+        """Число строк в таблицах subscriptions.sqlite."""
+        with self._connect() as db:
+            sub_row = db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END), 0) FROM subscriptions"
+            ).fetchone()
+            sub_cnt = int(sub_row[0]) if sub_row else 0
+            sub_active = int(sub_row[1]) if sub_row else 0
+
+            sp_row = db.execute("SELECT COUNT(*) FROM sub_prices").fetchone()
+            sp_cnt = int(sp_row[0]) if sp_row else 0
+
+            notif_row = db.execute("SELECT COUNT(*) FROM notifications").fetchone()
+            notif_cnt = int(notif_row[0]) if notif_row else 0
+
+        return {
+            "subscriptions": sub_cnt,
+            "active_subscriptions": sub_active,
+            "sub_prices": sp_cnt,
+            "notifications": notif_cnt,
+        }
+
+    def route_stats(self, limit: int = 5) -> dict[str, object]:
+        """Статистика маршрутов активных подписок: групп (уникальных запросов), топ-N маршрутов."""
+        with self._connect() as db:
+            g_row = db.execute(
+                "SELECT COUNT(DISTINCT origin || '-' || destination || '-' || depart || '-' || COALESCE(return_date, '') || '-' || adults) "
+                "FROM subscriptions WHERE active = 1"
+            ).fetchone()
+            groups_count = int(g_row[0]) if g_row and g_row[0] is not None else 0
+
+            top_rows = db.execute(
+                "SELECT origin, destination, COUNT(*) AS cnt FROM subscriptions "
+                "WHERE active = 1 GROUP BY origin, destination ORDER BY cnt DESC, origin ASC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+            top_routes = [(str(r["origin"]), str(r["destination"]), int(r["cnt"])) for r in top_rows]
+
+            act_row = db.execute("SELECT COUNT(*) FROM subscriptions WHERE active = 1").fetchone()
+            active_count = int(act_row[0]) if act_row and act_row[0] is not None else 0
+
+        return {
+            "active_count": active_count,
+            "groups_count": groups_count,
+            "top_routes": top_routes,
+        }
+
+
 
 def _classify_reason(s: str) -> str:
     """Определяет тип причины уведомления без чисел."""

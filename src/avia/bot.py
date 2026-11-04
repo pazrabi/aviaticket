@@ -6,13 +6,15 @@ from datetime import date, datetime
 from html import escape
 import logging
 import secrets
+from pathlib import Path
+import shutil
 import time
 from typing import Any
 
 import httpx
 
-from . import advice, analytics, charts
-from .backup import backup_all
+from . import admin_panel, advice, analytics, charts
+from .backup import backup_all, list_backups
 from .bg_collector import BackgroundCollector
 from .config import Settings, load_settings
 from .dialog import (
@@ -87,6 +89,8 @@ class Bot:
             self.subs = SubscriptionStore(settings.storage_dir / "subscriptions.sqlite")
             self.store = store if store is not None else ResultStore()
             self.dialog = Dialog(store=self.store, subs=self.subs)
+        self._backup_in_progress: bool = False
+        self._last_manual_backup_at: float = 0.0
 
     async def call(self, method: str, **params):
         payload = {k: v for k, v in params.items() if v is not None}
@@ -410,6 +414,11 @@ class Bot:
         if not self._admit(msg.get("from", {}), msg.get("chat")):
             return
         text = (msg.get("text") or "").strip()
+        cmd = text.split()[0].split("@")[0] if text else ""
+        if cmd == "/admin":
+            if msg.get("from", {}).get("id") in self.s.tg_allowed_ids:
+                await self._show_admin_panel(chat_id, section="home")
+            return
         if text.startswith(("/stats", "/block", "/unblock")):
             if msg.get("from", {}).get("id") in self.s.tg_allowed_ids:
                 await self._admin_command(chat_id, text)
@@ -511,6 +520,9 @@ class Bot:
             except Exception:
                 log.exception("stats: bg_collect failed")
 
+            lines.append("")
+            lines.append("Подробнее: /admin")
+
             await self.send(chat_id, "\n".join(lines))
             return
         arg = arg.strip()
@@ -527,17 +539,357 @@ class Bot:
         else:
             await self.send(chat_id, f"{target}: {'заблокирован' if cmd == '/block' else 'разблокирован'}")
 
+    async def _handle_admin_callback(self, cq: dict, data: str) -> None:
+        cq_id = cq.get("id")
+        msg = cq.get("message") or {}
+        chat_id = msg.get("chat", {}).get("id")
+        user_id = cq.get("from", {}).get("id")
+        if chat_id is None:
+            chat_id = user_id
+        message_id = msg.get("message_id")
+
+        parts = data.split(":")
+        section = parts[1] if len(parts) > 1 else "home"
+        param = parts[2] if len(parts) > 2 else None
+
+        if section == "backup_now":
+            if self._backup_in_progress:
+                if cq_id:
+                    await self.call("answerCallbackQuery", callback_query_id=cq_id, text="⏳ Бэкап уже выполняется…")
+                return
+            now = time.time()
+            if now - self._last_manual_backup_at < 30.0:
+                rem = max(1, int(round(30.0 - (now - self._last_manual_backup_at))))
+                if cq_id:
+                    await self.call(
+                        "answerCallbackQuery",
+                        callback_query_id=cq_id,
+                        text=f"Подождите {rem} с перед следующим бэкапом",
+                    )
+                return
+            self._backup_in_progress = True
+            try:
+                created = await asyncio.to_thread(self.backup_now)
+                self._last_manual_backup_at = time.time()
+                if cq_id:
+                    await self.call(
+                        "answerCallbackQuery",
+                        callback_query_id=cq_id,
+                        text=f"Готово: создано {len(created)} файлов",
+                    )
+            except Exception:
+                log.exception("backup_now failed")
+                if cq_id:
+                    await self.call(
+                        "answerCallbackQuery",
+                        callback_query_id=cq_id,
+                        text="⚠️ Ошибка бэкапа",
+                    )
+            finally:
+                self._backup_in_progress = False
+
+            await self._show_admin_panel(chat_id, section="backup", message_id=message_id)
+            return
+
+        if cq_id:
+            try:
+                await self.call("answerCallbackQuery", callback_query_id=cq_id)
+            except Exception:
+                pass
+
+        await self._show_admin_panel(chat_id, section=section, param=param, message_id=message_id)
+
+    async def _show_admin_panel(
+        self,
+        chat_id: int,
+        section: str = "home",
+        param: str | None = None,
+        message_id: int | None = None,
+    ) -> None:
+        text, reply_markup = await self._render_admin_panel(section, param)
+        if message_id is not None:
+            try:
+                await self.call(
+                    "editMessageText",
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                    reply_markup=reply_markup,
+                )
+            except Exception as e:
+                err_str = str(e).lower()
+                if "not modified" in err_str:
+                    pass
+                else:
+                    log.warning("admin editMessageText failed: %s", e)
+        else:
+            await self.send(chat_id, text, reply_markup=reply_markup)
+
+    async def _render_admin_panel(
+        self,
+        section: str,
+        param: str | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        if section == "home":
+            return admin_panel.build_home(), admin_panel.make_home_keyboard()
+
+        period = param or "24h"
+        keyboard = admin_panel.make_section_keyboard(section, period=period)
+        try:
+            if section == "over":
+                ctx = await asyncio.to_thread(self._collect_overview_data)
+                text = admin_panel.build_overview(ctx)
+            elif section == "parse":
+                ctx = await asyncio.to_thread(self._collect_parse_data, period)
+                text = admin_panel.build_parse(ctx, period=period)
+            elif section == "users":
+                ctx = await asyncio.to_thread(self._collect_users_data)
+                text = admin_panel.build_users(ctx)
+            elif section == "db":
+                ctx = await asyncio.to_thread(self._collect_db_data)
+                text = admin_panel.build_db(ctx)
+            elif section == "tickets":
+                ctx = await asyncio.to_thread(self._collect_tickets_data)
+                text = admin_panel.build_tickets(ctx)
+            elif section == "subs":
+                ctx = await asyncio.to_thread(self._collect_subs_data)
+                text = admin_panel.build_subs(ctx)
+            elif section == "backup":
+                ctx = await asyncio.to_thread(self._collect_backup_data)
+                text = admin_panel.build_backups(ctx)
+            else:
+                text = admin_panel.build_home()
+                keyboard = admin_panel.make_home_keyboard()
+        except Exception:
+            log.exception("admin section %s error", section)
+            headers = {
+                "over": "📊 <b>Обзор</b>",
+                "parse": "🌐 <b>Парсинг</b>",
+                "users": "👥 <b>Пользователи</b>",
+                "db": "🗄 <b>База</b>",
+                "tickets": "🎫 <b>Билеты</b>",
+                "subs": "🔔 <b>Подписки</b>",
+                "backup": "🛟 <b>Бэкапы</b>",
+            }
+            title = headers.get(section, "🛠 <b>Панель разработчика</b>")
+            text = f"{title}\n\n⚠️ данные недоступны"
+
+        return text, keyboard
+
+    def _collect_overview_data(self) -> dict[str, Any]:
+        now = time.time()
+        uptime = now - self.started_at
+        git_ver = admin_panel.get_git_commit(Path(__file__).resolve().parents[2])
+        u_tot = self.users.count() if self.users else 0
+        u_24 = self.users.count_active_since(now - 86400) if self.users else 0
+        u_7d = self.users.count_active_since(now - 7 * 86400) if self.users else 0
+        u_new = self.users.count_since_created(now - 86400) if self.users else 0
+        st = self.users.stats() if self.users else {}
+        s_user = st.get("today", 0)
+
+        if self.s.bg_collect:
+            done = self.bg_collector.done_today if self.bg_collector else 0
+            bg_info = f"{done} из {self.s.bg_collect_max_per_day}"
+        else:
+            bg_info = "выключен"
+
+        active_subs = 0
+        if self.subs:
+            s_stats = self.subs.table_stats()
+            active_subs = s_stats.get("active_subscriptions", 0)
+
+        busy_cnt = len(self.busy)
+        last_b = self.last_backup_at
+
+        state_mb = 0.0
+        try:
+            if self.s.storage_dir.exists():
+                size_b = sum(f.stat().st_size for f in self.s.storage_dir.rglob("*") if f.is_file())
+                state_mb = size_b / (1024 * 1024)
+        except Exception:
+            pass
+
+        return {
+            "uptime_seconds": uptime,
+            "git_version": git_ver,
+            "users_total": u_tot,
+            "users_active_24h": u_24,
+            "users_active_7d": u_7d,
+            "users_new_24h": u_new,
+            "searches_today": s_user,
+            "bg_searches": bg_info,
+            "active_subs": active_subs,
+            "busy_searches": busy_cnt,
+            "last_backup_at": last_b,
+            "now": now,
+            "state_size_mb": state_mb,
+        }
+
+    def _collect_parse_data(self, period: str = "24h") -> dict[str, Any]:
+        if self.metrics is None:
+            return {"summary": None, "counts_by_source": {}, "recent_errors": []}
+        now = time.time()
+        since_ts = now - (7 * 86400.0 if period == "7d" else 86400.0)
+        summary = self.metrics.summary(since_ts)
+        counts = self.metrics.counts_by_source(since_ts)
+        errors = self.metrics.recent_errors(limit=5, since_ts=since_ts)
+        return {
+            "summary": summary,
+            "counts_by_source": counts,
+            "recent_errors": errors,
+        }
+
+    def _collect_users_data(self) -> dict[str, Any]:
+        now = time.time()
+        st = self.users.stats() if self.users else {}
+        u_tot = st.get("users", 0)
+        blocked = st.get("blocked", 0)
+        searches = st.get("searches", 0)
+        new_24 = self.users.count_since_created(now - 86400) if self.users else 0
+        new_7d = self.users.count_since_created(now - 7 * 86400) if self.users else 0
+        act_24 = self.users.count_active_since(now - 86400) if self.users else 0
+        act_7d = self.users.count_active_since(now - 7 * 86400) if self.users else 0
+        top = self.users.top_searchers(limit=5) if self.users else []
+        recent = self.users.recent(limit=5) if self.users else []
+        return {
+            "total": u_tot,
+            "blocked": blocked,
+            "searches": searches,
+            "new_24h": new_24,
+            "new_7d": new_7d,
+            "active_24h": act_24,
+            "active_7d": act_7d,
+            "top_searchers": top,
+            "recent_users": recent,
+        }
+
+    def _collect_db_data(self) -> dict[str, Any]:
+        db_files = []
+        if self.s.storage_dir.exists():
+            for p in sorted(self.s.storage_dir.glob("*.sqlite")):
+                if p.is_file():
+                    db_files.append({"name": p.name, "size_mb": p.stat().st_size / (1024 * 1024)})
+
+        h_stats = self.history.table_stats() if self.history else {}
+        s_stats = self.subs.table_stats() if self.subs else {}
+        u_cnt = self.users.count() if self.users else 0
+
+        m_cnt = 0
+        if self.metrics:
+            try:
+                with self.metrics._connect() as db:
+                    row = db.execute("SELECT COUNT(*) FROM site_runs").fetchone()
+                    m_cnt = int(row[0]) if row else 0
+            except Exception:
+                m_cnt = 0
+
+        now = time.time()
+        growth_24 = self.history.rows_since(now - 86400) if self.history else 0
+
+        ph_path = self.s.storage_dir / "history.sqlite"
+        total_ph = h_stats.get("price_history", 0)
+        growth_mb = 0.0
+        if total_ph > 0 and ph_path.exists():
+            try:
+                avg_row = ph_path.stat().st_size / total_ph
+                growth_mb = (avg_row * growth_24) / (1024 * 1024)
+            except Exception:
+                growth_mb = 0.0
+
+        disk_free_gb = 0.0
+        try:
+            _, _, free = shutil.disk_usage(self.s.storage_dir)
+            disk_free_gb = free / (1024 ** 3)
+        except Exception:
+            pass
+
+        return {
+            "db_files": db_files,
+            "history_stats": h_stats,
+            "subscriptions_stats": s_stats,
+            "users_count": u_cnt,
+            "metrics_runs_count": m_cnt,
+            "history_growth_24h": growth_24,
+            "growth_mb_day": growth_mb,
+            "disk_free_gb": disk_free_gb,
+        }
+
+    def _collect_tickets_data(self) -> dict[str, Any]:
+        now = time.time()
+        t_overview = self.history.tickets_overview(days=7, now=now) if self.history else {}
+        pop_routes = self.history.popular_routes(limit=5, days=7, now=now) if self.history else []
+        routes_list = []
+        for orig, dest, count in pop_routes:
+            min_p = self.history.route_min_price(orig, dest, days=7, now=now)
+            routes_list.append({"origin": orig, "destination": dest, "count": count, "min_price": min_p})
+
+        sites = self.history.site_share(days=7, now=now) if self.history else []
+
+        return {
+            "routes_count": t_overview.get("routes_count", 0),
+            "searches_count": t_overview.get("searches_count", 0),
+            "avg_days_to_departure": t_overview.get("avg_days_to_departure"),
+            "popular_routes": routes_list,
+            "baggage": {
+                "with": t_overview.get("baggage_with", 0),
+                "without": t_overview.get("baggage_without", 0),
+                "unknown": t_overview.get("baggage_unknown", 0),
+                "total": t_overview.get("baggage_total", 0),
+            },
+            "site_share": sites,
+        }
+
+    def _collect_subs_data(self) -> dict[str, Any]:
+        now = time.time()
+        today_d = (
+            self.dialog.today()
+            if hasattr(self, "dialog") and hasattr(self.dialog, "today") and callable(self.dialog.today)
+            else date.today()
+        )
+        r_stats = self.subs.route_stats(limit=5) if self.subs else {}
+        ov = self.subs.overdue_stats(now, today_d) if self.subs else {}
+        reasons = self.subs.notification_reason_counts(now - 7 * 86400) if self.subs else {}
+        n_24 = self.subs.notifications_since(now - 86400) if self.subs else 0
+
+        return {
+            "active_count": r_stats.get("active_count", ov.get("active", 0)),
+            "groups_count": r_stats.get("groups_count", 0),
+            "top_routes": r_stats.get("top_routes", []),
+            "overdue": ov,
+            "reasons": reasons,
+            "notifications_24h": n_24,
+        }
+
+    def _collect_backup_data(self) -> dict[str, Any]:
+        backups = list_backups(self.s.backup_dir)
+        return {
+            "keep": self.s.backup_keep,
+            "hour": self.s.backup_hour,
+            "backups": backups,
+        }
+
     async def handle_callback(self, cq: dict):
         user_id = cq.get("from", {}).get("id")
+        data = cq.get("data", "")
+        cq_id = cq.get("id")
+
+        if data.startswith("adm:"):
+            if user_id not in self.s.tg_allowed_ids:
+                if cq_id:
+                    await self.call("answerCallbackQuery", callback_query_id=cq_id, text="Нет доступа")
+                return
+            await self._handle_admin_callback(cq, data)
+            return
+
         msg = cq.get("message") or {}
         if not self._admit(cq.get("from", {}), msg.get("chat")):
             return
-        cq_id = cq["id"]
         chat_id = msg.get("chat", {}).get("id")
         if chat_id is None:
             chat_id = user_id
         message_id = msg.get("message_id")
-        data = cq.get("data", "")
 
         if data.startswith("hist:"):
             now = time.time()

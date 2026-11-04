@@ -209,6 +209,7 @@ async def test_admin_stats_full_output(tmp_path):
     # Блок 4: Мак работал сегодня
     assert "Мак работал сегодня:" in text
     assert "Работал" in text and "пропусков" in text
+    assert "Подробнее: /admin" in text
 
 
 @pytest.mark.asyncio

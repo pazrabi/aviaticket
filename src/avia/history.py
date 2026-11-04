@@ -950,4 +950,179 @@ class PriceHistory:
             samples.add(sample_key)
         return len(samples)
 
+    def table_stats(self) -> dict[str, object]:
+        """Числа строк и даты первой/последней записи в history.sqlite."""
+        with self._connect() as db:
+            ph_row = db.execute(
+                "SELECT COUNT(*), MIN(observed_at), MAX(observed_at) FROM price_history"
+            ).fetchone()
+            ph_cnt = int(ph_row[0]) if ph_row and ph_row[0] is not None else 0
+            earliest_ts = float(ph_row[1]) if ph_row and ph_row[1] is not None else None
+            latest_ts = float(ph_row[2]) if ph_row and ph_row[2] is not None else None
+
+            rd_row = db.execute("SELECT COUNT(*) FROM route_daily").fetchone()
+            rd_cnt = int(rd_row[0]) if rd_row and rd_row[0] is not None else 0
+
+            hb_row = db.execute("SELECT COUNT(*) FROM scheduler_heartbeat").fetchone()
+            hb_cnt = int(hb_row[0]) if hb_row and hb_row[0] is not None else 0
+
+        earliest_date = datetime.fromtimestamp(earliest_ts).date() if earliest_ts is not None else None
+        latest_date = datetime.fromtimestamp(latest_ts).date() if latest_ts is not None else None
+
+        return {
+            "price_history": ph_cnt,
+            "route_daily": rd_cnt,
+            "scheduler_heartbeat": hb_cnt,
+            "earliest_ts": earliest_ts,
+            "latest_ts": latest_ts,
+            "earliest_date": earliest_date,
+            "latest_date": latest_date,
+        }
+
+    def rows_since(self, ts: float) -> int:
+        """Число строк price_history с observed_at >= ts."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT COUNT(*) FROM price_history WHERE observed_at >= ?",
+                (float(ts),),
+            ).fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    def route_min_price(
+        self,
+        origin: str,
+        destination: str,
+        days: int = 7,
+        now: float | None = None,
+    ) -> int | None:
+        """Минимальная цена за последние days дней по направлению origin -> destination."""
+        if days <= 0:
+            return None
+        now_ts = time.time() if now is None else float(now)
+        since_ts = now_ts - days * 86400.0
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT MIN(price) FROM price_history "
+                "WHERE origin = ? AND destination = ? AND observed_at >= ? AND observed_at <= ?",
+                (origin, destination, since_ts, now_ts),
+            ).fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+            return None
+
+    def site_share(
+        self,
+        days: int = 7,
+        now: float | None = None,
+    ) -> list[tuple[str, int, int]]:
+        """Распределение по сайтам за days дней: [(site, строк, побед)] по убыванию строк."""
+        if days <= 0:
+            return []
+        now_ts = time.time() if now is None else float(now)
+        since_ts = now_ts - days * 86400.0
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT site, price, search_id, observed_at FROM price_history "
+                "WHERE observed_at >= ? AND observed_at <= ?",
+                (since_ts, now_ts),
+            ).fetchall()
+
+        if not rows:
+            return []
+
+        site_rows: dict[str, int] = {}
+        searches: dict[str, dict[str, list[int]]] = {}
+
+        for site, price, s_id, obs_at in rows:
+            s_name = str(site)
+            site_rows[s_name] = site_rows.get(s_name, 0) + 1
+            sample_key = str(s_id) if s_id else f"m_{round(obs_at / 60.0)}"
+            if sample_key not in searches:
+                searches[sample_key] = {}
+            if s_name not in searches[sample_key]:
+                searches[sample_key][s_name] = []
+            searches[sample_key][s_name].append(int(price))
+
+        wins: dict[str, int] = {}
+        for sample_key, site_prices in searches.items():
+            all_prices = [p for plist in site_prices.values() for p in plist]
+            if not all_prices:
+                continue
+            best_p = min(all_prices)
+            for s_name, plist in site_prices.items():
+                if min(plist) == best_p:
+                    wins[s_name] = wins.get(s_name, 0) + 1
+
+        result = [
+            (s_name, site_rows[s_name], wins.get(s_name, 0))
+            for s_name in site_rows
+        ]
+        result.sort(key=lambda x: (-x[1], -x[2], x[0]))
+        return result
+
+    def tickets_overview(
+        self,
+        days: int = 7,
+        now: float | None = None,
+    ) -> dict[str, object]:
+        """Сводка по билетам за days дней: маршрутов, замеров, багаж, ср. дней до вылета."""
+        if days <= 0:
+            return {
+                "routes_count": 0,
+                "searches_count": 0,
+                "baggage_with": 0,
+                "baggage_without": 0,
+                "baggage_unknown": 0,
+                "baggage_total": 0,
+                "avg_days_to_departure": None,
+            }
+        now_ts = time.time() if now is None else float(now)
+        since_ts = now_ts - days * 86400.0
+
+        with self._connect() as db:
+            r_cnt = db.execute(
+                "SELECT COUNT(DISTINCT origin || '-' || destination) FROM price_history "
+                "WHERE observed_at >= ? AND observed_at <= ?",
+                (since_ts, now_ts),
+            ).fetchone()[0]
+
+            bg_rows = db.execute(
+                "SELECT baggage, COUNT(*) FROM price_history "
+                "WHERE observed_at >= ? AND observed_at <= ? GROUP BY baggage",
+                (since_ts, now_ts),
+            ).fetchall()
+
+            dep_row = db.execute(
+                "SELECT AVG(days_to_departure) FROM price_history "
+                "WHERE observed_at >= ? AND observed_at <= ? AND days_to_departure IS NOT NULL",
+                (since_ts, now_ts),
+            ).fetchone()
+
+        searches_cnt = self.count_searches_since(since_ts)
+
+        bg_with = 0
+        bg_without = 0
+        bg_unknown = 0
+        for bg_val, cnt in bg_rows:
+            if bg_val == "with":
+                bg_with += int(cnt)
+            elif bg_val == "without":
+                bg_without += int(cnt)
+            else:
+                bg_unknown += int(cnt)
+        bg_total = bg_with + bg_without + bg_unknown
+
+        avg_days = float(dep_row[0]) if dep_row and dep_row[0] is not None else None
+
+        return {
+            "routes_count": int(r_cnt) if r_cnt else 0,
+            "searches_count": searches_cnt,
+            "baggage_with": bg_with,
+            "baggage_without": bg_without,
+            "baggage_unknown": bg_unknown,
+            "baggage_total": bg_total,
+            "avg_days_to_departure": round(avg_days, 1) if avg_days is not None else None,
+        }
+
+
 
