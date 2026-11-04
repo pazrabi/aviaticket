@@ -222,24 +222,31 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
 
     statuses = ctx.get("parser_statuses")
     if statuses is None and summary:
+        from .parser_watch import evaluate_status
+        settings = ctx.get("settings")
+        if settings is None:
+            try:
+                from .config import load_settings
+                settings = load_settings()
+            except Exception:
+                settings = None
+        min_runs = getattr(settings, "parser_watch_min_runs", 8)
+        min_ok = getattr(settings, "parser_watch_min_ok_pct", 60.0)
+        max_inc = getattr(settings, "parser_watch_max_incomplete_pct", 60.0)
         statuses = {}
         for s_name, item in summary.items():
             if s_name != "_total":
                 runs = item.get("runs", 0)
                 ok = item.get("ok", 0)
                 part = item.get("partial", 0)
-                if runs >= 8:
-                    ok_pct = (ok / runs) * 100.0
-                    part_pct = (part / runs) * 100.0
-                    if ok_pct < 60.0:
-                        st = "сломан"
-                    elif part_pct > 60.0:
-                        st = "деградирует"
-                    else:
-                        st = "ок"
-                else:
-                    st = "мало данных"
-                statuses[s_name] = st
+                statuses[s_name] = evaluate_status(
+                    runs=runs,
+                    ok=ok,
+                    partial=part,
+                    min_runs=min_runs,
+                    min_ok_pct=float(min_ok),
+                    max_incomplete_pct=float(max_inc),
+                )
 
     if statuses:
         status_parts = [f"{escape(s)}: {escape(st)}" for s, st in sorted(statuses.items())]

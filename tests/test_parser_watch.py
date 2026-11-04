@@ -185,6 +185,27 @@ def test_admin_panel_status_line():
     assert escape("siteA") in txt
 
 
+def test_admin_panel_fallback_evaluate_status():
+    """Если parser_statuses отсутствует в контексте, вычисляется через evaluate_status с учётом settings."""
+    ctx = {
+        "summary": {
+            "_total": {"runs": 30, "ok": 20, "partial": 2, "captcha": 0, "failed": 10, "avg_elapsed": 2.0, "avg_offers": 10.0},
+            "siteA": {"runs": 10, "ok": 10, "partial": 0, "captcha": 0, "failed": 0, "avg_elapsed": 1.5, "avg_offers": 10.0},
+            "siteB": {"runs": 10, "ok": 2, "partial": 0, "captcha": 0, "failed": 8, "avg_elapsed": 1.5, "avg_offers": 1.0},
+            "siteC": {"runs": 10, "ok": 8, "partial": 7, "captcha": 0, "failed": 2, "avg_elapsed": 1.5, "avg_offers": 3.0},
+        },
+        # parser_statuses отсутствует
+    }
+    txt = build_parse(ctx, "24h")
+    assert "Статус: siteA: ок · siteB: сломан · siteC: деградирует" in txt
+
+    # С кастомными settings (min_runs=15) -> для 10 запусков статус "мало данных"
+    custom_s = Settings(sites=[], parser_watch_min_runs=15)
+    ctx["settings"] = custom_s
+    txt2 = build_parse(ctx, "24h")
+    assert "Статус: siteA: мало данных · siteB: мало данных · siteC: мало данных" in txt2
+
+
 def test_parser_watch_env_settings(monkeypatch):
     """Настройки загружаются из переменных окружения PARSER_WATCH_*."""
     monkeypatch.setenv("PARSER_WATCH_ENABLED", "0")

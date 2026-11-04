@@ -107,6 +107,11 @@ class Bot:
         self._last_manual_backup_at: float = 0.0
         self._last_parser_watch: float = 0.0
         self._last_samples_check: float = 0.0
+        try:
+            from .samples import install_sample_hook
+            install_sample_hook()
+        except Exception:
+            log.exception("ошибка установки перехватчика образцов")
 
     async def call(self, method: str, **params):
         payload = {k: v for k, v in params.items() if v is not None}

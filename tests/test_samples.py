@@ -13,9 +13,12 @@ from avia.parsers import PARSERS
 from avia.samples import (
     check_samples,
     check_samples_with_cooldown,
+    install_sample_hook,
     load_sample,
     run_parser_check_cli,
+    sample_capture_context,
     save_sample,
+    uninstall_sample_hook,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,12 +111,15 @@ def test_save_sample_gzip_compression_and_load(tmp_path):
 
 
 def test_save_sample_redacts_tokens(tmp_path):
-    """В сохранённых образцах токен заменяется на [REDACTED]."""
+    """В сохранённых образцах токен заменяется на [REDACTED], включая JSON-структуры."""
     samples_dir = tmp_path / "samples"
+    json_body = '{"access_token": "JSON_SECRET_KEY", "api_key": "JSON_API_KEY", "secret": "JSON_SECRET_VAL", "price": 5000}'
     snap = Snapshot(
         url="https://example.com/api?token=SECRET_12345&flight=10",
         text="Текст с access_token=SECRET_ACCESS_KEY внутри",
-        json_payloads=[("https://example.com/res?api_key=SECRET_API_KEY", '{"data": 1}')],
+        json_payloads=[
+            ("https://example.com/res?api_key=SECRET_API_KEY", json_body),
+        ],
     )
     q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 1))
 
@@ -124,7 +130,17 @@ def test_save_sample_redacts_tokens(tmp_path):
     assert "SECRET_12345" not in decompressed
     assert "SECRET_ACCESS_KEY" not in decompressed
     assert "SECRET_API_KEY" not in decompressed
+    assert "JSON_SECRET_KEY" not in decompressed
+    assert "JSON_API_KEY" not in decompressed
+    assert "JSON_SECRET_VAL" not in decompressed
     assert "[REDACTED]" in decompressed
+
+    # Проверяем, что загруженный образец содержит валидный payload с [REDACTED]
+    _, loaded_snap, _ = load_sample(p)
+    loaded_payload = json.loads(loaded_snap.json_payloads[0][1])
+    assert loaded_payload["access_token"] == "[REDACTED]"
+    assert loaded_payload["api_key"] == "[REDACTED]"
+    assert loaded_payload["price"] == 5000
 
 
 def test_save_sample_size_limit(tmp_path):
@@ -275,3 +291,70 @@ def test_check_samples_with_cooldown(tmp_path):
     # Следующая проверка -> нет сообщений
     rec_msgs2 = check_samples_with_cooldown(samples_dir, metrics, cooldown_hours=6, now=t0 + 7400)
     assert len(rec_msgs2) == 0
+
+
+def test_save_sample_future_mtime_clock_skew(tmp_path):
+    """Погрешность часов (mtime в будущем) не блокирует сохранение новых образцов."""
+    samples_dir = tmp_path / "samples"
+    snap = Snapshot(url="https://example.com", text="Поиск", json_payloads=[])
+    q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 1))
+
+    t0 = 1000000.0
+    # Создаём файл, у которого mtime в будущем относительно t0 (например, t0 + 10s)
+    p1 = save_sample("tutu", snap, q, samples_dir, now=t0 + 10.0)
+    assert p1 is not None and p1.exists()
+
+    # Сохраняем в момент t0 (now_ts - mtime = -10s < 0). Не должно блокироваться.
+    p2 = save_sample("tutu", snap, q, samples_dir, now=t0)
+    assert p2 is not None and p2.exists()
+
+
+@pytest.mark.asyncio
+async def test_sample_capture_context_concurrency_no_race(tmp_path):
+    """Параллельные поиски с sample_capture_context не имеют состояния гонки."""
+    import asyncio
+    from avia.models import Offer
+
+    dir1 = tmp_path / "samples1"
+    dir2 = tmp_path / "samples2"
+
+    dummy_site = "dummy_concurrent_site"
+
+    def dummy_parser(snap, q, site="dummy_concurrent_site"):
+        return [Offer(site=site, price=1000, airline="SU")]
+
+    PARSERS[dummy_site] = dummy_parser
+    try:
+        install_sample_hook()
+
+        snap = Snapshot(url="https://example.com", text="test", json_payloads=[])
+        q1 = Query(origin="MOW", destination="LED", depart=date(2026, 12, 1))
+        q2 = Query(origin="MOW", destination="AER", depart=date(2026, 12, 5))
+
+        async def slow_search():
+            with sample_capture_context(dir1):
+                await asyncio.sleep(0.05)
+                return PARSERS[dummy_site](snap, q1)
+
+        async def fast_search():
+            with sample_capture_context(dir2):
+                await asyncio.sleep(0.01)
+                return PARSERS[dummy_site](snap, q2)
+
+        res_slow, res_fast = await asyncio.gather(slow_search(), fast_search())
+        assert len(res_slow) == 1
+        assert len(res_fast) == 1
+
+        # Оба каталога должны получить свои образцы
+        files1 = list((dir1 / dummy_site).glob("sample_*.json.gz"))
+        files2 = list((dir2 / dummy_site).glob("sample_*.json.gz"))
+        assert len(files1) == 1
+        assert len(files2) == 1
+
+        # Вне контекста вызов парсера не сохраняет образцы
+        dir3 = tmp_path / "samples3"
+        PARSERS[dummy_site](snap, q1)
+        assert not dir3.exists()
+    finally:
+        uninstall_sample_hook()
+        PARSERS.pop(dummy_site, None)

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import contextvars
 import functools
 import gzip
 from html import escape
@@ -11,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import time
+import types
 from typing import Any, Callable
 
 from .collector import Snapshot
@@ -24,12 +26,35 @@ ParserFn = Callable[[Snapshot, Query], list[Offer]]
 
 def _redact_tokens(text: str) -> str:
     """Удаляет токены и ключи API из текста."""
-    return re.sub(
-        r'((?:[?&]|\b)(?:token|access_token|api_key|key|secret)=)[^&"\s]+',
+    # Query-параметры вида ?token=... или access_token=... или key=...
+    text = re.sub(
+        r'((?:[?&]|\b)(?:token|access_token|api_key|key|secret)=)[^&"\\\'\s]+',
         r'\1[REDACTED]',
         text,
         flags=re.I,
     )
+    # JSON-поля с двойными кавычками ("access_token": "...", "api_key": "...")
+    text = re.sub(
+        r'("(?:access_token|token|api_key|secret)"\s*:\s*")[^"]+(")',
+        r'\1[REDACTED]\2',
+        text,
+        flags=re.I,
+    )
+    # Экранированные JSON-поля в сериализованных строках (\"access_token\": \"...\")
+    text = re.sub(
+        r'(\\"(?:access_token|token|api_key|secret)\\"\s*:\s*\\")[^\\"]+(\\")',
+        r'\1[REDACTED]\2',
+        text,
+        flags=re.I,
+    )
+    # JSON/dict с одинарными кавычками ('access_token': '...')
+    text = re.sub(
+        r'(\'(?:access_token|token|api_key|secret)\'\s*:\s*\')[^\']+(\')',
+        r'\1[REDACTED]\2',
+        text,
+        flags=re.I,
+    )
+    return text
 
 
 def save_sample(
@@ -53,7 +78,7 @@ def save_sample(
     for f in existing_type_files:
         try:
             mtime = f.stat().st_mtime
-            if now_ts - mtime < min_interval_seconds:
+            if 0 <= now_ts - mtime < min_interval_seconds:
                 return None
         except OSError:
             pass
@@ -300,68 +325,100 @@ def run_parser_check_cli(samples_dir: Path | str | None = None) -> int:
     return 1 if has_failure else 0
 
 
-def install_sample_hook(samples_dir: Path | str) -> None:
+_samples_dir_var: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "_samples_dir_var", default=None
+)
+
+
+def _run_sample_hook(site_name: str, snap: Snapshot, q: Query, offers: list[Offer]) -> None:
+    if offers:
+        target_dir = _samples_dir_var.get()
+        if target_dir is not None:
+            try:
+                save_sample(site_name, snap, q, target_dir)
+            except Exception:
+                log.exception("ошибка сохранения образца %s", site_name)
+
+
+def install_sample_hook(samples_dir: Path | str | None = None) -> None:
     """Устанавливает перехватчик в PARSERS для автоматического сохранения образцов при успешных поисках."""
+    if samples_dir is not None:
+        _samples_dir_var.set(Path(samples_dir))
+
     for name, parser_fn in list(PARSERS.items()):
         if getattr(parser_fn, "_is_sample_hooked", False):
             continue
 
-        def make_wrapper(site_name: str, fn: ParserFn):
-            @functools.wraps(fn)
-            def wrapper(snap: Snapshot, q: Query) -> list[Offer]:
-                offers = fn(snap, q)
-                if offers:
-                    try:
-                        save_sample(site_name, snap, q, samples_dir)
-                    except Exception:
-                        log.exception("ошибка сохранения образца %s", site_name)
-                return offers
+        if isinstance(parser_fn, types.FunctionType) and parser_fn.__closure__ is None:
+            orig_copy = types.FunctionType(
+                parser_fn.__code__,
+                parser_fn.__globals__,
+                name=parser_fn.__name__,
+                argdefs=parser_fn.__defaults__,
+                closure=parser_fn.__closure__,
+            )
+            parser_fn.__globals__[f"_orig_parser_{name}"] = orig_copy
+            parser_fn.__globals__["_sample_hook_run"] = _run_sample_hook
+            src = f"""
+def _wrapper_{name}(snapshot, query):
+    offers = _orig_parser_{name}(snapshot, query)
+    _sample_hook_run({name!r}, snapshot, query, offers)
+    return offers
+"""
+            exec(src, parser_fn.__globals__)
+            wrapper_fn = parser_fn.__globals__[f"_wrapper_{name}"]
+            parser_fn._orig_code = parser_fn.__code__
+            parser_fn.__code__ = wrapper_fn.__code__
+            parser_fn._is_sample_hooked = True
+        else:
+            def make_wrapper(site_name: str, fn: ParserFn):
+                @functools.wraps(fn)
+                def wrapper(snap: Snapshot, q: Query) -> list[Offer]:
+                    offers = fn(snap, q)
+                    _run_sample_hook(site_name, snap, q, offers)
+                    return offers
 
-            wrapper._is_sample_hooked = True
-            if hasattr(fn, "results_complete"):
-                wrapper.results_complete = getattr(fn, "results_complete")
-            return wrapper
+                wrapper._is_sample_hooked = True
+                wrapper._orig_parser_fn = fn
+                if hasattr(fn, "results_complete"):
+                    wrapper.results_complete = getattr(fn, "results_complete")
+                return wrapper
 
-        PARSERS[name] = make_wrapper(name, parser_fn)
+            PARSERS[name] = make_wrapper(name, parser_fn)
+
+
+def uninstall_sample_hook() -> None:
+    """Снимает перехватчик с функций в PARSERS (для тестов)."""
+    for name, fn in list(PARSERS.items()):
+        if getattr(fn, "_is_sample_hooked", False):
+            if hasattr(fn, "_orig_code"):
+                fn.__code__ = fn._orig_code
+            elif hasattr(fn, "_orig_parser_fn"):
+                PARSERS[name] = getattr(fn, "_orig_parser_fn")
+            fn._is_sample_hooked = False
 
 
 class sample_capture_context:
-    """Контекстный менеджер для перехвата и сохранения снимков парсеров во время поиска."""
+    """Контекстный менеджер для установки каталога сохранения образцов в ContextVar текущей задачи asyncio."""
 
     def __init__(self, samples_dir: Path | str | None):
-        self.samples_dir = samples_dir
-        self.orig_parsers: dict[str, Any] = {}
+        self.samples_dir = Path(samples_dir) if samples_dir is not None else None
+        self.token: contextvars.Token | None = None
 
     def __enter__(self):
-        if not self.samples_dir:
-            return self
-        for name, fn in list(PARSERS.items()):
-            # Если уже обёрнут — сохраняем исходную функцию
-            orig = getattr(fn, "_orig_parser_fn", fn)
-            self.orig_parsers[name] = orig
-
-            def make_wrapper(site_name: str, real_fn: ParserFn):
-                @functools.wraps(real_fn)
-                def wrapper(snap: Snapshot, q: Query) -> list[Offer]:
-                    offers = real_fn(snap, q)
-                    if offers:
-                        try:
-                            save_sample(site_name, snap, q, self.samples_dir)
-                        except Exception:
-                            log.exception("ошибка сохранения образца %s", site_name)
-                    return offers
-
-                wrapper._orig_parser_fn = real_fn
-                if hasattr(real_fn, "results_complete"):
-                    wrapper.results_complete = getattr(real_fn, "results_complete")
-                return wrapper
-
-            PARSERS[name] = make_wrapper(name, orig)
+        install_sample_hook()
+        self.token = _samples_dir_var.set(self.samples_dir)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        for name, fn in self.orig_parsers.items():
-            PARSERS[name] = fn
+        if self.token is not None:
+            _samples_dir_var.reset(self.token)
+
+    async def __aenter__(self):
+        return self.__enter__()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return self.__exit__(exc_type, exc_val, exc_tb)
 
 
 def check_samples_with_cooldown(
