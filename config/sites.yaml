@@ -53,7 +53,7 @@ sites:
     parser: tutu
     id_resolver: tutu
     enabled: true
-    phone: realme
+    phone: "realme,redmi"   # realme первым; redmi подхватывает, когда realme занят (замеры 2026-11-04)
     phone_wait_seconds: 25
     phone_capture_json: ["/avia/offers/v2"]
     url_template: "https://avia.tutu.ru/f/{origin_seo}/{destination_seo}/?class=Y&travelers={adults}&route[0]={origin_id}-{ddmmyyyy}-{destination_id}"
@@ -87,7 +87,7 @@ sites:
     source: browser
     parser: onetwotrip
     enabled: true
-    phone: realme
+    phone: "realme,redmi"   # realme первым; redmi подхватывает, когда realme занят (замеры 2026-11-04)
     phone_wait_seconds: 30
     phone_capture_json: ["/search/v3"]
     url_template: "https://www.onetwotrip.com/ru/f/search/{ddmm}{origin}{destination}?sc=E&p={adults}_0_0"
