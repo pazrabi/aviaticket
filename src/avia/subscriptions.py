@@ -431,6 +431,83 @@ class SubscriptionStore:
                 (float(now), int(price), offer_id, sub_id),
             )
 
+    def notification_reason_counts(self, since_ts: float) -> dict[str, int]:
+        """Группирует причины отправленных уведомлений с since_ts по типу."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT reasons FROM notifications WHERE sent_at >= ? ORDER BY id ASC",
+                (float(since_ts),),
+            ).fetchall()
+
+        counts: dict[str, int] = {}
+        for (raw,) in rows:
+            if not raw:
+                continue
+            reasons_list: list[str] = []
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    reasons_list = [str(x) for x in parsed]
+                elif isinstance(parsed, str):
+                    reasons_list = [parsed]
+            except Exception:
+                reasons_list = [part.strip() for part in raw.replace(";", "\n").splitlines() if part.strip()]
+
+            for r in reasons_list:
+                key = _classify_reason(r)
+                counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def overdue_stats(self, now: float, today: date) -> dict[str, int]:
+        """Статистика очереди проверок: число активных, просроченных и макс. отставание в мин."""
+        today_date = today() if callable(today) else today
+        now_ts = now() if callable(now) else float(now)
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT * FROM subscriptions WHERE active = 1 ORDER BY id ASC"
+            ).fetchall()
+
+        total = len(rows)
+        overdue_count = 0
+        max_lag_seconds = 0.0
+
+        for row in rows:
+            sub = self._row_to_sub(row)
+            interval = poll_interval_seconds(sub.depart, today_date)
+            ref_time = sub.last_checked_at if sub.last_checked_at is not None else sub.created_at
+            elapsed = now_ts - ref_time
+            if elapsed > interval:
+                overdue_count += 1
+                lag = elapsed - interval
+                if lag > max_lag_seconds:
+                    max_lag_seconds = lag
+
+        max_lag_minutes = int(round(max_lag_seconds / 60.0))
+        return {
+            "total": total,
+            "active": total,
+            "overdue": overdue_count,
+            "max_lag_minutes": max_lag_minutes,
+            "max_lag": max_lag_minutes,
+        }
+
+
+def _classify_reason(s: str) -> str:
+    """Определяет тип причины уведомления без чисел."""
+    s_clean = s.strip().lower()
+    if s_clean.startswith("новый минимум"):
+        return "новый минимум"
+    if s_clean.startswith("упала"):
+        return "упала"
+    if s_clean.startswith("подорожала"):
+        return "подорожала"
+    if "порог" in s_clean:
+        return "ниже порога"
+    if "ниже обычного" in s_clean:
+        return "ниже обычного"
+    return s.strip()
+
 
 @dataclass
 class NotifyRules:

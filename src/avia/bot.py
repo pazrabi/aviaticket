@@ -2,17 +2,21 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import date, datetime
 from html import escape
 import logging
 import secrets
 import time
+from typing import Any
 
 import httpx
 
+from . import analytics, charts
 from .config import Settings, load_settings
 from .dialog import (
     HELP,
     Dialog,
+    HistoryRequest,
     Reply,
     SearchRequest,
     Session,
@@ -53,6 +57,7 @@ class Bot:
         self.users = UserStore(settings.storage_dir / "users.sqlite")
         self._search_sem = asyncio.Semaphore(settings.max_parallel_searches)
         self.history = PriceHistory(settings.storage_dir / "history.sqlite")
+        self._hist_times: dict[int, float] = {}
         if dialog is not None:
             self.dialog = dialog
             self.store = store if store is not None else dialog.store
@@ -112,10 +117,35 @@ class Bot:
             last_res = await self.call("sendMessage", **params)
         return last_res
 
+    async def send_photo(
+        self,
+        chat_id: int,
+        png_bytes: bytes,
+        caption: str | None = None,
+    ):
+        data: dict[str, str] = {"chat_id": str(chat_id)}
+        if caption:
+            data["caption"] = caption[:1024]
+            data["parse_mode"] = "HTML"
+        files = {"photo": ("chart.png", png_bytes, "image/png")}
+        try:
+            r = await self.http.post(
+                API.format(token=self.s.tg_token, method="sendPhoto"),
+                data=data,
+                files=files,
+            )
+            res = r.json()
+            if not res.get("ok"):
+                raise RuntimeError(f"telegram sendPhoto: {res}")
+            return res.get("result")
+        except Exception as e:
+            log.error("send_photo failed for chat %s: %s", chat_id, e)
+            raise
+
     async def _process_actions(
         self,
         chat_id: int,
-        actions: list[Reply | SearchRequest],
+        actions: list[Reply | SearchRequest | HistoryRequest],
         message_id: int | None = None,
     ):
         for item in actions:
@@ -138,6 +168,65 @@ class Bot:
                         await self.send(chat_id, item.text, reply_markup=reply_markup)
             elif isinstance(item, SearchRequest):
                 await self._run_search(chat_id, item)
+            elif isinstance(item, HistoryRequest):
+                await self._handle_history_request(chat_id, item)
+
+    async def _handle_history_request(self, chat_id: int, req: HistoryRequest) -> None:
+        try:
+            q = req.query
+            if self.history is None:
+                await self.send(chat_id, "Пока мало данных по этому маршруту, загляните позже")
+                return
+
+            def _load_data_and_render():
+                stats = self.history.route_stats(q)
+                series = self.history.route_series(q)
+                site_stats = self.history.cheapest_site_stats(q)
+
+                orig = city_name(q.origin)
+                dest = city_name(q.destination)
+
+                def _fmt_date(d: Any) -> str:
+                    if isinstance(d, (date, datetime)):
+                        return d.strftime("%d.%m")
+                    if isinstance(d, str):
+                        try:
+                            return date.fromisoformat(d.strip()).strftime("%d.%m")
+                        except Exception:
+                            return d
+                    return str(d)
+
+                d_str = _fmt_date(q.depart)
+                if q.return_date:
+                    r_str = _fmt_date(q.return_date)
+                    date_title = f"{d_str}–{r_str}"
+                else:
+                    date_title = d_str
+                title = f"{orig} → {dest}, {date_title}"
+
+                median = stats["median"] if stats else None
+                now_price = stats["last_price"] if stats else None
+
+                png = charts.render_price_chart(series, median, title, now_price=now_price)
+                return stats, series, site_stats, png
+
+            stats, series, site_stats, png = await asyncio.to_thread(_load_data_and_render)
+
+            lines = ["📊 <b>История цены</b>"]
+            sum_lines = analytics.summary_lines(stats, site_stats)
+            if sum_lines:
+                lines.extend(sum_lines)
+            caption = "\n".join(lines)
+
+            if png is not None:
+                await self.send_photo(chat_id, png, caption=caption)
+            elif stats is not None:
+                await self.send(chat_id, caption)
+            else:
+                await self.send(chat_id, "Пока мало данных по этому маршруту, загляните позже")
+        except Exception:
+            log.exception("history chart failed")
+            await self.send(chat_id, "Не удалось построить график")
 
     async def _run_search(self, chat_id: int, req: SearchRequest):
         if chat_id in self.busy:
@@ -285,6 +374,72 @@ class Bot:
                 name = f"@{u.username}" if u.username else (u.first_name or "—")
                 mark = " 🚫" if u.blocked else ""
                 lines.append(f"{u.tg_id} {escape(name)} · поисков {u.total_searches}{mark}")
+
+            # Дополнительные блоки аналитики
+            # 1. Популярные маршруты (7 дней)
+            try:
+                if self.history is not None:
+                    routes = self.history.popular_routes(5, 7)
+                    lines.append("")
+                    lines.append("Популярные маршруты (7 дней):")
+                    if routes:
+                        for orig, dest, count in routes:
+                            lines.append(f"{escape(city_name(orig))} → {escape(city_name(dest))}: {count}")
+                    else:
+                        lines.append("—")
+            except Exception:
+                log.exception("stats: popular_routes failed")
+
+            # 2. Уведомления по причинам (7 дней)
+            try:
+                if self.subs is not None:
+                    since_ts = time.time() - 7 * 86400.0
+                    reasons_dict = self.subs.notification_reason_counts(since_ts)
+                    lines.append("")
+                    lines.append("Уведомления по причинам (7 дней):")
+                    if reasons_dict:
+                        for r_name, r_cnt in reasons_dict.items():
+                            lines.append(f"{escape(r_name)}: {r_cnt}")
+                    else:
+                        lines.append("—")
+            except Exception:
+                log.exception("stats: notification_reason_counts failed")
+
+            # 3. Очередь проверок
+            try:
+                if self.subs is not None:
+                    now_ts = time.time()
+                    today_d = (
+                        self.dialog.today()
+                        if hasattr(self, "dialog") and hasattr(self.dialog, "today") and callable(self.dialog.today)
+                        else date.today()
+                    )
+                    ov = self.subs.overdue_stats(now_ts, today_d)
+                    lines.append("")
+                    lines.append("Очередь проверок:")
+                    lines.append(
+                        f"Подписок {ov.get('total', 0)}, просрочено {ov.get('overdue', 0)}, максимум отстаёт на {ov.get('max_lag_minutes', 0)} мин"
+                    )
+            except Exception:
+                log.exception("stats: overdue_stats failed")
+
+            # 4. Мак работал сегодня
+            try:
+                if self.history is not None:
+                    now_ts = time.time()
+                    now_dt = datetime.fromtimestamp(now_ts)
+                    start_of_day = datetime(now_dt.year, now_dt.month, now_dt.day).timestamp()
+                    cov = self.history.coverage(start_of_day, now_ts)
+                    covered_s = cov.get("covered_seconds", 0.0)
+                    gaps = cov.get("gaps", [])
+                    worked_h = int(round(covered_s / 3600.0))
+                    total_h = int(round(max(0.0, now_ts - start_of_day) / 3600.0))
+                    lines.append("")
+                    lines.append("Мак работал сегодня:")
+                    lines.append(f"Работал {worked_h} ч из {total_h}, пропусков {len(gaps)}")
+            except Exception:
+                log.exception("stats: coverage failed")
+
             await self.send(chat_id, "\n".join(lines))
             return
         arg = arg.strip()
@@ -312,6 +467,13 @@ class Bot:
             chat_id = user_id
         message_id = msg.get("message_id")
         data = cq.get("data", "")
+
+        if data.startswith("hist:"):
+            now = time.time()
+            if now - self._hist_times.get(chat_id, 0.0) < 5.0:
+                await self.call("answerCallbackQuery", callback_query_id=cq_id, text="Секунду…")
+                return
+            self._hist_times[chat_id] = now
 
         answered = False
         try:

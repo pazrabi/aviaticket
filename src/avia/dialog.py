@@ -90,6 +90,11 @@ class SearchRequest:
 
 
 @dataclass
+class HistoryRequest:
+    query: Query
+
+
+@dataclass
 class Session:
     step: Step = Step.MENU
     origin: str | None = None
@@ -122,6 +127,7 @@ def compact_keyboard(dialog_id: str, *, has_more: bool) -> list[list[tuple[str, 
         ("⚙️ Фильтры", f"filters:{dialog_id}"),
         ("📋 По сайтам", f"full:{dialog_id}"),
     ])
+    rows.append([("📊 История", f"hist:{dialog_id}")])
     rows.append([
         ("🔔 Следить за ценой", f"track:{dialog_id}"),
         ("🔎 Новый поиск", f"new:{dialog_id}"),
@@ -620,7 +626,38 @@ class Dialog:
         ]
         return [Reply(text=text, keyboard=keyboard, answer="Подписка оформлена")]
 
-    def on_callback(self, chat_id: int | str, data: str) -> list[Reply | SearchRequest]:
+    def _on_hist_callback(self, chat_id: int | str, parts: list[str]) -> list[Reply | HistoryRequest]:
+        if len(parts) >= 3 and parts[1] == "sub":
+            sub_id_str = parts[2]
+            if self.subs is not None:
+                try:
+                    sub = self.subs.get(int(sub_id_str))
+                    if sub is not None and sub.chat_id == int(chat_id):
+                        return [HistoryRequest(query=sub.query())]
+                except (ValueError, TypeError):
+                    pass
+            return [Reply(text="Пока мало данных по этому маршруту, загляните позже")]
+
+        q: Query | None = None
+        snap = self.store.get(chat_id)
+        if snap is not None:
+            q = snap.query
+        else:
+            session = self.sessions.get(chat_id)
+            if session is not None and session.origin and session.destination and session.depart:
+                q = Query(
+                    origin=session.origin,
+                    destination=session.destination,
+                    depart=session.depart,
+                    return_date=session.return_date,
+                    adults=session.adults,
+                )
+
+        if q is not None:
+            return [HistoryRequest(query=q)]
+        return [Reply(text="Пока мало данных по этому маршруту, загляните позже")]
+
+    def on_callback(self, chat_id: int | str, data: str) -> list[Reply | SearchRequest | HistoryRequest]:
         if data == "menu:go":
             return [self._start_search(chat_id)]
         if data == "menu:track":
@@ -649,6 +686,9 @@ class Dialog:
 
         if action == "track":
             return self._on_track_callback(chat_id)
+
+        if action == "hist":
+            return self._on_hist_callback(chat_id, parts)
 
         cb_dialog_id = sub_id_or_dialog_id
         session = self.sessions.get(chat_id)
