@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 from datetime import date, datetime
 import logging
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -331,3 +331,31 @@ async def test_send_photo_method(tmp_path, monkeypatch, caplog):
         with pytest.raises(RuntimeError):
             await bot.send_photo(777, b"fake_bytes", caption="error test")
         assert "my_secret_token_xyz" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_bot_history_request_advice_inclusion_and_resilience(tmp_path, monkeypatch):
+    """HistoryRequest содержит блок совета при наличии достаточного числа замеров, а ошибки price_curve игнорируются."""
+    bot = make_bot(tmp_path)
+    q = Query(origin="KUF", destination="EVN", depart=date.today() + date.resolution * 12)
+
+    # 12 замеров
+    for day in range(12):
+        bot.history.annotate(
+            q,
+            [SiteResult("aviasales", True, [Offer("aviasales", price=10000, offer_id=f"o{day}")])],
+            now=1000000.0 + day * 86400,
+            search_id=f"s{day}",
+        )
+
+    # Имитируем сбой в price_curve — не должен ломать построение истории
+    monkeypatch.setattr(bot.history, "price_curve", MagicMock(side_effect=RuntimeError("curve failed")))
+    monkeypatch.setattr("avia.charts.render_price_chart", lambda series, median, title, now_price: b"fake_png")
+
+    await bot._process_actions(100, [HistoryRequest(query=q)])
+
+    assert len(bot.photos) == 1
+    photo = bot.photos[0]
+    assert "📊 <b>История цены</b>" in photo["caption"]
+    assert "💡 <b>Совет: брать</b>" in photo["caption"]
+

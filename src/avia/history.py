@@ -743,3 +743,109 @@ class PriceHistory:
         ]
         result.sort(key=lambda x: (-x[2], x[0], x[1]))
         return result[:limit]
+
+    def price_curve(
+        self,
+        days: int = 180,
+        now: float | None = None,
+        min_samples: int = 30,
+    ) -> dict[str, dict]:
+        """Кривая цены от числа дней до вылета по всем маршрутам сразу.
+
+        Корзины days_to_departure: «0-7», «8-14», «15-21», «22-30», «31-60», «61+».
+        Для каждого замера вычисляется отношение лучшей цены замера к медиане маршрута за тот же период,
+        затем по каждой корзине берётся медиана отношений. Корзины с samples < min_samples не включаются.
+        """
+        if days <= 0:
+            return {}
+        now_ts = time.time() if now is None else float(now)
+        since_ts = now_ts - days * 86400.0
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT origin, destination, depart, COALESCE(return_date, ''), adults, "
+                "price, search_id, observed_at, days_to_departure "
+                "FROM price_history "
+                "WHERE observed_at >= ? AND observed_at <= ? "
+                "ORDER BY observed_at ASC",
+                (since_ts, now_ts),
+            ).fetchall()
+
+        if not rows:
+            return {}
+
+        routes: dict[tuple, dict[str, dict]] = {}
+        for origin, destination, depart, ret, adults, price, s_id, obs_at, days_dep in rows:
+            route_key = (origin, destination, depart, ret, adults)
+            if route_key not in routes:
+                routes[route_key] = {}
+            sample_key = str(s_id) if s_id else f"m_{round(obs_at / 60.0)}"
+            if sample_key not in routes[route_key]:
+                if days_dep is not None:
+                    d_val = int(days_dep)
+                else:
+                    dep_d = _normalize_date(depart)
+                    obs_d = datetime.fromtimestamp(obs_at).date()
+                    d_val = (dep_d - obs_d).days if dep_d is not None else None
+                routes[route_key][sample_key] = {
+                    "prices": [],
+                    "days_to_departure": d_val,
+                }
+            elif routes[route_key][sample_key]["days_to_departure"] is None and days_dep is not None:
+                routes[route_key][sample_key]["days_to_departure"] = int(days_dep)
+
+            routes[route_key][sample_key]["prices"].append(int(price))
+
+        bucket_order = ["0-7", "8-14", "15-21", "22-30", "31-60", "61+"]
+        bucket_ratios: dict[str, list[float]] = {b: [] for b in bucket_order}
+
+        for searches in routes.values():
+            sample_best_prices: list[int] = []
+            for s_data in searches.values():
+                if s_data["prices"]:
+                    best_p = min(s_data["prices"])
+                    s_data["best_price"] = best_p
+                    sample_best_prices.append(best_p)
+
+            if not sample_best_prices:
+                continue
+
+            route_median = float(statistics.median(sample_best_prices))
+            if route_median <= 0:
+                continue
+
+            for s_data in searches.values():
+                best_p = s_data.get("best_price")
+                d = s_data.get("days_to_departure")
+                if best_p is None or d is None or d < 0:
+                    continue
+
+                ratio = best_p / route_median
+
+                b_name = None
+                if 0 <= d <= 7:
+                    b_name = "0-7"
+                elif 8 <= d <= 14:
+                    b_name = "8-14"
+                elif 15 <= d <= 21:
+                    b_name = "15-21"
+                elif 22 <= d <= 30:
+                    b_name = "22-30"
+                elif 31 <= d <= 60:
+                    b_name = "31-60"
+                elif d >= 61:
+                    b_name = "61+"
+
+                if b_name is not None:
+                    bucket_ratios[b_name].append(ratio)
+
+        result: dict[str, dict] = {}
+        for b in bucket_order:
+            ratios = bucket_ratios[b]
+            if len(ratios) >= max(1, min_samples):
+                result[b] = {
+                    "ratio": round(float(statistics.median(ratios)), 4),
+                    "samples": len(ratios),
+                }
+        return result
+

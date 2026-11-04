@@ -944,3 +944,31 @@ def test_popular_routes(tmp_path):
     assert len(popular) == 2
     assert popular[0] == ("KUF", "EVN", 3)
     assert popular[1] == ("MOW", "AER", 2)
+
+
+def test_price_curve_multi_route_and_baskets(tmp_path):
+    """price_curve рассчитывает медианы отношений по корзинам дней до вылета по всем маршрутам."""
+    h = PriceHistory(tmp_path / "h.sqlite")
+    now_ts = datetime(2026, 11, 20, 12, 0).timestamp()
+
+    # Маршрут 1: вылет через 5 дней (0-7), 10 дней (8-14), 25 дней (22-30)
+    q1 = Query(origin="MOW", destination="LED", depart=date(2026, 11, 25))
+    h.annotate(q1, _make_res([Offer("s", price=12000, offer_id="o1")]), now=now_ts, search_id="s1")
+
+    q1_10 = Query(origin="MOW", destination="LED", depart=date(2026, 11, 30))
+    h.annotate(q1_10, _make_res([Offer("s", price=10000, offer_id="o2")]), now=now_ts, search_id="s2")
+
+    # Маршрут 2: вылет через 6 дней (0-7), 12 дней (8-14)
+    q2 = Query(origin="KUF", destination="EVN", depart=date(2026, 11, 26))
+    h.annotate(q2, _make_res([Offer("s", price=24000, offer_id="o3")]), now=now_ts, search_id="s3")
+
+    q2_12 = Query(origin="KUF", destination="EVN", depart=date(2026, 12, 2))
+    h.annotate(q2_12, _make_res([Offer("s", price=20000, offer_id="o4")]), now=now_ts, search_id="s4")
+
+    # С min_samples=1 должны вернуться обе корзины "0-7" и "8-14"
+    curve = h.price_curve(days=30, now=now_ts + 60, min_samples=1)
+    assert "0-7" in curve
+    assert "8-14" in curve
+    assert curve["0-7"]["samples"] == 2
+    assert curve["8-14"]["samples"] == 2
+

@@ -11,7 +11,7 @@ from typing import Any
 
 import httpx
 
-from . import analytics, charts
+from . import advice, analytics, charts
 from .config import Settings, load_settings
 from .dialog import (
     HELP,
@@ -183,6 +183,27 @@ class Bot:
                 series = self.history.route_series(q)
                 site_stats = self.history.cheapest_site_stats(q)
 
+                curve = None
+                try:
+                    curve = self.history.price_curve()
+                except Exception:
+                    curve = None
+
+                adv = None
+                try:
+                    dep_d = q.depart
+                    if isinstance(dep_d, datetime):
+                        dep_d = dep_d.date()
+                    elif isinstance(dep_d, str):
+                        try:
+                            dep_d = date.fromisoformat(dep_d.strip())
+                        except Exception:
+                            dep_d = None
+                    d = (dep_d - date.today()).days if dep_d is not None else None
+                    adv = advice.build_advice(stats, d, curve=curve)
+                except Exception:
+                    adv = None
+
                 orig = city_name(q.origin)
                 dest = city_name(q.destination)
 
@@ -208,15 +229,27 @@ class Bot:
                 now_price = stats["last_price"] if stats else None
 
                 png = charts.render_price_chart(series, median, title, now_price=now_price)
-                return stats, series, site_stats, png
+                return stats, series, site_stats, png, adv
 
-            stats, series, site_stats, png = await asyncio.to_thread(_load_data_and_render)
+            stats, series, site_stats, png, adv = await asyncio.to_thread(_load_data_and_render)
 
             lines = ["📊 <b>История цены</b>"]
             sum_lines = analytics.summary_lines(stats, site_stats)
             if sum_lines:
                 lines.extend(sum_lines)
+
+            adv_lines = advice.format_advice(adv) if adv else []
+            if adv_lines:
+                lines.append("")
+                lines.extend(adv_lines)
+
             caption = "\n".join(lines)
+            if len(caption) > 1024:
+                if adv_lines and len(adv_lines) >= 3 and adv_lines[-1] in lines:
+                    lines.remove(adv_lines[-1])
+                    caption = "\n".join(lines)
+                if len(caption) > 1024:
+                    caption = caption[:1024]
 
             if png is not None:
                 await self.send_photo(chat_id, png, caption=caption)

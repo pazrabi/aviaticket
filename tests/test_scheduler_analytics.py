@@ -557,3 +557,104 @@ def test_build_notification_markup_history_button():
     for row in kb:
         for btn in row:
             assert len(btn["callback_data"].encode("utf-8")) <= 64
+
+
+# --- 5. Тесты интеграции совета «брать или ждать» в Scheduler ---
+
+
+@pytest.mark.asyncio
+async def test_scheduler_run_once_includes_advice_and_preserves_rise_hint(store, history, clock, today):
+    """Scheduler.run_once добавляет одну строку совета, а подсказка для роста остаётся последней."""
+    q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 11), adults=1)
+    sub = store.create(chat_id=101, query=q, baggage_mode="any", criteria=SearchCriteria(), now=clock())
+    store.record_price(sub.id, 10000, "RUB", "o_init", clock() - 3600)
+
+    # 12 замеров в истории
+    _seed_history_searches(
+        history,
+        q,
+        [(10000, "aviasales")] * 12,
+        base_time=clock(),
+    )
+
+    # Цена выросла до 12500 -> triggers подорожала
+    async def search_fn(query: Query) -> list[SiteResult]:
+        return [
+            SiteResult(
+                site="aviasales",
+                ok=True,
+                offers=[Offer(site="aviasales", price=12500, currency="RUB", url="https://s.ru/1")],
+            )
+        ]
+
+    sent: list[tuple[int, str, dict | None]] = []
+
+    async def notify_fn(chat_id: int, text: str, markup: dict | None) -> None:
+        sent.append((chat_id, text, markup))
+
+    sched = Scheduler(
+        store=store,
+        search_fn=search_fn,
+        notify_fn=notify_fn,
+        history=history,
+        clock=clock,
+        today=today,
+    )
+
+    count = await sched.run_once()
+    assert count == 1
+    assert len(sent) == 1
+    _, text, _ = sent[0]
+
+    assert "💡 <b>Совет: брать</b> — " in text
+    lines = text.split("\n")
+    assert lines[-1] == "Если планируете лететь, возможно, стоит не откладывать покупку."
+
+
+@pytest.mark.asyncio
+async def test_scheduler_run_once_advice_error_does_not_break_notification(store, history, clock, today, monkeypatch):
+    """Сбой при вычислении совета логируется, уведомление отправляется без строки совета."""
+    q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 11), adults=1)
+    sub = store.create(chat_id=101, query=q, baggage_mode="any", criteria=SearchCriteria(), now=clock())
+    store.record_price(sub.id, 10000, "RUB", "o_init", clock() - 3600)
+
+    _seed_history_searches(
+        history,
+        q,
+        [(10000, "aviasales")] * 12,
+        base_time=clock(),
+    )
+
+    monkeypatch.setattr("avia.advice.build_advice", MagicMock(side_effect=RuntimeError("Advice crash")))
+
+    async def search_fn(query: Query) -> list[SiteResult]:
+        return [
+            SiteResult(
+                site="aviasales",
+                ok=True,
+                offers=[Offer(site="aviasales", price=12500, currency="RUB", url="https://s.ru/1")],
+            )
+        ]
+
+    sent: list[tuple[int, str, dict | None]] = []
+
+    async def notify_fn(chat_id: int, text: str, markup: dict | None) -> None:
+        sent.append((chat_id, text, markup))
+
+    sched = Scheduler(
+        store=store,
+        search_fn=search_fn,
+        notify_fn=notify_fn,
+        history=history,
+        clock=clock,
+        today=today,
+    )
+
+    count = await sched.run_once()
+    assert count == 1
+    assert len(sent) == 1
+    _, text, _ = sent[0]
+
+    assert "Совет:" not in text
+    assert "Если планируете лететь, возможно, стоит не откладывать покупку." in text
+

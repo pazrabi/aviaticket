@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import date, datetime
 from html import escape
 import logging
 import time
 from typing import Any, Callable
 
-from . import analytics
+from . import advice, analytics
 from .filters import apply_criteria
 from .formatting import date_ru, offer_card
 from .history import PriceHistory
@@ -198,7 +198,37 @@ class Scheduler:
                                     )
                                     extra = analytics.summary_lines(stats, site_stats)[:3]
                                     if extra:
-                                        extra_lines = extra
+                                        extra_lines = list(extra)
+
+                                    try:
+                                        curve = await asyncio.to_thread(self.history.price_curve)
+                                    except Exception:
+                                        curve = None
+
+                                    try:
+                                        dep_val = sub_query.depart
+                                        if isinstance(dep_val, datetime):
+                                            dep_date = dep_val.date()
+                                        elif isinstance(dep_val, date):
+                                            dep_date = dep_val
+                                        elif isinstance(dep_val, str):
+                                            dep_date = date.fromisoformat(dep_val.strip())
+                                        else:
+                                            dep_date = None
+                                        d = (dep_date - today_val).days if dep_date is not None else None
+                                        adv = advice.build_advice(stats, d, curve=curve)
+                                        if adv is not None:
+                                            adv_lines = advice.format_advice(adv)
+                                            if adv_lines:
+                                                advice_line = f"{adv_lines[0]} — {escape(adv.text.rstrip('.'))}"
+                                                if extra_lines is None:
+                                                    extra_lines = [advice_line]
+                                                else:
+                                                    extra_lines.append(advice_line)
+                                    except Exception:
+                                        log.exception(
+                                            "Ошибка расчёта совета для подписки %s", sub.id
+                                        )
                                 except Exception:
                                     log.exception(
                                         "Ошибка расчёта аналитики для подписки %s", sub.id
