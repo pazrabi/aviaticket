@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Управление ботом на сервере с Мака: ./deploy/botctl.sh status|logs|restart|stop|start|deploy|backup
+# Управление ботом на сервере с Мака: ./deploy/botctl.sh status|logs|restart|stop|start|deploy|backup|pull-backups
 # Бот работает на сервере (служба avia-bot). На Маке бота НЕ запускать: два бота на один токен мешают друг другу.
 set -euo pipefail
 
@@ -34,8 +34,15 @@ case "${1:-}" in
   backup)
     remote "cd $DIR && sudo -u avia .venv/bin/python -c 'from avia.config import load_settings; from avia.backup import backup_all; s=load_settings(); print(len(backup_all(s.storage_dir, s.backup_dir, s.backup_keep)), \"копий создано\")'"
     ;;
+  pull-backups)
+    # копии баз с сервера на Мак (без --delete: старые копии на Маке остаются); папка по умолчанию ~/avia-backups
+    DEST="${AVIA_BACKUP_DEST:-$HOME/avia-backups}"
+    mkdir -p "$DEST"
+    rsync -a -e "ssh ${SSH_OPTS[*]}" "$HOST:$DIR/state/backups/" "$DEST/"
+    echo "Копии на Маке: $DEST ($(find "$DEST" -type f | wc -l | tr -d ' ') файлов, $(du -sh "$DEST" | cut -f1))"
+    ;;
   *)
-    echo "Использование: $0 status|logs [N]|restart|stop|start|deploy|backup"
+    echo "Использование: $0 status|logs [N]|restart|stop|start|deploy|backup|pull-backups"
     exit 1
     ;;
 esac
