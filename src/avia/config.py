@@ -34,6 +34,15 @@ class SiteConfig:
     phone_wait_seconds: int = 40
     # подстрока в ответе, по которой видно конец выдачи (хаб ждёт её появления)
     phone_wait_for: str = ""
+    # сколько секунд ждать предпочтительный (первый в списке phone) телефон, прежде чем брать запасной
+    phone_patience_seconds: int = 0
+    # для подписок и фона (priority > 0): другое время ожидания и признак конца выдачи
+    phone_full_wait_seconds: int | None = None
+    phone_full_wait_for: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.phone_patience_seconds < 0:
+            raise ValueError("phone_patience_seconds must be >= 0")
 
 
 @dataclass
