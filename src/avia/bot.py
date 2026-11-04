@@ -49,11 +49,14 @@ API = "https://api.telegram.org/bot{token}/{method}"
 
 async def _search_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
     """Вызывает search с priority, а при несовместимости мока (TypeError) повторяет без priority."""
-    try:
-        return await fn(*args, **kwargs)
-    except TypeError:
-        kwargs.pop("priority", None)
-        return await fn(*args, **kwargs)
+    samples_dir = kwargs.pop("samples_dir", None)
+    from .samples import sample_capture_context
+    with sample_capture_context(samples_dir):
+        try:
+            return await fn(*args, **kwargs)
+        except TypeError:
+            kwargs.pop("priority", None)
+            return await fn(*args, **kwargs)
 
 
 class Bot:
@@ -102,6 +105,13 @@ class Bot:
             self.dialog = Dialog(store=self.store, subs=self.subs)
         self._backup_in_progress: bool = False
         self._last_manual_backup_at: float = 0.0
+        self._last_parser_watch: float = 0.0
+        self._last_samples_check: float = 0.0
+        try:
+            from .samples import install_sample_hook
+            install_sample_hook()
+        except Exception:
+            log.exception("ошибка установки перехватчика образцов")
 
     async def call(self, method: str, **params):
         payload = {k: v for k, v in params.items() if v is not None}
@@ -334,7 +344,13 @@ class Bot:
             self._active_searches += 1
             try:
                 async with self._gate.slot(0):
-                    results = await _search_call(search, q, self.s, priority=0)
+                    results = await _search_call(
+                        search,
+                        q,
+                        self.s,
+                        priority=0,
+                        samples_dir=self.s.storage_dir / "samples",
+                    )
             finally:
                 self._active_searches -= 1
             self._record_metrics("user", results)
@@ -781,12 +797,19 @@ class Bot:
         errors = self.metrics.recent_errors(limit=5, since_ts=since_ts)
         devices_summary = self.metrics.summary_by_device(since_ts)
         site_devices_summary = self.metrics.summary_by_site_device(since_ts)
+        parser_statuses = {}
+        try:
+            from .parser_watch import get_parser_statuses
+            parser_statuses = get_parser_statuses(self.metrics, self.s, now=now)
+        except Exception:
+            log.exception("ошибка сбора parser_statuses")
         return {
             "summary": summary,
             "counts_by_source": counts,
             "recent_errors": errors,
             "devices_summary": devices_summary,
             "site_devices_summary": site_devices_summary,
+            "parser_statuses": parser_statuses,
         }
 
     def _collect_users_data(self) -> dict[str, Any]:
@@ -1043,7 +1066,13 @@ class Bot:
 
     async def _bg_search(self, q: Query):
         async with self._gate.slot(2):
-            results = await _search_call(search, q, self.s, priority=2)
+            results = await _search_call(
+                search,
+                q,
+                self.s,
+                priority=2,
+                samples_dir=self.s.storage_dir / "samples",
+            )
         self._record_metrics("bg", results)
         return results
 
@@ -1052,7 +1081,13 @@ class Bot:
         self._active_searches += 1
         try:
             async with self._gate.slot(1):
-                results = await _search_call(search, q, self.s, priority=1)
+                results = await _search_call(
+                    search,
+                    q,
+                    self.s,
+                    priority=1,
+                    samples_dir=self.s.storage_dir / "samples",
+                )
         finally:
             self._active_searches -= 1
         self._record_metrics("sub", results)
@@ -1060,6 +1095,16 @@ class Bot:
 
     async def _scheduler_notify(self, chat_id: int, text: str, reply_markup: dict | None) -> None:
         await self.send(chat_id, text, reply_markup=reply_markup)
+
+    async def _notify_admins(self, text: str) -> None:
+        """Отправляет сообщение всем администраторам из tg_allowed_ids."""
+        if not self.s.tg_allowed_ids:
+            return
+        for admin_id in self.s.tg_allowed_ids:
+            try:
+                await self.send(admin_id, text)
+            except Exception:
+                log.exception("ошибка отправки сообщения администратору %s", admin_id)
 
     async def _maintenance_loop(self, tick_seconds: float = 300.0) -> None:
         """Отмечает, что бот жив (для учёта пропусков), и раз в сутки сворачивает и чистит историю цен."""
@@ -1091,6 +1136,38 @@ class Bot:
                             self._last_forecast_train = time.time()
                         except Exception:
                             log.exception("ошибка обучения модели прогноза")
+
+                if self.s.parser_watch_enabled and self.metrics is not None:
+                    if time.time() - self._last_parser_watch >= 1800:
+                        try:
+                            from .parser_watch import check_parser_watch
+                            alerts = await asyncio.to_thread(
+                                check_parser_watch,
+                                self.metrics,
+                                self.s,
+                            )
+                            for alert_text in alerts:
+                                await self._notify_admins(alert_text)
+                            self._last_parser_watch = time.time()
+                        except Exception:
+                            log.exception("ошибка проверки парсеров в parser_watch")
+
+                if time.time() - self._last_samples_check >= 7 * 86400:
+                    try:
+                        samples_dir = self.s.storage_dir / "samples"
+                        if samples_dir.exists():
+                            from .samples import check_samples_with_cooldown
+                            failures = await asyncio.to_thread(
+                                check_samples_with_cooldown,
+                                samples_dir,
+                                self.metrics,
+                                cooldown_hours=float(self.s.parser_watch_cooldown_hours),
+                            )
+                            for fail_msg in failures:
+                                await self._notify_admins(fail_msg)
+                        self._last_samples_check = time.time()
+                    except Exception:
+                        log.exception("ошибка еженедельной проверки образцов")
             except asyncio.CancelledError:
                 raise
             except Exception:

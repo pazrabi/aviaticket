@@ -29,6 +29,13 @@ CREATE TABLE IF NOT EXISTS site_runs (
 );
 CREATE INDEX IF NOT EXISTS ix_site_runs_ts ON site_runs (ts);
 CREATE INDEX IF NOT EXISTS ix_site_runs_site_ts ON site_runs (site, ts);
+
+CREATE TABLE IF NOT EXISTS parser_watch_state (
+    site              TEXT PRIMARY KEY,
+    last_status       TEXT NOT NULL,
+    last_alert_ts     REAL NOT NULL,
+    last_alert_status TEXT NOT NULL
+);
 """
 
 
@@ -417,3 +424,66 @@ class MetricsStore:
         with self._connect() as db:
             cur = db.execute("DELETE FROM site_runs WHERE ts < ?", (cutoff,))
             return cur.rowcount
+
+    def watch_stats(self, since_ts: float) -> dict[str, dict[str, Any]]:
+        """Статистика запусков по сайтам для parser_watch за период since_ts."""
+        with self._connect() as db:
+            cur = db.execute(
+                """
+                SELECT
+                    site,
+                    COUNT(*) AS runs,
+                    SUM(ok) AS ok_cnt,
+                    SUM(partial) AS partial_cnt
+                FROM site_runs
+                WHERE ts >= ?
+                GROUP BY site
+                """,
+                (float(since_ts),),
+            )
+            res = {}
+            for row in cur.fetchall():
+                res[str(row["site"])] = {
+                    "runs": int(row["runs"]),
+                    "ok": int(row["ok_cnt"] or 0),
+                    "partial": int(row["partial_cnt"] or 0),
+                }
+            return res
+
+    def get_watch_state(self, site: str) -> dict[str, Any] | None:
+        """Возвращает сохранённое состояние алерта parser_watch для сайта."""
+        with self._connect() as db:
+            cur = db.execute(
+                "SELECT site, last_status, last_alert_ts, last_alert_status FROM parser_watch_state WHERE site = ?",
+                (site,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "site": str(row["site"]),
+                "last_status": str(row["last_status"]),
+                "last_alert_ts": float(row["last_alert_ts"]),
+                "last_alert_status": str(row["last_alert_status"]),
+            }
+
+    def set_watch_state(
+        self,
+        site: str,
+        last_status: str,
+        last_alert_ts: float,
+        last_alert_status: str,
+    ) -> None:
+        """Сохраняет состояние алерта parser_watch для сайта."""
+        with self._connect() as db:
+            db.execute(
+                """
+                INSERT INTO parser_watch_state (site, last_status, last_alert_ts, last_alert_status)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(site) DO UPDATE SET
+                    last_status = excluded.last_status,
+                    last_alert_ts = excluded.last_alert_ts,
+                    last_alert_status = excluded.last_alert_status
+                """,
+                (site, last_status, float(last_alert_ts), last_alert_status),
+            )

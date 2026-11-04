@@ -23,6 +23,12 @@ def main():
         print(json.dumps(rep, indent=2, ensure_ascii=False))
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == "parser-check":
+        from .samples import run_parser_check_cli
+        target_dir = sys.argv[2] if len(sys.argv) > 2 else None
+        code = run_parser_check_cli(target_dir)
+        sys.exit(code)
+
     try:
         q = parse_query(" ".join(a for a in sys.argv[1:] if not a.startswith("--")))
     except ParseError as e:
