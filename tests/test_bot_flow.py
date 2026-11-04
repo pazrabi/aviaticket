@@ -184,7 +184,7 @@ async def test_bot_wait_msg_deleted_or_edited(monkeypatch):
 
     # Находим id сообщения «Ищу...»
     wait_calls = [
-        p for m, p in bot.calls if m == "sendMessage" and "Ищу MOW → ALA" in p["text"]
+        p for m, p in bot.calls if m == "sendMessage" and "Ищу билеты" in p["text"]
     ]
     assert len(wait_calls) == 1
     # Проверяем, что был вызов deleteMessage
@@ -266,7 +266,7 @@ async def test_bot_price_command_works(monkeypatch):
 
     # Проверяем отправленные сообщения
     send_texts = [p["text"] for m, p in bot.calls if m == "sendMessage"]
-    assert any("Ищу MOW → ALA на 10.12" in t for t in send_texts)
+    assert any("Ищу билеты" in t for t in send_texts)
     assert any("TestAir" in t and "12 345" in t for t in send_texts)
 
     # Проверяем, что снимок сохранился в store

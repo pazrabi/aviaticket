@@ -88,13 +88,13 @@ def test_compact_report_default_criteria():
     text = chunks[0]
 
     # Сквозная нумерация и карточки
-    assert "1. <b>Самый дешёвый</b>" in text
-    assert "2. <b>Самый быстрый</b>" in text
+    assert "<b>1  💰 Самый дешёвый</b>" in text
+    assert "<b>2  ⚡ Самый быстрый</b>" in text
     assert flat == [o1, o2]
     assert len(pool) == 2
 
     # Layovers
-    assert "пересадка: Стамбул" in text
+    assert "🔁 Стамбул" in text
 
     # Ссылки: прямая и непрямая
     assert '<a href="https://site_b.ru/direct">купить билет</a>' in text
@@ -103,11 +103,11 @@ def test_compact_report_default_criteria():
     # Ошибка сайта строкой
     assert "⚠️ <b>bad_site</b>: таймаут" in text
 
-    # Ссылка на Озон Тревел и подсказка номера билета
-    assert "Озон Тревел:" in text
+    # Ссылка на Ozon Travel и подсказка номера билета
+    assert "Ozon Travel" in text
     assert "https://www.ozon.ru/travel/flight/search" in text
     assert "Напишите номер билета, чтобы увидеть подробности." in text
-    assert "Цены сняты со страницы сейчас" in text
+    assert "Цены сняты сейчас" in text
 
     _check_html_tags_balanced(text)
 
@@ -122,7 +122,7 @@ def test_compact_report_single_card():
 
     assert len(flat) == 1
     assert flat[0] is o
-    assert "1. <b>Самый дешёвый</b>" in chunks[0]
+    assert "<b>1  💰 Самый дешёвый</b>" in chunks[0]
     assert "2. <b>" not in chunks[0]
 
 
@@ -138,7 +138,7 @@ def test_compact_report_empty_results_default_criteria():
     assert "ослабить фильтры" not in text
     assert flat == []
     assert pool == []
-    assert "Озон Тревел:" in text
+    assert "Ozon Travel" in text
     assert "Напишите номер билета" not in text
 
 
@@ -153,7 +153,7 @@ def test_compact_report_empty_results_non_default_criteria():
 
     assert "Билетов не нашлось" in text
     assert "Попробуйте ослабить фильтры" in text
-    assert "Фильтры: пересадки: только прямые" in text
+    assert "⚙️ пересадки: только прямые" in text
 
 
 def test_compact_report_filters_reduce_pool_and_header():
@@ -173,8 +173,8 @@ def test_compact_report_filters_reduce_pool_and_header():
     )
     text = chunks[0]
 
-    assert "Фильтры: пересадки: только прямые, в пути: до 5 ч, скрыто фильтрами: 3" in text
-    assert "Багаж: только с багажом, скрыто вариантов: 1" in text
+    assert "⚙️ пересадки: только прямые, в пути: до 5 ч, скрыто фильтрами: 3" in text
+    assert "только с багажом · скрыто: 1" in text
 
 
 def test_compact_report_best_balance_card_only_with_hour_cost():
@@ -193,7 +193,7 @@ def test_compact_report_best_balance_card_only_with_hour_cost():
     # 2. С hour_cost -> карточка «Лучший баланс» есть
     chunks_hc, flat_hc, _ = build_compact_report(q, results, SearchCriteria(hour_cost=1000))
     assert len(flat_hc) == 3
-    assert "3. <b>Лучший баланс</b>" in chunks_hc[0]
+    assert "<b>3  ⚖️ Лучший баланс</b>" in chunks_hc[0]
     assert flat_hc[2] is o3
 
 
@@ -207,16 +207,16 @@ def test_build_more_report_numbering_and_exhaustion():
     text1, new1 = build_more_report(q, pool, cards, n=5, start_number=3)
     assert text1 is not None
     assert len(new1) == 5
-    assert "3. <b>10 200 ₽</b>" in text1
-    assert "7. <b>10 600 ₽</b>" in text1
-    assert "8. " not in text1
+    assert "<b>3</b>\n<b>10 200 ₽</b>" in text1
+    assert "<b>7</b>\n<b>10 600 ₽</b>" in text1
+    assert "<b>8</b>" not in text1
 
     # 2. Вторая порция: остался 1 билет, номер 8
     shown_so_far = cards + new1
     text2, new2 = build_more_report(q, pool, shown_so_far, n=5, start_number=8)
     assert text2 is not None
     assert len(new2) == 1
-    assert "8. <b>10 700 ₽</b>" in text2
+    assert "<b>8</b>\n<b>10 700 ₽</b>" in text2
 
     # 3. Конец списка -> None и []
     shown_all = shown_so_far + new2
@@ -270,14 +270,14 @@ async def test_bot_flow_search_gives_compact_response_with_buttons(monkeypatch):
 
     # Проверяем кнопки
     # Ряд 1: more (так как в pool 10 билетов, а показано 1-2)
-    assert any("Показать ещё 5" in b["text"] and b["callback_data"].startswith("more:") for b in kb[0])
+    assert any("Показать ещё" in b["text"] and b["callback_data"].startswith("more:") for b in kb[0])
     # Ряд 2: filters, full
-    assert any("Изменить фильтры" in b["text"] and b["callback_data"].startswith("filters:") for b in kb[1])
-    assert any("Полный список" in b["text"] and b["callback_data"].startswith("full:") for b in kb[1])
+    assert any("Фильтры" in b["text"] and b["callback_data"].startswith("filters:") for b in kb[1])
+    assert any("По сайтам" in b["text"] and b["callback_data"].startswith("full:") for b in kb[1])
     # Ряд 3: track
-    assert any("Отслеживать цену" in b["text"] and b["callback_data"].startswith("track:") for b in kb[2])
+    assert any("Следить за ценой" in b["text"] and b["callback_data"].startswith("track:") for b in kb[2])
     # Ряд 4: new
-    assert any("Новый поиск" in b["text"] and b["callback_data"].startswith("new:") for b in kb[3])
+    assert any("Новый поиск" in b["text"] and b["callback_data"].startswith("new:") for b in kb[2])
 
     snap = bot.store.get(10)
     assert snap is not None
@@ -435,7 +435,7 @@ async def test_bot_flow_filters_returns_baggage_with_saved_criteria(monkeypatch)
     assert new_session.dialog_id != cur_d_id  # новый dialog_id
 
     send_texts = [p["text"] for m, p in bot.calls if m == "sendMessage"]
-    assert any("Багаж?" in t for t in send_texts)
+    assert any("Багаж" in t for t in send_texts)
     # На кнопке расширенных настроек отображается количество фильтров (2)
     last_call = [p for m, p in bot.calls if m == "sendMessage"][-1]
     kb = last_call["reply_markup"]["inline_keyboard"]
@@ -473,8 +473,8 @@ def test_compact_report_without_prefilled_offer_ids():
     more_text, more_offers = build_more_report(q, pool, flat, n=5, start_number=2)
     assert more_text is not None
     assert more_offers == [o2, o3]
-    assert "2. <b>20 000 ₽</b>" in more_text
-    assert "3. <b>30 000 ₽</b>" in more_text
+    assert "<b>2</b>\n<b>20 000 ₽</b>" in more_text
+    assert "<b>3</b>\n<b>30 000 ₽</b>" in more_text
 
 
 def test_build_more_report_int_raises_typeerror_and_set_works():
@@ -564,8 +564,8 @@ async def test_bot_flow_full_to_summary_via_list_compact(monkeypatch):
 
     # Проверяем кнопки компактного вида
     ret_kb = send_calls[-1]["reply_markup"]["inline_keyboard"]
-    assert any("Полный список" in b["text"] for row in ret_kb for b in row)
-    assert any("Показать ещё 5" in b["text"] for row in ret_kb for b in row)
+    assert any("По сайтам" in b["text"] for row in ret_kb for b in row)
+    assert any("Показать ещё" in b["text"] for row in ret_kb for b in row)
 
     # 4. Проверяем, что номер билета "1" теперь открывает именно карточку из компактного flat
     bot.calls.clear()
@@ -576,7 +576,7 @@ async def test_bot_flow_full_to_summary_via_list_compact(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_bot_flow_details_back_to_compact_and_full(monkeypatch):
-    """Кнопка «⬅ К списку» из карточки деталей возвращает в правильный вид (compact или full)."""
+    """Кнопка «⬅️ К списку» из карточки деталей возвращает в правильный вид (compact или full)."""
     bot = make_fake_bot(allowed_ids={123})
 
     offers = [
@@ -601,7 +601,7 @@ async def test_bot_flow_details_back_to_compact_and_full(monkeypatch):
     back_btn = [b for row in kb_details for b in row if "К списку" in b["text"]][0]
     assert back_btn["callback_data"] == f"list:{d_id}"
 
-    # 3. Нажимаем «⬅ К списку» -> возврат в компактный отчёт
+    # 3. Нажимаем «⬅️ К списку» -> возврат в компактный отчёт
     bot.calls.clear()
     await bot.handle_callback({
         "id": "cq_back_compact",
@@ -612,7 +612,7 @@ async def test_bot_flow_details_back_to_compact_and_full(monkeypatch):
     assert snap.view == "compact"
     last_call = [p for m, p in bot.calls if m == "sendMessage"][-1]
     ret_kb = last_call["reply_markup"]["inline_keyboard"]
-    assert any("Полный список" in b["text"] for row in ret_kb for b in row)
+    assert any("По сайтам" in b["text"] for row in ret_kb for b in row)
 
     # 4. Переходим в полный список
     bot.calls.clear()
@@ -631,7 +631,7 @@ async def test_bot_flow_details_back_to_compact_and_full(monkeypatch):
     kb_details5 = details_msg5["reply_markup"]["inline_keyboard"]
     back_btn5 = [b for row in kb_details5 for b in row if "К списку" in b["text"]][0]
 
-    # 6. Нажимаем «⬅ К списку» -> возврат в полный список, а не в компактный
+    # 6. Нажимаем «⬅️ К списку» -> возврат в полный список, а не в компактный
     bot.calls.clear()
     await bot.handle_callback({
         "id": "cq_back_full",

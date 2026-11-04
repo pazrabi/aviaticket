@@ -20,10 +20,11 @@ from .dialog import (
     to_reply_markup,
 )
 from .filters import apply_criteria
-from .formatting import build_compact_report, build_report, format_details
+from .formatting import build_compact_report, build_report, date_ru, format_details
 from .guard import friendly_error
 from .history import PriceHistory
 from .offers import assign_ids, filter_by_baggage
+from .parsing import city_name
 from .pipeline import search
 from .scheduler import Scheduler
 from .store import ResultStore
@@ -139,7 +140,7 @@ class Bot:
 
     async def _run_search(self, chat_id: int, req: SearchRequest):
         if chat_id in self.busy:
-            await self.send(chat_id, "Предыдущий поиск ещё идёт, подождите.")
+            await self.send(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите.")
             return
         if (
             chat_id not in self.s.tg_allowed_ids
@@ -147,7 +148,7 @@ class Bot:
         ):
             await self.send(
                 chat_id,
-                f"На сегодня лимит поисков исчерпан ({self.s.daily_search_limit}). Завтра можно снова; "
+                f"😴 На сегодня лимит поисков исчерпан ({self.s.daily_search_limit}). Завтра можно снова, "
                 "отслеживания продолжают работать.",
             )
             return
@@ -158,7 +159,8 @@ class Bot:
         try:
             wait_msg = await self.send(
                 chat_id,
-                f"Ищу {q.origin} → {q.destination} на {q.depart:%d.%m}, это займёт около минуты…",
+                f"🔍 <b>Ищу билеты</b>\n{escape(city_name(q.origin))} → {escape(city_name(q.destination))}, {date_ru(q.depart)}\n\n"
+                "<i>Опрашиваю сервисы, это займёт несколько минут…</i>",
             )
             if isinstance(wait_msg, dict):
                 wait_msg_id = wait_msg.get("message_id")

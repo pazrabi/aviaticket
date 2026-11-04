@@ -53,7 +53,7 @@ def test_dialog_one_way_success():
     assert len(rep) == 1
     assert session.step == Step.DATE
     assert session.destination == "ALA"
-    assert "Дата вылета" in rep[0].text
+    assert "Когда вылет" in rep[0].text
 
     # 5. Ввод даты вылета
     rep = dialog.on_text(chat_id, "12.12.2026")
@@ -67,7 +67,7 @@ def test_dialog_one_way_success():
     assert len(rep) == 1
     assert session.step == Step.BAGGAGE
     assert session.return_date is None
-    assert "Багаж?" in rep[0].text
+    assert "Багаж" in rep[0].text
 
     # 7. Изменение пассажиров счётчиком: 1 -> 2
     rep = dialog.on_callback(chat_id, f"pax:{d_id}:+")
@@ -103,7 +103,7 @@ def test_dialog_round_trip_and_soon_message(monkeypatch):
     rep = dialog.on_callback(chat_id, f"trip:{d_id}:rt")
     assert len(rep) == 1
     assert session.step == Step.RETURN_DATE
-    assert "Дата возвращения" in rep[0].text
+    assert "Когда обратно" in rep[0].text
 
     # Ввод даты возврата
     rep = dialog.on_text(chat_id, "20.12.2026")
@@ -167,7 +167,7 @@ def test_dialog_cancel_on_each_step_and_command():
     d_id = dialog.sessions[chat_id].dialog_id
     rep = dialog.on_callback(chat_id, f"cancel:{d_id}")
     assert dialog.sessions[chat_id].step == Step.MENU
-    assert "Главное меню" in rep[0].text
+    assert "Дешёвые авиабилеты" in rep[0].text
 
     # DEST
     dialog.on_callback(chat_id, "menu:go")
@@ -223,7 +223,7 @@ def test_dialog_cancel_on_each_step_and_command():
     dialog.on_text(chat_id, "MOW")
     rep = dialog.on_text(chat_id, "/cancel")
     assert dialog.sessions[chat_id].step == Step.MENU
-    assert "Главное меню" in rep[0].text
+    assert "Дешёвые авиабилеты" in rep[0].text
 
 
 def test_dialog_input_errors_do_not_reset_step():
@@ -401,15 +401,15 @@ def test_dialog_ticket_number_flow():
     assert "site1" in rep[0].text
     assert "Airline1" in rep[0].text
     assert rep[0].keyboard == [
-        [("⬅ К списку", "list:d107"), ("🔔 Отслеживать цену", "track:d107")],
+        [("⬅️ К списку", "list:d107"), ("🔔 Следить за ценой", "track:d107")],
         [("🔎 Новый поиск", "new:d107")],
     ]
 
-    # Кнопка «🔔 Отслеживать цену»
+    # Кнопка «🔔 Следить за ценой»
     rep_track = dialog.on_callback(chat_id, "track:d107")
     assert rep_track[0].answer == "Отслеживание недоступно"
 
-    # Кнопка «⬅ К списку» пересобирает build_report
+    # Кнопка «⬅️ К списку» пересобирает build_report
     rep_list = dialog.on_callback(chat_id, "list:d107")
     assert len(rep_list) >= 1
     assert any("site1" in r.text for r in rep_list)
@@ -424,15 +424,15 @@ def test_dialog_ticket_number_flow():
 
     # 2. Неверный номер (0, больше длины, отрицательный)
     rep0 = dialog.on_text(chat_id, "0")
-    assert rep0[0].text == "Нет варианта с таким номером, всего: 2"
+    assert rep0[0].text == "🤔 Нет варианта с таким номером. Доступно: 1–2"
     rep3 = dialog.on_text(chat_id, "3")
-    assert rep3[0].text == "Нет варианта с таким номером, всего: 2"
+    assert rep3[0].text == "🤔 Нет варианта с таким номером. Доступно: 1–2"
     rep_neg = dialog.on_text(chat_id, "-1")
-    assert rep_neg[0].text == "Нет варианта с таким номером, всего: 2"
+    assert rep_neg[0].text == "🤔 Нет варианта с таким номером. Доступно: 1–2"
 
     # Не число при наличии snapshot
     rep_abc = dialog.on_text(chat_id, "какой-то текст")
-    assert rep_abc[0].text == "Нет варианта с таким номером, всего: 2"
+    assert rep_abc[0].text == "🤔 Нет варианта с таким номером. Доступно: 1–2"
 
     # 3. Snapshot отсутствует или истёк
     empty_chat = 108

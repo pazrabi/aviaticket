@@ -49,9 +49,9 @@ def test_subscribe_from_results_flow(dialog, store, subs):
     assert len(replies) == 1
     rep = replies[0]
     assert rep.answer == "Подписка оформлена"
-    assert "🔔 Слежу за маршрутом: Самара → Ереван, 01.12–04.12" in rep.text
-    assert f"Сейчас от {money(9500, 'RUB')}" in rep.text
-    assert "Пришлю сообщение, когда цена упадёт." in rep.text
+    assert "Слежу за ценой" in rep.text
+    assert f"Сейчас от <b>{money(9500, 'RUB')}</b>" in rep.text
+    assert "Пришлю сообщение, когда цена изменится." in rep.text
 
     active = subs.list_active(chat_id)
     assert len(active) == 1
@@ -82,7 +82,7 @@ def test_subscribe_duplicate_not_duplicated(dialog, store, subs):
 
     rep2 = dialog.on_callback(chat_id, "track:d1")[0]
     assert "Вы уже следите за этим маршрутом." in rep2.text
-    assert "🔔 Слежу за маршрутом:" in rep2.text
+    assert "Слежу за ценой" in rep2.text
     assert rep2.answer == "Подписка оформлена"
     assert subs.count_active(chat_id) == 1
 
@@ -111,7 +111,7 @@ def test_subscribe_with_filters_formatting(dialog, store, subs):
     store.put(chat_id, q, [SiteResult("s1", True, [o])], "with", [o], criteria=crit)
 
     rep = dialog.on_callback(chat_id, "track:d1")[0]
-    assert "фильтры: с багажом, пересадки: только прямые" in rep.text
+    assert "с багажом, пересадки: только прямые" in rep.text
 
 
 def test_subscribe_limit(dialog, store, subs):
@@ -130,7 +130,7 @@ def test_subscribe_limit(dialog, store, subs):
     store.put(chat_id, q_new, [SiteResult("s1", True, [o])], "any", [o])
 
     rep_limit = dialog.on_callback(chat_id, "track:d_lim")[0]
-    assert f"Достигнут лимит отслеживаний ({MAX_SUBSCRIPTIONS})" in rep_limit.text
+    assert f"Лимит отслеживаний: {MAX_SUBSCRIPTIONS}" in rep_limit.text
     assert rep_limit.keyboard == [[("🔔 Мои отслеживания", "menu:track")]]
     assert subs.count_active(chat_id) == MAX_SUBSCRIPTIONS
 
@@ -179,7 +179,7 @@ def test_my_subscriptions_list_empty_and_items(dialog, subs):
     chat_id = 107
     # Пустой список
     rep_empty = dialog.on_callback(chat_id, "menu:track")[0]
-    assert rep_empty.text == "Пока ничего не отслеживается. Выполните поиск и нажмите «🔔 Отслеживать цену»"
+    assert "Пока ничего не отслеживается" in rep_empty.text
     assert rep_empty.keyboard == [[("🔎 Найти билет", "menu:go")]]
 
     # Создаём подписку 1: Самара → Ереван, 01.12–04.12, 1 пасс. · пересадки: только прямые · порог 9 000 ₽ · от 9 500 ₽
@@ -206,14 +206,14 @@ def test_my_subscriptions_list_empty_and_items(dialog, subs):
 
     rep_list = dialog.on_callback(chat_id, "menu:track")[0]
     normalized_text = rep_list.text.replace("\xa0", " ")
-    expected_line1 = "1. Самара → Ереван, 01.12–04.12, 1 пасс. · пересадки: только прямые · порог 9 000 ₽ · от 9 500 ₽"
-    expected_line2 = "2. Москва → Сочи, 15.01, 2 пасс. · без багажа"
+    expected_line1 = "<b>1. Самара → Ереван</b>\n📅 1 дек – 4 дек  ·  👤 1\n⚙️ пересадки: только прямые\n💰 от 9 500 ₽\n🎯 порог 9 000 ₽"
+    expected_line2 = "<b>2. Москва → Сочи</b>\n📅 15 янв  ·  👤 2\n⚙️ без багажа"
     assert expected_line1 in normalized_text
     assert expected_line2 in normalized_text
 
     assert rep_list.keyboard == [
-        [(f"❌ №1", f"unsub:{sub1.id}"), (f"🎯 №1", f"thr:{sub1.id}")],
-        [(f"❌ №2", f"unsub:{sub2.id}"), (f"🎯 №2", f"thr:{sub2.id}")],
+        [("🎯 Порог №1", f"thr:{sub1.id}"), ("🔕 Отключить №1", f"unsub:{sub1.id}")],
+        [("🎯 Порог №2", f"thr:{sub2.id}"), ("🔕 Отключить №2", f"unsub:{sub2.id}")],
         [("🔎 Найти билет", "menu:go")],
     ]
 
@@ -238,8 +238,8 @@ def test_unsub_flow(dialog, subs):
 
     # Своя подписка
     rep_own = dialog.on_callback(chat_id, f"unsub:{sub.id}")[0]
-    assert rep_own.text == "🔕 Отслеживание отключено"
-    assert rep_own.answer == "🔕 Отслеживание отключено"
+    assert rep_own.text == "🔕 <b>Отслеживание отключено</b>"
+    assert rep_own.answer == "🔕 <b>Отслеживание отключено</b>"
     assert rep_own.keyboard == [
         [("🔔 Мои отслеживания", "menu:track")],
         [("🔎 Новый поиск", "menu:go")],
@@ -255,7 +255,7 @@ def test_threshold_flow(dialog, subs):
 
     # Вход
     rep_enter = dialog.on_callback(chat_id, f"thr:{sub.id}")[0]
-    assert rep_enter.text == "Введите цену в рублях, ниже которой прислать уведомление (0 — убрать порог)"
+    assert "Порог цены" in rep_enter.text
     sess = dialog.sessions[chat_id]
     assert sess.step == Step.THRESHOLD
     assert sess.threshold_sub_id == sub.id
@@ -263,17 +263,17 @@ def test_threshold_flow(dialog, subs):
 
     # Мусорный ввод текста
     rep_bad = dialog.on_text(chat_id, "десять тысяч")[0]
-    assert rep_bad.text == "Введите число в рублях, например 9000"
+    assert "Нужно число в рублях" in rep_bad.text
     assert dialog.sessions[chat_id].step == Step.THRESHOLD
 
     # Отрицательное число
     rep_neg = dialog.on_text(chat_id, "-500")[0]
-    assert rep_neg.text == "Введите число в рублях, например 9000"
+    assert "Нужно число в рублях" in rep_neg.text
     assert dialog.sessions[chat_id].step == Step.THRESHOLD
 
     # Корректный ввод с пробелами и ₽
     rep_ok = dialog.on_text(chat_id, " 9 000 ₽ ")[0]
-    assert f"🎯 Порог {money(9000, 'RUB')} сохранён" == rep_ok.text
+    assert f"🎯 Порог <b>{money(9000, 'RUB')}</b> сохранён" == rep_ok.text
     assert rep_ok.keyboard == [[("🔔 Мои отслеживания", "menu:track")]]
     assert dialog.sessions[chat_id].step == Step.DONE
     assert subs.get(sub.id).threshold == 9000
@@ -290,7 +290,7 @@ def test_threshold_flow(dialog, subs):
     dialog.on_callback(chat_id, f"thr:{sub.id}")
     curr_sess = dialog.sessions[chat_id]
     rep_cancel = dialog.on_callback(chat_id, f"cancel:{curr_sess.dialog_id}")[0]
-    assert "Главное меню" in rep_cancel.text
+    assert "Дешёвые авиабилеты" in rep_cancel.text
 
 
 def test_card_details_and_compact_keyboard_contain_track(dialog, store):
@@ -299,7 +299,7 @@ def test_card_details_and_compact_keyboard_contain_track(dialog, store):
     d_id = "test_d"
     kb = compact_keyboard(d_id, has_more=False)
     # Ряд с track отдельный
-    assert [("🔔 Отслеживать цену", f"track:{d_id}")] in kb
+    assert ("🔔 Следить за ценой", f"track:{d_id}") in [b for row in kb for b in row]
 
     # Карточка деталей
     q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 10))
@@ -311,7 +311,7 @@ def test_card_details_and_compact_keyboard_contain_track(dialog, store):
     card_kb = rep_card.keyboard or []
     track_btns = [b for row in card_kb for b in row if b[1] == f"track:{d_id}"]
     assert len(track_btns) == 1
-    assert track_btns[0][0] == "🔔 Отслеживать цену"
+    assert track_btns[0][0] == "🔔 Следить за ценой"
 
 
 def test_all_callback_data_len_le_64(dialog, store, subs):

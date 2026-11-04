@@ -8,7 +8,7 @@ import time
 from typing import Any, Callable
 
 from .filters import apply_criteria
-from .formatting import offer_line, offer_link_caption
+from .formatting import date_ru, offer_card
 from .history import PriceHistory
 from .models import Offer, Query, SiteResult
 from .offers import assign_ids, filter_by_baggage
@@ -25,34 +25,31 @@ def build_notification(
     now: float | None = None,
 ) -> str:
     """Формирует HTML-текст уведомления об изменении цены по подписке."""
-    lines: list[str] = ["🔔 <b>Цена изменилась</b>"]
+    is_rise = bool(reasons) and all(r.startswith("подорожала") for r in reasons)
+    lines: list[str] = ["📈 <b>Цены дорожают</b>" if is_rise else "🔔 <b>Цена изменилась</b>"]
 
-    orig_name = escape(city_name(sub.origin))
-    dest_name = escape(city_name(sub.destination))
-    if sub.return_date:
-        dates = f"{sub.depart:%d.%m}–{sub.return_date:%d.%m} (туда-обратно)"
-    else:
-        dates = f"{sub.depart:%d.%m} (в одну сторону)"
-    lines.append(f"{orig_name} → {dest_name}, {dates}, пассажиров: {sub.adults}")
-
-    reasons_str = "; ".join(escape(r) for r in reasons)
-    lines.append(f"Причина: {reasons_str}")
-
-    offer_str = offer_line(offer, baggage_mode=getattr(sub, "baggage_mode", "any"))
-    site_html = f"<i>{escape(offer.site)}</i>"
-    if offer.url:
-        caption = offer_link_caption(offer)
-        link_html = f'<a href="{escape(offer.url, quote=True)}">{caption}</a>'
-        site_part = f"{site_html} {link_html}"
-    else:
-        site_part = site_html
-
-    lines.append(f"{offer_str} · {site_part}")
+    q = Query(
+        origin=sub.origin,
+        destination=sub.destination,
+        depart=sub.depart,
+        adults=sub.adults,
+        return_date=sub.return_date,
+    )
+    dates = date_ru(sub.depart) + (f" – {date_ru(sub.return_date)}" if sub.return_date else "")
+    lines.append(f"✈️ <b>{escape(city_name(sub.origin))} → {escape(city_name(sub.destination))}</b>")
+    lines.append(f"📅 {dates}  ·  👤 {sub.adults}")
+    lines.append("")
+    lines.append(f"{'⚠️' if is_rise else '📈'} Причина: {'; '.join(escape(r) for r in reasons)}")
+    lines.append("")
+    lines.extend(offer_card(offer, q, number=1, baggage_mode=getattr(sub, "baggage_mode", "any"))[1:])
+    if is_rise:
+        lines.append("")
+        lines.append("Если планируете лететь, возможно, стоит не откладывать покупку.")
 
     if sub.criteria:
         desc = sub.criteria.describe()
         if desc:
-            lines.append(f"Фильтры: {', '.join(escape(d) for d in desc)}")
+            lines.append(f"⚙️ {', '.join(escape(d) for d in desc)}")
 
     text = "\n".join(lines)
     if len(text) > 4096:
@@ -64,8 +61,10 @@ def build_notification_markup(sub: Subscription) -> dict[str, Any]:
     """Формирует инлайн-клавиатуру к уведомлению о цене."""
     return {
         "inline_keyboard": [
-            [{"text": "🔕 Отписаться", "callback_data": f"unsub:{sub.id}"}],
-            [{"text": "🎯 Порог цены", "callback_data": f"thr:{sub.id}"}],
+            [
+                {"text": "🎯 Порог цены", "callback_data": f"thr:{sub.id}"},
+                {"text": "🔕 Отписаться", "callback_data": f"unsub:{sub.id}"},
+            ],
             [{"text": "🔎 Новый поиск", "callback_data": "menu:go"}],
         ]
     }

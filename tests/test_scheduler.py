@@ -485,25 +485,26 @@ def test_build_notification_text_and_markup():
     lines = text.split("\n")
 
     assert lines[0] == "🔔 <b>Цена изменилась</b>"
-    assert lines[1] == "Самара → Ереван, 01.12–04.12 (туда-обратно), пассажиров: 2"
-    assert lines[2] == "Причина: новый минимум; упала на 2000 ₽ (12%)"
-    assert "15 000 ₽" in lines[3]
-    assert "<i>tutu</i>" in lines[3]
-    assert '<a href="https://avia.tutu.ru/offer/123?foo=1&amp;bar=2">купить билет</a>' in lines[3]
+    assert lines[1] == "✈️ <b>Самара → Ереван</b>"
+    assert lines[2] == "📅 1 дек – 4 дек  ·  👤 2"
+    assert lines[4] == "📈 Причина: новый минимум; упала на 2000 ₽ (12%)"
+    assert "15 000 ₽" in text.replace("\xa0", " ")
+    assert "<i>Туту</i>" in text
+    assert '<a href="https://avia.tutu.ru/offer/123?foo=1&amp;bar=2">купить билет</a>' in text
     assert "Озон" not in text
-    assert "Фильтры: пересадки: только прямые, вылет: утром" in lines[4]
+    assert "пересадки: только прямые, вылет: утром" in lines[-1]
     assert len(text) <= 4096
 
     # Разметка
     markup = build_notification_markup(sub)
     assert "inline_keyboard" in markup
-    assert len(markup["inline_keyboard"]) == 3
+    assert len(markup["inline_keyboard"]) == 2
 
-    r1, r2, r3 = markup["inline_keyboard"]
-    assert r1[0]["text"] == "🔕 Отписаться"
-    assert r1[0]["callback_data"] == "unsub:42"
-    assert r2[0]["text"] == "🎯 Порог цены"
-    assert r2[0]["callback_data"] == "thr:42"
+    r1, r3 = markup["inline_keyboard"]
+    assert r1[0]["text"] == "🎯 Порог цены"
+    assert r1[0]["callback_data"] == "thr:42"
+    assert r1[1]["text"] == "🔕 Отписаться"
+    assert r1[1]["callback_data"] == "unsub:42"
     assert r3[0]["text"] == "🔎 Новый поиск"
     assert r3[0]["callback_data"] == "menu:go"
 
@@ -539,9 +540,10 @@ def test_build_notification_one_way_and_non_direct_and_no_criteria():
     text = build_notification(sub, offer, ["на 15% ниже обычного"])
     lines = text.split("\n")
 
-    assert lines[1] == "Санкт-Петербург → Москва, 10.12 (в одну сторону), пассажиров: 1"
-    assert lines[2] == "Причина: на 15% ниже обычного"
-    assert '<a href="https://travel.yandex.ru/avia/search">открыть выдачу сайта</a>' in lines[3]
+    assert lines[1] == "✈️ <b>Санкт-Петербург → Москва</b>"
+    assert lines[2] == "📅 10 дек  ·  👤 1"
+    assert lines[4] == "📈 Причина: на 15% ниже обычного"
+    assert '<a href="https://travel.yandex.ru/avia/search">открыть выдачу сайта</a>' in text
     # Без критериев строки Фильтры нет
     assert not any(l.startswith("Фильтры:") for l in lines)
 

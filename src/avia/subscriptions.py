@@ -440,6 +440,7 @@ class NotifyRules:
     median_min_points: int = 5
     pause_seconds: float = 3 * 3600.0
     median_window_seconds: float = 14 * 86400.0
+    rise_pct: float = 10.0
 
 
 _DEFAULT_RULES = NotifyRules()
@@ -501,5 +502,17 @@ def evaluate(
             med_pct = (med - price) / med * 100.0
             if med_pct >= active_rules.median_pct:
                 reasons.append(f"на {round(med_pct)}% ниже обычного")
+
+    # 5. «подорожала на N ₽ (P%)»: относительно эталона ref (sub.last_notified_price или reference_price)
+    if (
+        ref is not None
+        and ref > 0
+        and price > ref
+        and "новый минимум" not in reasons
+    ):
+        diff = price - ref
+        pct = (diff / ref) * 100.0
+        if (price * 100) >= round(ref * (100.0 + active_rules.rise_pct), 6):
+            reasons.append(f"подорожала на {diff} ₽ ({round(pct)}%)")
 
     return reasons

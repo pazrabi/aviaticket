@@ -18,6 +18,7 @@ from .formatting import (
     build_compact_report,
     build_more_report,
     build_report,
+    date_ru,
     format_details,
     money,
 )
@@ -41,11 +42,22 @@ MAX_SUBSCRIPTIONS = 1
 # сайты, умеющие «туда и обратно» (все пять сайтов); пустое множество включает заглушку «скоро»
 ROUND_TRIP_SITES: frozenset[str] = frozenset({"aviasales", "kupibilet", "yandex_travel", "tutu", "onetwotrip", "ozon_travel"})
 
+MENU_TEXT = (
+    "✈️ <b>Дешёвые авиабилеты</b>\n"
+    "Сравниваю цены на нескольких сервисах и показываю самое выгодное.\n\n"
+    "Нажмите «Найти билет» — и ответьте на пару вопросов."
+)
+
 HELP = (
-    "Пришлите команду:\n"
+    "ℹ️ <b>Как пользоваться</b>\n\n"
+    "1. Нажмите «🔎 Найти билет» и ответьте на вопросы: откуда, куда, даты, багаж.\n"
+    "2. Бот опросит сервисы и покажет самый дешёвый и самый быстрый варианты.\n"
+    "3. Напишите номер билета, чтобы увидеть подробности.\n"
+    "4. «🔔 Отслеживать цену» — пришлю сообщение, когда цена изменится.\n\n"
+    "⚡ <b>Быстрый поиск командой</b>\n"
     "<code>/price Москва Алматы 10.12</code>\n"
-    "<code>/price MOW TAS 2026-12-10 2</code> (2 пассажира)\n\n"
-    "Города по-русски или кодом IATA."
+    "<code>/price MOW TAS 2026-12-10 2</code> — 2 пассажира\n\n"
+    "Города можно писать по-русски или кодом IATA."
 )
 
 
@@ -105,14 +117,28 @@ def to_reply_markup(keyboard: list[list[tuple[str, str]]] | None) -> dict | None
 def compact_keyboard(dialog_id: str, *, has_more: bool) -> list[list[tuple[str, str]]]:
     rows: list[list[tuple[str, str]]] = []
     if has_more:
-        rows.append([("➕ Показать ещё 5", f"more:{dialog_id}")])
+        rows.append([("➕ Показать ещё", f"more:{dialog_id}")])
     rows.append([
-        ("⚙ Изменить фильтры", f"filters:{dialog_id}"),
-        ("📋 Полный список", f"full:{dialog_id}"),
+        ("⚙️ Фильтры", f"filters:{dialog_id}"),
+        ("📋 По сайтам", f"full:{dialog_id}"),
     ])
-    rows.append([("🔔 Отслеживать цену", f"track:{dialog_id}")])
-    rows.append([("🔎 Новый поиск", f"new:{dialog_id}")])
+    rows.append([
+        ("🔔 Следить за ценой", f"track:{dialog_id}"),
+        ("🔎 Новый поиск", f"new:{dialog_id}"),
+    ])
     return rows
+
+
+def _baggage_text(session: Session) -> str:
+    lines = ["🧳 <b>Багаж</b>"]
+    if session.origin and session.destination and session.depart:
+        route = f"{escape(city_name(session.origin))} → {escape(city_name(session.destination))}"
+        dates = f"{date_ru(session.depart)}"
+        if session.return_date:
+            dates += f" – {date_ru(session.return_date)}"
+        lines.insert(0, f"✈️ <b>{route}</b>  ·  📅 {dates}\n")
+    lines.append("Какие билеты показывать?")
+    return "\n".join(lines)
 
 
 def _format_filters(baggage_mode: str, criteria: SearchCriteria) -> list[str]:
@@ -128,7 +154,7 @@ def _format_filters(baggage_mode: str, criteria: SearchCriteria) -> list[str]:
 def full_keyboard(dialog_id: str) -> list[list[tuple[str, str]]]:
     return [
         [
-            ("⬅ К сводке", f"list:{dialog_id}:compact"),
+            ("⬅️ К сводке", f"list:{dialog_id}:compact"),
             ("🔎 Новый поиск", f"new:{dialog_id}"),
         ]
     ]
@@ -150,7 +176,7 @@ class Dialog:
     def start_menu(self, chat_id: int | str) -> Reply:
         self.sessions[chat_id] = Session(step=Step.MENU, dialog_id=secrets.token_hex(2))
         return Reply(
-            text="Главное меню:",
+            text=MENU_TEXT,
             keyboard=[
                 [("🔎 Найти билет", "menu:go")],
                 [("🔔 Мои отслеживания", "menu:track")],
@@ -162,22 +188,22 @@ class Dialog:
         session = Session(step=Step.ORIGIN, dialog_id=secrets.token_hex(2))
         self.sessions[chat_id] = session
         return Reply(
-            text="Откуда? Укажите город или код IATA:",
+            text="🛫 <b>Откуда летим?</b>\nГород или код IATA, например <i>Москва</i> или <i>MOW</i>",
             keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
         )
 
     def _baggage_reply(self, session: Session, *, edit: bool = False) -> Reply:
         desc = session.criteria.describe()
-        adv_text = f"⚙ Расширенные настройки ({len(desc)})" if desc else "⚙ Расширенные настройки"
+        adv_text = f"⚙️ Расширенные настройки ({len(desc)})" if desc else "⚙️ Расширенные настройки"
         return Reply(
-            text="Багаж?",
+            text=_baggage_text(session),
             keyboard=[
                 [
-                    ("С багажом", f"bag:{session.dialog_id}:with"),
-                    ("Без багажа", f"bag:{session.dialog_id}:without"),
-                    ("Не важно", f"bag:{session.dialog_id}:any"),
+                    ("🧳 С багажом", f"bag:{session.dialog_id}:with"),
+                    ("🎒 Без багажа", f"bag:{session.dialog_id}:without"),
                 ],
-                [(f"Пассажиров: {session.adults}", f"pax:{session.dialog_id}:+")],
+                [("✅ Не важно — показать всё", f"bag:{session.dialog_id}:any")],
+                [(f"👤 Пассажиров: {session.adults}  ·  изменить", f"pax:{session.dialog_id}:+")],
                 [(adv_text, f"adv:{session.dialog_id}:menu")],
                 [("✖ Отмена", f"cancel:{session.dialog_id}")],
             ],
@@ -186,17 +212,17 @@ class Dialog:
 
     def _adv_menu_reply(self, session: Session) -> Reply:
         desc = session.criteria.describe()
-        body = "\n".join(desc) if desc else "Всё не важно"
-        text = f"⚙ Расширенные настройки\n\n{body}"
+        body = "\n".join(f"• {d}" for d in desc) if desc else "Фильтры не заданы — показываю всё"
+        text = f"⚙️ <b>Расширенные настройки</b>\n\n{escape(body)}"
         return Reply(
             text=text,
             keyboard=[
-                [("Пересадки", f"adv:{session.dialog_id}:s_tr")],
-                [("Время в пути", f"adv:{session.dialog_id}:s_dur")],
-                [("Время вылета", f"adv:{session.dialog_id}:s_dp")],
-                [("Время прилёта", f"adv:{session.dialog_id}:s_ap")],
-                [("Баланс цены и времени", f"adv:{session.dialog_id}:s_hc")],
-                [("Сбросить всё", f"adv:{session.dialog_id}:reset")],
+                [("🔀 Пересадки", f"adv:{session.dialog_id}:s_tr")],
+                [("⏱ Время в пути", f"adv:{session.dialog_id}:s_dur")],
+                [("🛫 Время вылета", f"adv:{session.dialog_id}:s_dp")],
+                [("🛬 Время прилёта", f"adv:{session.dialog_id}:s_ap")],
+                [("⚖️ Баланс цены и времени", f"adv:{session.dialog_id}:s_hc")],
+                [("🧹 Сбросить всё", f"adv:{session.dialog_id}:reset")],
                 [("✅ Готово", f"adv:{session.dialog_id}:done")],
                 [("✖ Отмена", f"cancel:{session.dialog_id}")],
             ],
@@ -205,75 +231,75 @@ class Dialog:
 
     def _adv_transfers_reply(self, session: Session) -> Reply:
         return Reply(
-            text="⚙ Пересадки",
+            text="🔀 <b>Сколько пересадок допустимо?</b>",
             keyboard=[
-                [("Только прямые", f"adv:{session.dialog_id}:tr_0")],
-                [("До 1", f"adv:{session.dialog_id}:tr_1")],
-                [("До 2", f"adv:{session.dialog_id}:tr_2")],
+                [("✈️ Только прямые", f"adv:{session.dialog_id}:tr_0")],
+                [("До 1 пересадки", f"adv:{session.dialog_id}:tr_1")],
+                [("До 2 пересадок", f"adv:{session.dialog_id}:tr_2")],
                 [("Не важно", f"adv:{session.dialog_id}:tr_any")],
-                [("⬅ Назад", f"adv:{session.dialog_id}:menu")],
+                [("⬅️ Назад", f"adv:{session.dialog_id}:menu")],
             ],
             edit=True,
         )
 
     def _adv_duration_reply(self, session: Session) -> Reply:
         return Reply(
-            text="⚙ Время в пути",
+            text="⏱ <b>Максимальное время в пути</b>",
             keyboard=[
                 [("До 8 ч", f"adv:{session.dialog_id}:dur_8")],
                 [("До 15 ч", f"adv:{session.dialog_id}:dur_15")],
                 [("До 24 ч", f"adv:{session.dialog_id}:dur_24")],
                 [("Не важно", f"adv:{session.dialog_id}:dur_any")],
-                [("⬅ Назад", f"adv:{session.dialog_id}:menu")],
+                [("⬅️ Назад", f"adv:{session.dialog_id}:menu")],
             ],
             edit=True,
         )
 
     def _adv_depart_reply(self, session: Session) -> Reply:
         labels = {
-            "morning": "утро 06–12",
-            "day": "день 12–18",
-            "evening": "вечер 18–24",
-            "night": "ночь 00–06",
+            "morning": "🌅 утро 06–12",
+            "day": "☀️ день 12–18",
+            "evening": "🌆 вечер 18–24",
+            "night": "🌙 ночь 00–06",
         }
         rows: list[list[tuple[str, str]]] = []
         for part in DAY_PARTS:
             lbl = labels.get(part, part)
             if part in session.criteria.depart_parts:
-                lbl = f"✓ {lbl}"
+                lbl = f"✅ {lbl}"
             rows.append([(lbl, f"adv:{session.dialog_id}:dp_{part}")])
         rows.append([("Не важно", f"adv:{session.dialog_id}:dp_any")])
-        rows.append([("⬅ Назад", f"adv:{session.dialog_id}:menu")])
-        return Reply(text="⚙ Время вылета", keyboard=rows, edit=True)
+        rows.append([("⬅️ Назад", f"adv:{session.dialog_id}:menu")])
+        return Reply(text="🛫 <b>Когда вылетать?</b>\nМожно выбрать несколько вариантов", keyboard=rows, edit=True)
 
     def _adv_arrive_reply(self, session: Session) -> Reply:
         labels = {
-            "morning": "утро 06–12",
-            "day": "день 12–18",
-            "evening": "вечер 18–24",
-            "night": "ночь 00–06",
+            "morning": "🌅 утро 06–12",
+            "day": "☀️ день 12–18",
+            "evening": "🌆 вечер 18–24",
+            "night": "🌙 ночь 00–06",
         }
         rows: list[list[tuple[str, str]]] = []
         for part in DAY_PARTS:
             lbl = labels.get(part, part)
             if part in session.criteria.arrive_parts:
-                lbl = f"✓ {lbl}"
+                lbl = f"✅ {lbl}"
             rows.append([(lbl, f"adv:{session.dialog_id}:ap_{part}")])
         rows.append([("Не важно", f"adv:{session.dialog_id}:ap_any")])
-        rows.append([("⬅ Назад", f"adv:{session.dialog_id}:menu")])
-        return Reply(text="⚙ Время прилёта", keyboard=rows, edit=True)
+        rows.append([("⬅️ Назад", f"adv:{session.dialog_id}:menu")])
+        return Reply(text="🛬 <b>Когда прилетать?</b>\nМожно выбрать несколько вариантов", keyboard=rows, edit=True)
 
     def _adv_balance_reply(self, session: Session) -> Reply:
         text = (
-            "⚙ Баланс цены и времени\n\n"
-            "Цена + стоимость часа в пути, показывается отдельная карточка «Лучший баланс»."
+            "⚖️ <b>Баланс цены и времени</b>\n\n"
+            "Считаю цену плюс стоимость часа в пути и показываю отдельную карточку «Лучший баланс»."
         )
         keyboard = [
             [("500 ₽/ч", f"adv:{session.dialog_id}:hc_500")],
             [("1000 ₽/ч", f"adv:{session.dialog_id}:hc_1000")],
             [("2000 ₽/ч", f"adv:{session.dialog_id}:hc_2000")],
             [("Выключить", f"adv:{session.dialog_id}:hc_off")],
-            [("⬅ Назад", f"adv:{session.dialog_id}:menu")],
+            [("⬅️ Назад", f"adv:{session.dialog_id}:menu")],
         ]
         return Reply(text=text, keyboard=keyboard, edit=True)
 
@@ -375,7 +401,7 @@ class Dialog:
 
     def _expired_reply(self) -> Reply:
         return Reply(
-            text="Диалог устарел, начните заново",
+            text="⌛ Диалог устарел, начните заново",
             keyboard=[[("🔎 Найти билет", "menu:go")]],
             answer="Диалог устарел, начните заново",
         )
@@ -392,7 +418,7 @@ class Dialog:
         if not subs:
             return [
                 Reply(
-                    text="Пока ничего не отслеживается. Выполните поиск и нажмите «🔔 Отслеживать цену»",
+                    text="🔔 <b>Пока ничего не отслеживается</b>\nВыполните поиск и нажмите «🔔 Следить за ценой»",
                     keyboard=[[("🔎 Найти билет", "menu:go")]],
                 )
             ]
@@ -400,34 +426,31 @@ class Dialog:
         lines: list[str] = []
         keyboard: list[list[tuple[str, str]]] = []
         for idx, sub in enumerate(subs, 1):
-            dep_str = sub.depart.strftime("%d.%m")
+            dates_str = date_ru(sub.depart)
             if sub.return_date:
-                dates_str = f"{dep_str}–{sub.return_date.strftime('%d.%m')}"
-            else:
-                dates_str = dep_str
+                dates_str += f" – {date_ru(sub.return_date)}"
 
             orig_name = escape(city_name(sub.origin))
             dest_name = escape(city_name(sub.destination))
-            parts = [f"{idx}. {orig_name} → {dest_name}, {dates_str}, {sub.adults} пасс."]
-
+            block = [
+                f"<b>{idx}. {orig_name} → {dest_name}</b>",
+                f"📅 {dates_str}  ·  👤 {sub.adults}",
+            ]
             filters = _format_filters(sub.baggage_mode, sub.criteria)
-            for f in filters:
-                parts.append(escape(f))
-
-            if sub.threshold is not None:
-                parts.append(f"порог {money(sub.threshold, 'RUB')}")
-
+            if filters:
+                block.append(f"⚙️ {escape(', '.join(filters))}")
             if sub.min_price is not None:
-                parts.append(f"от {money(sub.min_price, 'RUB')}")
-
-            lines.append(" · ".join(parts))
+                block.append(f"💰 от {money(sub.min_price, 'RUB')}")
+            if sub.threshold is not None:
+                block.append(f"🎯 порог {money(sub.threshold, 'RUB')}")
+            lines.append("\n".join(block))
             keyboard.append([
-                (f"❌ №{idx}", f"unsub:{sub.id}"),
-                (f"🎯 №{idx}", f"thr:{sub.id}"),
+                (f"🎯 Порог №{idx}", f"thr:{sub.id}"),
+                (f"🔕 Отключить №{idx}", f"unsub:{sub.id}"),
             ])
 
         keyboard.append([("🔎 Найти билет", "menu:go")])
-        return [Reply(text="\n".join(lines), keyboard=keyboard)]
+        return [Reply(text="🔔 <b>Мои отслеживания</b>\n\n" + "\n\n".join(lines), keyboard=keyboard)]
 
     def _on_unsub_callback(self, chat_id: int | str, sub_id_str: str) -> list[Reply]:
         if self.subs is None:
@@ -447,7 +470,7 @@ class Dialog:
             sub_id = None
 
         if sub_id is not None and self.subs.deactivate(sub_id, int(chat_id)):
-            msg = "🔕 Отслеживание отключено"
+            msg = "🔕 <b>Отслеживание отключено</b>"
         else:
             msg = "Подписка не найдена"
 
@@ -491,7 +514,7 @@ class Dialog:
         self.sessions[chat_id] = session
         return [
             Reply(
-                text="Введите цену в рублях, ниже которой прислать уведомление (0 — убрать порог)",
+                text="🎯 <b>Порог цены</b>\nНапишите сумму в рублях — сообщу, когда цена станет ниже.\nЧтобы убрать порог, отправьте 0.",
                 keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
             )
         ]
@@ -501,7 +524,7 @@ class Dialog:
         if snap is None:
             return [
                 Reply(
-                    text="Результаты поиска устарели, начните новый поиск",
+                    text="⌛ Результаты поиска устарели, начните новый поиск",
                     keyboard=[[("🔎 Найти билет", "menu:go")]],
                 )
             ]
@@ -528,7 +551,7 @@ class Dialog:
         if existing is None and len(active_subs) >= MAX_SUBSCRIPTIONS:
             return [
                 Reply(
-                    text=f"Достигнут лимит отслеживаний ({MAX_SUBSCRIPTIONS}), отпишитесь от ненужного",
+                    text=f"⚠️ Лимит отслеживаний: {MAX_SUBSCRIPTIONS}. Отключите ненужное, чтобы добавить новое.",
                     keyboard=[[("🔔 Мои отслеживания", "menu:track")]],
                 )
             ]
@@ -566,27 +589,29 @@ class Dialog:
 
         orig_city = city_name(snap.query.origin)
         dest_city = city_name(snap.query.destination)
-        dep_str = snap.query.depart.strftime("%d.%m")
+        dates_str = date_ru(snap.query.depart)
         if snap.query.return_date:
-            dates_str = f"{dep_str}–{snap.query.return_date.strftime('%d.%m')}"
-        else:
-            dates_str = dep_str
+            dates_str += f" – {date_ru(snap.query.return_date)}"
 
-        route_str = f"{escape(orig_city)} → {escape(dest_city)}, {dates_str}"
+        lines = [
+            "🔔 <b>Слежу за ценой</b>",
+            "",
+            f"✈️ <b>{escape(orig_city)} → {escape(dest_city)}</b>",
+            f"📅 {dates_str}",
+        ]
         filters = _format_filters(snap.baggage_mode, snap.criteria)
         if filters:
-            filters_part = f", фильтры: {escape(', '.join(filters))}"
-        else:
-            filters_part = ""
-
+            lines.append(f"⚙️ {escape(', '.join(filters))}")
+        lines.append("")
         if best_offer is not None:
-            price_part = f"Сейчас от {money(best_offer.price, best_offer.currency)}. Пришлю сообщение, когда цена упадёт."
+            lines.append(f"Сейчас от <b>{money(best_offer.price, best_offer.currency)}</b>")
+            lines.append("Пришлю сообщение, когда цена изменится.")
         else:
-            price_part = "Пока билетов нет, пришлю, когда появятся."
-
-        text = f"🔔 Слежу за маршрутом: {route_str}{filters_part}. {price_part}"
+            lines.append("Пока билетов нет, пришлю, когда появятся.")
         if already_exists:
-            text += "\n\nВы уже следите за этим маршрутом."
+            lines.append("")
+            lines.append("<i>Вы уже следите за этим маршрутом.</i>")
+        text = "\n".join(lines)
 
         keyboard = [
             [("🎯 Порог цены", f"thr:{sub.id}")],
@@ -641,7 +666,7 @@ class Dialog:
                 session.step = Step.DEST
                 return [
                     Reply(
-                        text="Куда? Укажите город или код IATA:",
+                        text="🛬 <b>Куда летим?</b>\nГород или код IATA, например <i>Ереван</i> или <i>EVN</i>",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -649,7 +674,7 @@ class Dialog:
                 if iata == session.origin:
                     return [
                         Reply(
-                            text=f"⚠️ {escape('города вылета и прилёта совпадают')}\n\nКуда? Укажите город или код IATA:",
+                            text=f"⚠️ {escape('города вылета и прилёта совпадают')}\n\n🛬 <b>Куда летим?</b>\nГород или код IATA, например <i>Ереван</i> или <i>EVN</i>",
                             keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                         )
                     ]
@@ -657,7 +682,7 @@ class Dialog:
                 session.step = Step.DATE
                 return [
                     Reply(
-                        text="Дата вылета (12.12, 12.12.2026, 2026-12-12):",
+                        text="📅 <b>Когда вылет?</b>\nНапример: <code>12.12</code>, <code>12.12.2026</code> или <code>2026-12-12</code>",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -672,7 +697,7 @@ class Dialog:
                 session.step = Step.RETURN_DATE
                 return [
                     Reply(
-                        text="Дата возвращения (12.12, 12.12.2026, 2026-12-12):",
+                        text="📅 <b>Когда обратно?</b>\nНапример: <code>20.12</code> или <code>20.12.2026</code>",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -698,7 +723,7 @@ class Dialog:
             if session.return_date is not None and not ROUND_TRIP_SITES:
                 return [
                     Reply(
-                        text="Обратные билеты скоро: пока ищу только в одну сторону",
+                        text="↔️ Обратные билеты скоро: пока ищу только в одну сторону",
                         keyboard=[
                             [("Искать только туда", f"go:{session.dialog_id}")],
                             [("✖ Отмена", f"cancel:{session.dialog_id}")],
@@ -748,7 +773,7 @@ class Dialog:
             if snap is None:
                 return [
                     Reply(
-                        text="Результаты поиска устарели, начните новый поиск",
+                        text="⌛ Результаты поиска устарели, начните новый поиск",
                         keyboard=[[("🔎 Найти билет", "menu:go")]],
                     )
                 ]
@@ -773,7 +798,7 @@ class Dialog:
             if snap is None:
                 return [
                     Reply(
-                        text="Результаты поиска устарели, начните новый поиск",
+                        text="⌛ Результаты поиска устарели, начните новый поиск",
                         keyboard=[[("🔎 Найти билет", "menu:go")]],
                     )
                 ]
@@ -795,7 +820,7 @@ class Dialog:
             if snap is None:
                 return [
                     Reply(
-                        text="Результаты поиска устарели, начните новый поиск",
+                        text="⌛ Результаты поиска устарели, начните новый поиск",
                         keyboard=[[("🔎 Найти билет", "menu:go")]],
                     )
                 ]
@@ -838,7 +863,7 @@ class Dialog:
             if snap is None:
                 return [
                     Reply(
-                        text="Результаты поиска устарели, начните новый поиск",
+                        text="⌛ Результаты поиска устарели, начните новый поиск",
                         keyboard=[[("🔎 Найти билет", "menu:go")]],
                     )
                 ]
@@ -896,7 +921,7 @@ class Dialog:
                 session.step = Step.DEST
                 return [
                     Reply(
-                        text="Куда? Укажите город или код IATA:",
+                        text="🛬 <b>Куда летим?</b>\nГород или код IATA, например <i>Ереван</i> или <i>EVN</i>",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -907,14 +932,14 @@ class Dialog:
                 ] + [[("✖ Отмена", f"cancel:{session.dialog_id}")]]
                 return [
                     Reply(
-                        text=f"⚠️ {escape(str(e))}\n\nОткуда? Укажите город или код IATA:",
+                        text=f"⚠️ {escape(str(e))}\n\n🛫 <b>Откуда летим?</b>\nГород или код IATA, например <i>Москва</i> или <i>MOW</i>",
                         keyboard=kb,
                     )
                 ]
             except ParseError as e:
                 return [
                     Reply(
-                        text=f"⚠️ {escape(str(e))}\n\nОткуда? Укажите город или код IATA:",
+                        text=f"⚠️ {escape(str(e))}\n\n🛫 <b>Откуда летим?</b>\nГород или код IATA, например <i>Москва</i> или <i>MOW</i>",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -928,7 +953,7 @@ class Dialog:
                 session.step = Step.DATE
                 return [
                     Reply(
-                        text="Дата вылета (12.12, 12.12.2026, 2026-12-12):",
+                        text="📅 <b>Когда вылет?</b>\nНапример: <code>12.12</code>, <code>12.12.2026</code> или <code>2026-12-12</code>",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -939,14 +964,14 @@ class Dialog:
                 ] + [[("✖ Отмена", f"cancel:{session.dialog_id}")]]
                 return [
                     Reply(
-                        text=f"⚠️ {escape(str(e))}\n\nКуда? Укажите город или код IATA:",
+                        text=f"⚠️ {escape(str(e))}\n\n🛬 <b>Куда летим?</b>\nГород или код IATA, например <i>Ереван</i> или <i>EVN</i>",
                         keyboard=kb,
                     )
                 ]
             except ParseError as e:
                 return [
                     Reply(
-                        text=f"⚠️ {escape(str(e))}\n\nКуда? Укажите город или код IATA:",
+                        text=f"⚠️ {escape(str(e))}\n\n🛬 <b>Куда летим?</b>\nГород или код IATA, например <i>Ереван</i> или <i>EVN</i>",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -958,11 +983,11 @@ class Dialog:
                 session.step = Step.TRIP
                 return [
                     Reply(
-                        text="Нужен обратный билет?",
+                        text="🔁 <b>Нужен обратный билет?</b>",
                         keyboard=[
                             [
-                                ("Только туда", f"trip:{session.dialog_id}:one"),
-                                ("Туда и обратно", f"trip:{session.dialog_id}:rt"),
+                                ("➡️ Только туда", f"trip:{session.dialog_id}:one"),
+                                ("↔️ Туда и обратно", f"trip:{session.dialog_id}:rt"),
                             ],
                             [("✖ Отмена", f"cancel:{session.dialog_id}")],
                         ],
@@ -971,7 +996,7 @@ class Dialog:
             except ParseError as e:
                 return [
                     Reply(
-                        text=f"⚠️ {escape(str(e))}\n\nДата вылета (12.12, 12.12.2026, 2026-12-12):",
+                        text=f"⚠️ {escape(str(e))}\n\n📅 <b>Когда вылет?</b>\nНапример: <code>12.12</code>, <code>12.12.2026</code> или <code>2026-12-12</code>",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -979,11 +1004,11 @@ class Dialog:
         if session is not None and session.step == Step.TRIP:
             return [
                 Reply(
-                    text="Пожалуйста, выберите вариант с помощью кнопок:\nНужен обратный билет?",
+                    text="👆 Выберите вариант кнопкой\n\n🔁 <b>Нужен обратный билет?</b>",
                     keyboard=[
                         [
-                            ("Только туда", f"trip:{session.dialog_id}:one"),
-                            ("Туда и обратно", f"trip:{session.dialog_id}:rt"),
+                            ("➡️ Только туда", f"trip:{session.dialog_id}:one"),
+                            ("↔️ Туда и обратно", f"trip:{session.dialog_id}:rt"),
                         ],
                         [("✖ Отмена", f"cancel:{session.dialog_id}")],
                     ],
@@ -999,7 +1024,7 @@ class Dialog:
             except ParseError as e:
                 return [
                     Reply(
-                        text=f"⚠️ {escape(str(e))}\n\nДата возвращения (12.12, 12.12.2026, 2026-12-12):",
+                        text=f"⚠️ {escape(str(e))}\n\n📅 <b>Когда обратно?</b>\nНапример: <code>20.12</code> или <code>20.12.2026</code>",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -1007,13 +1032,13 @@ class Dialog:
         if session is not None and session.step == Step.BAGGAGE:
             return [
                 Reply(
-                    text="Пожалуйста, выберите параметры багажа с помощью кнопок:\nБагаж?",
+                    text="👆 Выберите вариант кнопкой",
                     keyboard=self._baggage_reply(session).keyboard,
                 )
             ]
 
         if session is not None and session.step == Step.SEARCHING:
-            return [Reply(text="Поиск ещё идёт, подождите завершения.")]
+            return [Reply(text="⏳ Поиск ещё идёт, подождите завершения.")]
 
         if session is not None and session.step == Step.THRESHOLD:
             cleaned = text.replace(" ", "").replace("\xa0", "").replace("₽", "").strip()
@@ -1022,7 +1047,7 @@ class Dialog:
             except ValueError:
                 return [
                     Reply(
-                        text="Введите число в рублях, например 9000",
+                        text="⚠️ Нужно число в рублях, например <code>9000</code>",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -1030,7 +1055,7 @@ class Dialog:
             if val < 0:
                 return [
                     Reply(
-                        text="Введите число в рублях, например 9000",
+                        text="⚠️ Нужно число в рублях, например <code>9000</code>",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -1072,7 +1097,7 @@ class Dialog:
                     ]
                 return [
                     Reply(
-                        text=f"🎯 Порог {money(val, 'RUB')} сохранён",
+                        text=f"🎯 Порог <b>{money(val, 'RUB')}</b> сохранён",
                         keyboard=[[("🔔 Мои отслеживания", "menu:track")]],
                     )
                 ]
@@ -1085,7 +1110,7 @@ class Dialog:
             if snap is None:
                 return [
                     Reply(
-                        text="Результаты поиска устарели, начните новый поиск",
+                        text="⌛ Результаты поиска устарели, начните новый поиск",
                         keyboard=[[("🔎 Найти билет", "menu:go")]],
                     )
                 ]
@@ -1101,16 +1126,16 @@ class Dialog:
                         text=card,
                         keyboard=[
                             [
-                                ("⬅ К списку", f"list:{session.dialog_id}"),
-                                ("🔔 Отслеживать цену", f"track:{session.dialog_id}"),
+                                ("⬅️ К списку", f"list:{session.dialog_id}"),
+                                ("🔔 Следить за ценой", f"track:{session.dialog_id}"),
                             ],
                             [("🔎 Новый поиск", f"new:{session.dialog_id}")],
                         ],
                     )
                 ]
-            return [Reply(text=f"Нет варианта с таким номером, всего: {len(snap.flat)}")]
+            return [Reply(text=f"🤔 Нет варианта с таким номером. Доступно: 1–{len(snap.flat)}")]
 
         if snap is not None:
-            return [Reply(text=f"Нет варианта с таким номером, всего: {len(snap.flat)}")]
+            return [Reply(text=f"🤔 Нет варианта с таким номером. Доступно: 1–{len(snap.flat)}")]
 
         return [self.start_menu(chat_id)]

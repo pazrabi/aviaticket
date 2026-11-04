@@ -26,7 +26,7 @@ def test_report_has_ozon_link_without_offers():
     q = _q()
     chunks, _ = build_report(q, [SiteResult(site="x", ok=True, offers=[])])
     text = "\n".join(chunks)
-    assert "Озон Тревел" in text
+    assert "Ozon Travel" in text
     assert "route=kufevn" in text
 
 

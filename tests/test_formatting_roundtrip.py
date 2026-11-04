@@ -20,14 +20,14 @@ def test_header_city_names_and_unknown_code():
     q_oneway = Query("KUF", "EVN", date(2026, 12, 16))
     rep_oneway = format_report(q_oneway, [SiteResult("site", True, [])])
     assert "✈️ <b>Самара → Ереван</b>" in rep_oneway
-    assert "16.12.2026" in rep_oneway
+    assert "16 дек" in rep_oneway
 
     # 2. Известные коды в запросе туда-обратно
     q_rt = Query("KUF", "EVN", date(2026, 12, 16), return_date=date(2026, 12, 20))
     rep_rt = format_report(q_rt, [SiteResult("site", True, [])])
     assert "✈️ <b>Самара → Ереван</b>" in rep_rt
-    assert "туда 16.12.2026, обратно 20.12.2026" in rep_rt
-    assert "цена общая за оба плеча" in rep_rt
+    assert "16 дек – 20 дек" in rep_rt
+    assert "цена за оба плеча" in rep_rt
 
     # 3. Неизвестный код (XYZ остаётся XYZ, EVN -> Ереван)
     q_unk = Query("XYZ", "EVN", date(2026, 12, 16))
@@ -49,12 +49,12 @@ def test_header_city_names_and_unknown_code():
         back=Leg(airline="FLYONE Armenia", depart_time="08:00", arrive_time="11:10"),
     )
     card_rt = format_details(o_rt, q_rt)
-    assert "✈️ <b>Самара → Ереван</b>" in card_rt
-    assert "✈️ <b>Ереван → Самара</b>" in card_rt
+    assert "Туда: Самара → Ереван" in card_rt
+    assert "Обратно: Ереван → Самара" in card_rt
 
     # 6. Карточка с неизвестным кодом
     card_unk = format_details(o_rt, q_unk)
-    assert "✈️ <b>XYZ → Ереван</b>" in card_unk
+    assert "Туда: XYZ → Ереван" in card_unk
 
     # 7. Экранирование спецсимволов в кодах
     q_esc = Query("<orig>", "<dest>", date(2026, 12, 16))
@@ -118,10 +118,10 @@ def test_roundtrip_offer_line_two_legs_different_airlines():
     res = SiteResult("aviasales", True, dup_offers)
     text = format_report(q, [res], top_n=5)
     # o_same должен встретиться в списке ровно 1 раз (плюс строка «Дешевле всего»)
-    assert text.count("FLYONE Armenia · туда 10:15→13:30 (прямой)") == 2
-    assert "1. " in text
-    assert "2. " in text
-    assert "3. " not in text
+    assert text.count("10:15 → 13:30") == 2
+    assert "<b>1.</b>" in text
+    assert "<b>2.</b>" in text
+    assert "<b>3.</b>" not in text
 
 
 def test_roundtrip_offer_line_duration_omitted_when_longer_than_160():

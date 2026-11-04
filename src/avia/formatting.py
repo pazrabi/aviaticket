@@ -42,8 +42,8 @@ def _ozon_footer(q: Query, results: Sequence[SiteResult]) -> list[str]:
     if any(r.site == "ozon_travel" for r in results):
         return []
     return [
-        f'Озон Тревел: <a href="{escape(ozon_url(q), quote=True)}">открыть выдачу</a> '
-        "(цены Озона бот не проверяет)",
+        f'🔗 Ozon Travel: <a href="{escape(ozon_url(q), quote=True)}">открыть выдачу</a> '
+        "<i>(цены Озона бот не проверяет)</i>",
     ]
 
 
@@ -184,6 +184,167 @@ def offer_line(o: Offer, *, baggage_mode: str = "any") -> str:
     return " · ".join(parts)
 
 
+SITE_NAMES = {
+    "aviasales": "Aviasales",
+    "kupibilet": "Купибилет",
+    "yandex_travel": "Яндекс Путешествия",
+    "tutu": "Туту",
+    "onetwotrip": "OneTwoTrip",
+    "ozon_travel": "Ozon Travel",
+}
+
+MONTHS_SHORT = ("янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек")
+CARD_ICONS = {"Самый дешёвый": "💰", "Самый быстрый": "⚡", "Лучший баланс": "⚖️"}
+DIVIDER = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
+
+
+def site_label(site: str) -> str:
+    return SITE_NAMES.get(site, site)
+
+
+def date_ru(d: date) -> str:
+    return f"{d.day} {MONTHS_SHORT[d.month - 1]}"
+
+
+def _passengers(n: int) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} пассажир"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} пассажира"
+    return f"{n} пассажиров"
+
+
+def _leg_date(leg: Offer | Leg, fallback: date | None) -> date | None:
+    if leg.depart_at:
+        try:
+            return datetime.fromisoformat(leg.depart_at).date()
+        except (ValueError, TypeError):
+            pass
+    return fallback
+
+
+def _transfers_text(n: int | None) -> str | None:
+    if n is None:
+        return None
+    if n == 0:
+        return "прямой"
+    return "1 пересадка" if n == 1 else f"{n} пересадки" if n < 5 else f"{n} пересадок"
+
+
+def _leg_line(leg: Offer | Leg, icon: str, fallback: date | None) -> str | None:
+    """Одна строка плеча: 🛫 16 дек · 10:15 → 13:30 · 3ч 15м · прямой."""
+    parts: list[str] = []
+    d = _leg_date(leg, fallback)
+    if d:
+        parts.append(f"<b>{date_ru(d)}</b>")
+    if leg.depart_time and leg.arrive_time:
+        parts.append(f"{escape(leg.depart_time)} → {escape(leg.arrive_time)}")
+    elif leg.depart_time:
+        parts.append(f"вылет {escape(leg.depart_time)}")
+    elif leg.arrive_time:
+        parts.append(f"прилёт {escape(leg.arrive_time)}")
+    if leg.duration:
+        parts.append(escape(leg.duration))
+    tr = _transfers_text(leg.transfers)
+    if tr:
+        parts.append(tr)
+    if not parts:
+        return None
+    return f"{icon} " + " · ".join(parts)
+
+
+def _baggage_line(o: Offer, baggage_mode: str) -> str | None:
+    if o.baggage:
+        return f"🧳 {escape(o.baggage)}"
+    if baggage_mode != "any" and baggage_state(o) is None:
+        return "🧳 багаж не указан"
+    return None
+
+
+def offer_body(o: Offer, q: Query | None, baggage_mode: str = "any") -> list[str]:
+    """Строки с плечами и багажом (без цены и ссылки)."""
+    out_date = q.depart if q else None
+    back_date = (q.return_date or q.depart) if q else None
+    lines: list[str] = []
+    first = _leg_line(o, "🛫", out_date)
+    if first:
+        lines.append(first)
+    if o.back is not None:
+        second = _leg_line(o.back, "🛬", back_date)
+        if second:
+            lines.append(second)
+    bag = _baggage_line(o, baggage_mode)
+    if bag:
+        lines.append(bag)
+    layovers = _collect_layovers(o)
+    if layovers:
+        lines.append(f"🔁 {', '.join(escape(l) for l in layovers)}")
+    return lines
+
+
+def _price_html(o: Offer) -> str:
+    change = price_change_short(o).strip()
+    text = f"<b>{money(o.price, o.currency)}</b>"
+    if change:
+        text += f"  <i>{change.strip('()')}</i>"
+    return text
+
+
+def offer_card(
+    o: Offer,
+    q: Query | None,
+    *,
+    number: int,
+    title: str | None = None,
+    baggage_mode: str = "any",
+) -> list[str]:
+    """Карточка билета: заголовок, цена и авиакомпания, плечи в цитате, ссылка."""
+    icon = CARD_ICONS.get(title or "", "🎫")
+    head = f"<b>{number}  {icon} {escape(title)}</b>" if title else f"<b>{number}</b>"
+    price_row = _price_html(o)
+    airline = _airline_label(o)
+    if airline:
+        price_row += f"  ·  {airline}"
+    lines = [head, price_row]
+    body = offer_body(o, q, baggage_mode)
+    if body:
+        lines.append("<blockquote>" + "\n".join(body) + "</blockquote>")
+    link = offer_link_html(o)
+    src = f"<i>{escape(site_label(o.site))}</i>"
+    lines.append(f"🔗 {link}  ·  {src}" if link else src)
+    return lines
+
+
+def _trip_head(q: Query) -> list[str]:
+    lines = [f"✈️ <b>{escape(city_name(q.origin))} → {escape(city_name(q.destination))}</b>"]
+    dates = date_ru(q.depart)
+    if q.return_date:
+        dates += f" – {date_ru(q.return_date)}"
+    row = f"📅 {dates}  ·  👤 {_passengers(q.adults)}"
+    lines.append(row)
+    lines.append("↔️ туда и обратно, цена за оба плеча" if q.return_date else "➡️ только туда")
+    return lines
+
+
+def _baggage_filter_line(baggage_mode: str, dropped: int) -> str:
+    mode = "только с багажом" if baggage_mode == "with" else "только без багажа"
+    return f"🧳 {mode} · скрыто: {dropped} (без данных о багаже оставлены)"
+
+
+def _site_issue(r: SiteResult) -> str:
+    label = f"<b>{escape(site_label(r.site))}</b>"
+    link = f' · <a href="{escape(r.page_url, quote=True)}">открыть выдачу</a>' if r.page_url else ""
+    if not r.ok:
+        return f"⚠️ {label}: {escape(r.error or 'ошибка')}{link}"
+    notes = []
+    if r.partial:
+        notes.append("неполная выдача: сайт ещё догружал варианты")
+    if r.cached:
+        notes.append("из кэша, цены могли измениться")
+    tail = "".join(f"\n<i>{escape(n)}</i>" for n in notes)
+    return f"▫️ {label}: билетов не нашлось{link}{tail}"
+
+
 def build_report(
     q: Query,
     results: list[SiteResult],
@@ -192,131 +353,93 @@ def build_report(
     baggage_mode: str = "any",
     dropped: int = 0,
 ) -> tuple[list[str], list[Offer]]:
-    """Формирует части отчёта (каждая ≤ 4000 символов) и плоский список показанных билетов."""
-    orig_name = city_name(q.origin)
-    dest_name = city_name(q.destination)
-    route_head = f"✈️ <b>{escape(orig_name)} → {escape(dest_name)}</b>"
-    if q.return_date:
-        date_str = f"туда {q.depart:%d.%m.%Y}, обратно {q.return_date:%d.%m.%Y}"
-        head = (
-            f"{route_head}, "
-            f"{date_str}, пассажиров: {q.adults} (цена общая за оба плеча)"
-        )
-    else:
-        date_str = f"{q.depart:%d.%m.%Y}"
-        head = f"{route_head}, {date_str}, пассажиров: {q.adults}"
-
-    header_lines = [head]
+    """Полный список по сайтам (каждая часть ≤ 4000 символов) и плоский список показанных билетов."""
+    header_lines = _trip_head(q)
     if baggage_mode != "any":
-        b_mode_str = "только с багажом" if baggage_mode == "with" else "только без багажа"
-        header_lines.append(
-            f"Багаж: {b_mode_str}, скрыто вариантов: {dropped} (варианты без данных о багаже показаны)"
-        )
-    header_lines.append("")
-
-    all_offers = sorted((o for r in results for o in r.offers), key=lambda o: (o.currency, o.price))
+        header_lines.append(_baggage_filter_line(baggage_mode, dropped))
+    all_offers = [o for r in results for o in r.offers]
     if all_offers:
         best = min(all_offers, key=lambda o: o.price)
         header_lines.append(
-            f"Дешевле всего: {offer_line(best, baggage_mode=baggage_mode)} (<i>{escape(best.site)}</i>)"
+            f"🏆 Дешевле всего: <b>{money(best.price, best.currency)}</b> · {escape(site_label(best.site))}"
         )
-        header_lines.append("")
+    header_lines.append("")
 
     chunks: list[str] = []
-    current_lines: list[str] = []
+    current: list[str] = list(header_lines)
     flat: list[Offer] = []
     counter = 1
 
+    def fits(extra: list[str]) -> bool:
+        return not current or len("\n".join(current + extra)) <= 4000
+
     def flush() -> None:
-        nonlocal current_lines
-        if current_lines:
-            text = "\n".join(current_lines).strip()
-            if text:
-                chunks.append(text)
-            current_lines = []
+        nonlocal current
+        text = "\n".join(current).strip()
+        if text:
+            chunks.append(text)
+        current = []
 
-    def would_fit(lines_to_add: list[str]) -> bool:
-        if not current_lines:
-            return True
-        return len("\n".join(current_lines + lines_to_add)) <= 4000
-
-    current_lines.extend(header_lines)
-
+    issues: list[str] = []
     for r in results:
-        if not r.ok:
-            block = [_error_line(r), ""]
-            if current_lines and not would_fit(block):
-                flush()
-            current_lines.extend(block)
+        if not r.ok or not r.offers:
+            issues.append(_site_issue(r))
             continue
 
-        if not r.offers:
-            block = [f"<b>{escape(r.site)}</b>: билетов не нашлось" + _link_suffix(r)]
-            if r.partial:
-                block.append(escape("неполная выдача: сайт ещё догружал варианты"))
-            if r.cached:
-                block.append(escape("из кэша, цены могли измениться"))
-            block.append("")
-            if current_lines and not would_fit(block):
-                flush()
-            current_lines.extend(block)
-            continue
-
-        site_header = [f"<b>{escape(r.site)}</b> ({r.elapsed:.0f} с)"]
+        notes: list[str] = []
         if r.partial:
-            site_header.append(escape("неполная выдача: сайт ещё догружал варианты"))
+            notes.append("неполная выдача: сайт ещё догружал варианты")
         if r.cached:
-            site_header.append(escape("из кэша, цены могли измениться"))
+            notes.append("из кэша, цены могли измениться")
+        site_head = [f"<b>{escape(site_label(r.site))}</b>  <i>{r.elapsed:.0f} с</i>"]
+        site_head += [f"<i>{escape(n)}</i>" for n in notes]
 
-        cont_header = [f"<b>{escape(r.site)}</b> (продолжение)"]
-
-        shown: set[str] = set()
-        site_offers: list[tuple[Offer, str]] = []
+        seen: set[tuple[str, ...]] = set()
+        blocks: list[tuple[Offer, list[str]]] = []
         for o in r.offers:
-            line = offer_line(o, baggage_mode=baggage_mode)
-            if line in shown:
+            body = offer_body(o, q, baggage_mode)
+            key = (str(o.price), _airline_label(o) or "", *body)
+            if key in seen:
                 continue
-            shown.add(line)
-            site_offers.append((o, line))
-            if len(shown) >= top_n:
+            seen.add(key)
+            row = f"<b>{{n}}.</b> {_price_html(o)}"
+            airline = _airline_label(o)
+            if airline:
+                row += f"  ·  {airline}"
+            blocks.append((o, [row] + [f"    {b}" for b in body]))
+            if len(blocks) >= top_n:
                 break
 
-        first_variant = [f"{counter}. {site_offers[0][1]}"] if site_offers else []
-        if current_lines and not would_fit(site_header + first_variant):
+        if not fits(site_head + blocks[0][1]):
             flush()
-
-        current_lines.extend(site_header)
-
-        for o, line in site_offers:
-            num_line = f"{counter}. {line}"
+        current.extend(site_head)
+        for o, block in blocks:
+            lines = [block[0].format(n=counter)] + block[1:]
+            if not fits(lines):
+                flush()
+                current.append(f"<b>{escape(site_label(r.site))}</b> (продолжение)")
+            current.extend(lines)
             flat.append(o)
             counter += 1
-            if not would_fit([num_line]):
-                flush()
-                current_lines.extend(cont_header)
-            current_lines.append(num_line)
-
-        url_lines = []
         if r.page_url:
-            url_lines.append(f'<a href="{escape(r.page_url, quote=True)}">открыть выдачу</a>')
-        url_lines.append("")
+            current.append(f'🔗 <a href="{escape(r.page_url, quote=True)}">открыть выдачу</a>')
+        current.append("")
 
-        if not would_fit(url_lines):
+    if issues:
+        block = issues + [""]
+        if not fits(block):
             flush()
-            current_lines.extend(cont_header)
-        current_lines.extend(url_lines)
+        current.extend(block)
 
-    footer_lines = _ozon_footer(q, results) + [
-        "<i>Цены сняты со страницы сейчас, при покупке могут измениться.</i>"]
+    footer = _ozon_footer(q, results) + [
+        "<i>Цены сняты сейчас, при покупке могут измениться.</i>",
+    ]
     if flat:
-        footer_lines.append("Напишите номер билета, чтобы увидеть подробности.")
-
-    if current_lines and not would_fit(footer_lines):
+        footer.append("💬 Напишите номер билета, чтобы увидеть подробности.")
+    if not fits(footer):
         flush()
-
-    current_lines.extend(footer_lines)
+    current.extend(footer)
     flush()
-
     return chunks, flat
 
 
@@ -343,15 +466,15 @@ def _format_datetime(
     if iso_str:
         try:
             dt = datetime.fromisoformat(iso_str)
-            return dt.strftime("%d.%m.%Y %H:%M")
+            return f"{date_ru(dt.date())}, {dt:%H:%M}"
         except (ValueError, TypeError):
             return escape(iso_str)
     if time_str and fallback_date:
-        return f"{fallback_date:%d.%m.%Y} {escape(time_str)}"
+        return f"{date_ru(fallback_date)}, {escape(time_str)}"
     if time_str:
         return escape(time_str)
     if is_departure and fallback_date:
-        return f"{fallback_date:%d.%m.%Y}"
+        return date_ru(fallback_date)
     return "не указано"
 
 
@@ -359,7 +482,7 @@ def _format_transfers(transfers: int | None, layovers: list[str] | None) -> str:
     if layovers:
         return ", ".join(escape(l) for l in layovers)
     if transfers is not None:
-        return "0 (прямой)" if transfers == 0 else str(transfers)
+        return "прямой" if transfers == 0 else str(transfers)
     return "не указано"
 
 
@@ -371,32 +494,24 @@ def _format_leg_details(
     *,
     is_back: bool = False,
 ) -> list[str]:
-    lines: list[str] = []
-    if is_back:
-        lines.append("<b>Обратно</b>")
-    orig_name = city_name(orig)
-    dest_name = city_name(dest)
-    lines.append(f"✈️ <b>{escape(orig_name)} → {escape(dest_name)}</b>")
-
-    dep_str = _format_datetime(leg.depart_at, leg.depart_time, leg_date, is_departure=True)
-    arr_str = _format_datetime(leg.arrive_at, leg.arrive_time, leg_date, is_departure=False)
-    lines.append(f"Вылет: {dep_str}")
-    lines.append(f"Прилёт: {arr_str}")
-
-    airline_str = escape(leg.airline) if leg.airline else "не указано"
-    lines.append(f"Авиакомпания: {airline_str}")
-
+    icon = "🛬" if is_back else "🛫"
+    word = "Обратно" if is_back else "Туда"
+    lines = [f"{icon} <b>{word}: {escape(city_name(orig))} → {escape(city_name(dest))}</b>"]
+    body = [
+        f"Вылет:  {_format_datetime(leg.depart_at, leg.depart_time, leg_date, is_departure=True)}",
+        f"Прилёт:  {_format_datetime(leg.arrive_at, leg.arrive_time, leg_date, is_departure=False)}",
+    ]
+    if leg.duration:
+        body.append(f"В пути:  {escape(leg.duration)}")
+    body.append(f"Пересадки:  {_format_transfers(leg.transfers, leg.layovers)}")
+    if leg.airline:
+        body.append(f"Авиакомпания:  {escape(leg.airline)}")
     if leg.flight_numbers:
-        fn_label = "Рейс" if len(leg.flight_numbers) == 1 else "Рейсы"
-        fn_val = ", ".join(escape(fn) for fn in leg.flight_numbers)
-        lines.append(f"{fn_label}: {fn_val}")
+        label = "Рейс" if len(leg.flight_numbers) == 1 else "Рейсы"
+        body.append(f"{label}:  {', '.join(escape(fn) for fn in leg.flight_numbers)}")
     if leg.aircraft:
-        lines.append(f"Самолёт: {escape(leg.aircraft)}")
-
-    dur_str = escape(leg.duration) if leg.duration else "не указано"
-    lines.append(f"Длительность: {dur_str}")
-
-    lines.append(f"Пересадки: {_format_transfers(leg.transfers, leg.layovers)}")
+        body.append(f"Самолёт:  {escape(leg.aircraft)}")
+    lines.append("<blockquote>" + "\n".join(body) + "</blockquote>")
     return lines
 
 
@@ -431,8 +546,7 @@ def build_compact_report(
     dropped_baggage: int = 0,
     dropped_criteria: int = 0,
 ) -> tuple[list[str], list[Offer], list[Offer]]:
-    """Формирует компактный отчёт с карточками (pick_cards), плоским списком (flat) и пулом билетов (pool)."""
-    # 1. pool = все билеты успешных сайтов (дедуп по offer_id), упорядоченный: pareto_front, затем остальные по цене
+    """Сводка с карточками (pick_cards), плоским списком (flat) и пулом билетов (pool)."""
     unique_offers: list[Offer] = []
     seen_ids: set[str] = set()
     for r in results:
@@ -452,113 +566,72 @@ def build_compact_report(
     others.sort(key=lambda o: (o.currency, o.price))
     pool = pareto + others
 
-    # 2. Карточки pick_cards (до 3 шт), flat = билеты карточек по порядку
     cards = pick_cards(pool, criteria)
     flat = [o for _, o in cards]
 
-    # 3. Шапка отчёта
-    orig_name = city_name(q.origin)
-    dest_name = city_name(q.destination)
-    route_head = f"✈️ <b>{escape(orig_name)} → {escape(dest_name)}</b>"
-    if q.return_date:
-        date_str = f"туда {q.depart:%d.%m.%Y}, обратно {q.return_date:%d.%m.%Y}"
-        head = (
-            f"{route_head}, "
-            f"{date_str}, пассажиров: {q.adults} (цена общая за оба плеча)"
-        )
-    else:
-        date_str = f"{q.depart:%d.%m.%Y}"
-        head = f"{route_head}, {date_str}, пассажиров: {q.adults}"
-
-    header_lines = [head]
-
-    crit_desc = criteria.describe()
+    header_lines = _trip_head(q)
     filter_parts: list[str] = []
+    crit_desc = criteria.describe()
     if crit_desc:
         filter_parts.append(", ".join(crit_desc))
     if dropped_criteria > 0:
         filter_parts.append(f"скрыто фильтрами: {dropped_criteria}")
     if filter_parts:
-        header_lines.append(f"Фильтры: {', '.join(filter_parts)}")
-
+        header_lines.append(f"⚙️ {', '.join(filter_parts)}")
     if baggage_mode != "any":
-        b_mode_str = "только с багажом" if baggage_mode == "with" else "только без багажа"
-        header_lines.append(
-            f"Багаж: {b_mode_str}, скрыто вариантов: {dropped_baggage} (варианты без данных о багаже показаны)"
-        )
-
+        header_lines.append(_baggage_filter_line(baggage_mode, dropped_baggage))
     header_lines.append("")
 
     card_blocks: list[list[str]] = []
     for counter, (title, o) in enumerate(cards, start=1):
-        card = [
-            f"{counter}. <b>{escape(title)}</b>",
-            offer_line(o, baggage_mode=baggage_mode),
-            f"<i>{escape(o.site)}</i>",
-        ]
-        layovers = _collect_layovers(o)
-        if layovers:
-            card.append(f"пересадка: {', '.join(escape(l) for l in layovers)}")
-        link = offer_link_html(o)
-        if link:
-            card.append(link)
+        card = offer_card(o, q, number=counter, title=title, baggage_mode=baggage_mode)
         card.append("")
         card_blocks.append(card)
 
-    error_lines: list[str] = []
-    for r in results:
-        if not r.ok:
-            error_lines.append(_error_line(r))
+    issue_lines = [_site_issue(r) for r in results if not r.ok]
 
     empty_lines: list[str] = []
     if not pool:
-        empty_lines.append("Билетов не нашлось")
+        empty_lines.append("😕 <b>Билетов не нашлось</b>")
         if not criteria.is_default():
             empty_lines.append("Попробуйте ослабить фильтры.")
         empty_lines.append("")
 
     footer_lines = _ozon_footer(q, results) + [
-        "<i>Цены сняты со страницы сейчас, при покупке могут измениться.</i>",
+        "<i>Цены сняты сейчас, при покупке могут измениться.</i>",
     ]
     if flat:
-        footer_lines.append("Напишите номер билета, чтобы увидеть подробности.")
+        footer_lines.append("💬 Напишите номер билета, чтобы увидеть подробности.")
 
     chunks: list[str] = []
     current_lines: list[str] = []
 
     def flush() -> None:
         nonlocal current_lines
-        if current_lines:
-            text = "\n".join(current_lines).strip()
-            if text:
-                chunks.append(text)
-            current_lines = []
+        text = "\n".join(current_lines).strip()
+        if text:
+            chunks.append(text)
+        current_lines = []
 
     def would_fit(lines_to_add: list[str]) -> bool:
-        if not current_lines:
-            return True
-        return len("\n".join(current_lines + lines_to_add)) <= 4000
+        return not current_lines or len("\n".join(current_lines + lines_to_add)) <= 4000
 
     current_lines.extend(header_lines)
-
     for card in card_blocks:
-        if current_lines and not would_fit(card):
+        if not would_fit(card):
             flush()
         current_lines.extend(card)
-
-    for err in error_lines:
-        if current_lines and not would_fit([err]):
+    for line in issue_lines:
+        if not would_fit([line]):
             flush()
-        current_lines.append(err)
-    if error_lines:
+        current_lines.append(line)
+    if issue_lines:
         current_lines.append("")
-
     if empty_lines:
-        if current_lines and not would_fit(empty_lines):
+        if not would_fit(empty_lines):
             flush()
         current_lines.extend(empty_lines)
-
-    if current_lines and not would_fit(footer_lines):
+    if not would_fit(footer_lines):
         flush()
     current_lines.extend(footer_lines)
     flush()
@@ -600,45 +673,31 @@ def build_more_report(
         return None, []
 
     new_offers = unshown[:n]
-    blocks: list[str] = []
-    for counter, o in enumerate(new_offers, start=start_number):
-        lines = [
-            f"{counter}. {offer_line(o)}",
-            f"<i>{escape(o.site)}</i>",
-        ]
-        layovers = _collect_layovers(o)
-        if layovers:
-            lines.append(f"пересадка: {', '.join(escape(l) for l in layovers)}")
-        link = offer_link_html(o)
-        if link:
-            lines.append(link)
-        blocks.append("\n".join(lines))
-
+    blocks = ["\n".join(offer_card(o, q, number=counter)) for counter, o in enumerate(new_offers, start=start_number)]
     return "\n\n".join(blocks), new_offers
 
 
 def format_details(o: Offer, q: Query) -> str:
-    """Формирует подробную карточку билета для отправки в чат."""
-    lines = _format_leg_details(o, q.origin, q.destination, q.depart, is_back=False)
-
-    if o.back is not None:
-        lines.append("")
-        back_date = q.return_date or q.depart
-        lines.extend(_format_leg_details(o.back, q.destination, q.origin, back_date, is_back=True))
-
-    lines.append("")
-    baggage_val = escape(o.baggage) if o.baggage else "не указано"
-    carry_on_val = escape(o.carry_on) if o.carry_on else "не указано"
-    lines.append(f"Багаж: {baggage_val}")
-    lines.append(f"Ручная кладь: {carry_on_val}")
-    lines.append(f"Цена: <b>{money(o.price, o.currency)}</b>")
+    """Подробная карточка билета для отправки в чат."""
+    lines = [f"🎫 <b>Билет · {money(o.price, o.currency)}</b>"]
     change = price_change_card(o)
     if change:
-        lines.append(change)
-    lines.append(f"Сайт: {escape(o.site)}")
+        lines.append(f"<i>{escape(change)}</i>")
+    lines.append("")
+    lines.extend(_format_leg_details(o, q.origin, q.destination, q.depart, is_back=False))
+    if o.back is not None:
+        lines.extend(
+            _format_leg_details(o.back, q.destination, q.origin, q.return_date or q.depart, is_back=True)
+        )
 
-    if o.url:
-        lines.append(f"Ссылка: {offer_link_html(o)}")
+    lines.append("")
+    lines.append(f"🧳 Багаж: {escape(o.baggage) if o.baggage else 'не указано'}")
+    lines.append(f"🎒 Ручная кладь: {escape(o.carry_on) if o.carry_on else 'не указано'}")
+    lines.append(f"🏷 Сайт: {escape(site_label(o.site))}")
+
+    link = offer_link_html(o)
+    if link:
+        lines.append(f"🔗 {link}")
         if not o.url_is_direct:
             criteria: list[str] = []
             has_time = bool(o.depart_time or o.depart_at or (o.back and (o.back.depart_time or o.back.depart_at)))
@@ -648,10 +707,9 @@ def format_details(o: Offer, q: Query) -> str:
             if has_fn:
                 criteria.append("номеру рейса")
             if criteria:
-                lines.append(f"Найдите рейс в выдаче по {' и '.join(criteria)}")
+                lines.append(f"<i>Найдите рейс в выдаче по {' и '.join(criteria)}</i>")
 
     if o.fetched_at is not None:
-        t_str = datetime.fromtimestamp(o.fetched_at).strftime("%H:%M")
-        lines.append(f"Цена снята: {t_str}")
+        lines.append(f"<i>Цена снята в {datetime.fromtimestamp(o.fetched_at):%H:%M}</i>")
 
     return "\n".join(lines).strip()

@@ -114,7 +114,7 @@ def test_format_details_roundtrip_single_link_and_caption():
     )
     card = format_details(o, q)
 
-    assert card.count("Ссылка:") == 1
+    assert card.count("открыть выдачу сайта") == 1
     assert "открыть выдачу сайта" in card
     assert "купить билет" not in card
     assert "Найдите рейс в выдаче по времени вылета и номеру рейса" in card

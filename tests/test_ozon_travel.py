@@ -1,4 +1,4 @@
-"""Тесты парсера Озон Тревел (Ozon Travel)."""
+"""Тесты парсера Ozon Travel (Ozon Travel)."""
 from datetime import date
 import json
 from pathlib import Path
@@ -28,7 +28,7 @@ def _q(return_date: date | None = None) -> Query:
 
 
 def make_snapshot(payloads: list[tuple[str, str]] | None = None, blocked: bool = False) -> Snapshot:
-    """Создаёт тестовый Snapshot с сетевыми ответами виджета Озон Тревел."""
+    """Создаёт тестовый Snapshot с сетевыми ответами виджета Ozon Travel."""
     if payloads is None:
         payloads = [(WIDGET_URL, WIDGET_JSON)]
     return Snapshot(

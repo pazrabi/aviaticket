@@ -30,10 +30,10 @@ def test_continuous_numbering_across_sites():
     parts, flat = build_report(q, res, top_n=5)
     report = "\n".join(parts)
 
-    assert "1. <b>10 000 ₽</b>" in report
-    assert "2. <b>11 000 ₽</b>" in report
-    assert "3. <b>12 000 ₽</b>" in report
-    assert "4. <b>13 000 ₽</b>" in report
+    assert "<b>1.</b> <b>10 000 ₽</b>" in report
+    assert "<b>2.</b> <b>11 000 ₽</b>" in report
+    assert "<b>3.</b> <b>12 000 ₽</b>" in report
+    assert "<b>4.</b> <b>13 000 ₽</b>" in report
     assert flat == [o1, o2, o3, o4]
     assert "Напишите номер билета, чтобы увидеть подробности" in report
 
@@ -71,7 +71,7 @@ def test_long_report_chunking_and_balanced_tags():
     # Проверяем непрерывность нумерации от 1 до 200
     full_text = "\n".join(parts)
     for i in range(1, 201):
-        assert f"{i}. " in full_text
+        assert f"<b>{i}.</b>" in full_text
 
     # Проверяем наличие заголовка продолжения
     assert "<b>big_site</b> (продолжение)" in full_text
@@ -105,19 +105,19 @@ def test_format_details_single_leg_and_script_escaping():
 
     # Проверка основных полей
     assert "Москва → Алматы" in card
-    assert "10.12.2026 10:00" in card
-    assert "10.12.2026 14:30" in card
+    assert "10 дек, 10:00" in card
+    assert "10 дек, 14:30" in card
     assert "Air &lt;script&gt;Astana&lt;/script&gt;" in card
-    assert "Рейс: KC &lt;script&gt;101&lt;/script&gt;" in card
-    assert "Самолёт: Airbus &lt;script&gt;A320&lt;/script&gt;" in card
-    assert "Длительность: 4 ч 30 мин" in card
-    assert "Пересадки: Астана, 2 ч &lt;script&gt;10 мин&lt;/script&gt;" in card
+    assert "Рейс:  KC &lt;script&gt;101&lt;/script&gt;" in card
+    assert "Самолёт:  Airbus &lt;script&gt;A320&lt;/script&gt;" in card
+    assert "В пути:  4 ч 30 мин" in card
+    assert "Пересадки:  Астана, 2 ч &lt;script&gt;10 мин&lt;/script&gt;" in card
     assert "Багаж: с багажом &lt;script&gt;23 кг&lt;/script&gt;" in card
     assert "Ручная кладь: 10 кг &lt;script&gt;ручная&lt;/script&gt;" in card
     assert "15 000 ₽" in card
     assert "Сайт: &lt;script&gt;site&lt;/script&gt;" in card
     assert 'href="https://avia.example.com/buy?id=123&amp;foo=&lt;script&gt;"' in card
-    assert "Цена снята: " in card
+    assert "Цена снята в " in card
 
 
 def test_format_details_two_legs():
@@ -147,12 +147,12 @@ def test_format_details_two_legs():
     card = format_details(o, q)
 
     assert "Москва → Алматы" in card
-    assert "<b>Обратно</b>" in card
+    assert "Обратно: Алматы → Москва" in card
     assert "Алматы → Москва" in card
-    assert "20.12.2026 18:00" in card
-    assert "20.12.2026 22:30" in card
-    assert "Рейс: KC 102" in card
-    assert "Самолёт: Boeing 737" in card
+    assert "20 дек, 18:00" in card
+    assert "20 дек, 22:30" in card
+    assert "Рейс:  KC 102" in card
+    assert "Самолёт:  Boeing 737" in card
     assert "32 000 ₽" in card
     assert "Сайт: tutu"
 
@@ -165,12 +165,12 @@ def test_header_baggage_mode_and_variant_notice():
 
     report_with = format_report(q, [SiteResult("site1", True, [o_with, o_unknown])], baggage_mode="with", dropped=2)
 
-    assert "Багаж: только с багажом, скрыто вариантов: 2 (варианты без данных о багаже показаны)" in report_with
+    assert "только с багажом · скрыто: 2" in report_with
     assert "багаж не указан" in report_with
 
     # В режиме any пометки в шапке и строке варианта нет
     report_any = format_report(q, [SiteResult("site1", True, [o_unknown])], baggage_mode="any")
-    assert "Багаж:" not in report_any
+    assert "скрыто:" not in report_any
     assert "багаж не указан" not in report_any
 
 
@@ -179,5 +179,5 @@ def test_header_return_date():
     q = Query("MOW", "ALA", date(2026, 12, 10), return_date=date(2026, 12, 20))
     report = format_report(q, [SiteResult("site1", True, [])])
 
-    assert "туда 10.12.2026, обратно 20.12.2026" in report
-    assert "цена общая за оба плеча" in report
+    assert "10 дек – 20 дек" in report
+    assert "цена за оба плеча" in report
