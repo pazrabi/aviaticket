@@ -502,7 +502,7 @@ _BADGE_WORDS = {
 def _is_cabin_luggage_line(s: str) -> bool:
     """Проверяет, содержит ли строка габариты ручной клади (например, '36×30×27 см')."""
     s_l = s.lower()
-    return "см" in s_l and bool(re.search(r"\d+\s*[x×*]\s*\d+", s_l))
+    return "см" in s_l and bool(re.search(r"\d+\s*[xх×*]\s*\d+", s_l))
 
 
 def _parse_text_duration(text: str) -> tuple[str | None, int]:
@@ -526,7 +526,7 @@ def _parse_transfers_text(text: str) -> tuple[int | None, list[str] | None]:
     t_lower = t_clean.lower()
     if t_lower in ("прямой", "без пересадок"):
         return 0, None
-    m_count = re.fullmatch(r"(\d+)\s+пересадк[иае]?", t_lower)
+    m_count = re.fullmatch(r"(\d+)\s+(?:пересадк[иае]?|пересадок)", t_lower)
     if m_count:
         return int(m_count.group(1)), None
     m_city = re.fullmatch(r"пересадка\s+в\s+(.+)", t_clean, re.IGNORECASE)
@@ -624,17 +624,18 @@ def _parse_yandex_travel_text(text: str | None, query: Query | None) -> list[Off
             cur -= 1
 
         airline = None
-        while cur >= 0:
+        while cur >= max(0, k - 5):
             val = lines[cur]
             val_l = val.lower()
             if val_l in _BADGE_WORDS or re.search(r"^\d+\s*вариант", val_l):
                 cur -= 1
                 continue
-            # Граница предыдущей карточки
+            # Граница предыдущей карточки или блока
             if (
-                _PRICE_RE.match(re.sub(r"\s+", "", val))
+                "₽" in val
+                or re.match(r"^от\s*\d+", val_l)
+                or _PRICE_RE.match(re.sub(r"\s+", "", val))
                 or _TIME_RE.match(val)
-                or _AIRPORT_RE.match(val)
                 or _is_cabin_luggage_line(val)
             ):
                 break
@@ -656,11 +657,12 @@ def _parse_yandex_travel_text(text: str | None, query: Query | None) -> list[Off
         dep_at = arr_at = None
         if base_date is not None:
             dep_at = f"{base_date.isoformat()}T{dep_time}"
-            days_offset = plus_days
-            if dur_minutes >= 24 * 60:
-                days_offset += dur_minutes // (24 * 60)
-            if arr_time < dep_time and plus_days == 0:
-                days_offset += 1
+            if plus_days:
+                days_offset = plus_days
+            else:
+                days_offset = dur_minutes // (24 * 60)
+                if arr_time < dep_time:
+                    days_offset += 1
             arr_at = f"{(base_date + timedelta(days=days_offset)).isoformat()}T{arr_time}"
 
         offer = Offer(

@@ -253,7 +253,88 @@ def test_transfers_variations():
     assert offers2[0].transfers == 1
     assert offers2[0].layovers == ["Казани"]
 
-    # 3. неизвестный формат пересадки -> пропускаем карточку
-    text3 = card_template.format(transfers="сложный составной маршрут через неизвестный пункт")
+    # 3. 5 пересадок (суффикс -ок)
+    text3 = card_template.format(transfers="5 пересадок")
     offers3 = _parse_yandex_travel_text(text3, _q_ow())
-    assert len(offers3) == 0
+    assert len(offers3) == 1
+    assert offers3[0].transfers == 5
+    assert offers3[0].layovers is None
+
+    # 4. неизвестный формат пересадки -> пропускаем карточку
+    text4 = card_template.format(transfers="сложный составной маршрут через неизвестный пункт")
+    offers4 = _parse_yandex_travel_text(text4, _q_ow())
+    assert len(offers4) == 0
+
+
+def test_arrival_date_offset_with_plus_days():
+    """Проверка смещения даты прилёта для рейсов длительностью более суток при наличии +N."""
+    card = (
+        "Emirates\n"
+        "10:00\n"
+        "25 ч 00 м\n"
+        "11:00 +1\n"
+        "DME\n"
+        "1 пересадка\n"
+        "LED\n"
+        "15 000 ₽\n"
+    )
+    offers = _parse_yandex_travel_text(card, _q_ow(date(2026, 12, 10)))
+    assert len(offers) == 1
+    assert offers[0].depart_at == "2026-12-10T10:00"
+    # Смещение должно быть ровно +1 день (11 декабря), а не +2 дня
+    assert offers[0].arrive_at == "2026-12-11T11:00"
+
+
+def test_cabin_luggage_cyrillic_x():
+    """Проверка распознавания габаритов ручной клади с кириллической 'х' (U+0445)."""
+    # Буква 'х' в габаритах — русская кириллическая
+    card = (
+        "Победа\n"
+        "36\u044530\u044527 см\n"
+        "08:30\n"
+        "1 ч 35 м\n"
+        "10:05\n"
+        "VKO\n"
+        "прямой\n"
+        "LED\n"
+        "3 894 ₽\n"
+    )
+    offers = _parse_yandex_travel_text(card, _q_ow())
+    assert len(offers) == 1
+    assert offers[0].airline == "Победа"
+    assert offers[0].carry_on == "ручная кладь есть"
+
+
+def test_three_letter_latin_airlines():
+    """Авиакомпании с 3-буквенными названиями (KLM, LOT, SAS, ANA) не отбрасываются как аэропорты."""
+    for airline in ("KLM", "LOT", "SAS", "ANA"):
+        card = (
+            f"{airline}\n"
+            "14:00\n"
+            "2 ч 00 м\n"
+            "16:00\n"
+            "SVO\n"
+            "прямой\n"
+            "LED\n"
+            "9 000 ₽\n"
+        )
+        offers = _parse_yandex_travel_text(card, _q_ow())
+        assert len(offers) == 1, f"Авиакомпания {airline} должна успешно разбираться"
+        assert offers[0].airline == airline
+
+
+def test_airline_bounded_search_and_block_boundaries():
+    """Поиск авиакомпании не захватывает строки цен и заголовок блоков при отсутствии авиакомпании."""
+    # Связка времени без названия авиакомпании, предшествует строка 'от 5 793 ₽'
+    invalid_card = (
+        "от 5 793 ₽\n"
+        "10:00\n"
+        "1 ч 45 м\n"
+        "11:45\n"
+        "DME\n"
+        "прямой\n"
+        "LED\n"
+        "3 663 ₽\n"
+    )
+    offers = _parse_yandex_travel_text(invalid_card, _q_ow())
+    assert len(offers) == 0
