@@ -849,3 +849,105 @@ class PriceHistory:
                 }
         return result
 
+    def collect_candidates(
+        self,
+        limit: int = 5,
+        today: date | datetime | str | None = None,
+        now: float | None = None,
+        recheck_seconds: float = 6 * 3600,
+        seen_days: int = 14,
+    ) -> list[Query]:
+        """Кандидаты для фонового сбора цен: популярные маршруты за seen_days с depart >= today."""
+        if limit <= 0 or seen_days <= 0:
+            return []
+
+        now_ts = time.time() if now is None else float(now)
+        since_ts = now_ts - float(seen_days) * 86400.0
+
+        if today is None:
+            today_date = datetime.fromtimestamp(now_ts).date() if now is not None else date.today()
+        else:
+            today_date = _normalize_date(today)
+            if today_date is None:
+                today_date = date.today()
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT origin, destination, depart, COALESCE(return_date, ''), adults, search_id, observed_at "
+                "FROM price_history "
+                "WHERE observed_at >= ? AND observed_at <= ?",
+                (since_ts, now_ts),
+            ).fetchall()
+
+        if not rows:
+            return []
+
+        routes: dict[tuple, dict] = {}
+        for orig, dest, dep, ret, adults, s_id, obs_at in rows:
+            dep_date = _normalize_date(dep)
+            if dep_date is None or dep_date < today_date:
+                continue
+
+            ret_date = _normalize_date(ret) if ret else None
+            key = (orig, dest, dep_date, ret_date, int(adults))
+            sample_key = str(s_id) if s_id else f"m_{round(obs_at / 60.0)}"
+
+            if key not in routes:
+                routes[key] = {
+                    "origin": orig,
+                    "destination": dest,
+                    "depart": dep_date,
+                    "return_date": ret_date,
+                    "adults": int(adults),
+                    "samples": {sample_key},
+                    "last_observed_at": float(obs_at),
+                }
+            else:
+                routes[key]["samples"].add(sample_key)
+                if float(obs_at) > routes[key]["last_observed_at"]:
+                    routes[key]["last_observed_at"] = float(obs_at)
+
+        candidates: list[dict] = []
+        for r in routes.values():
+            if (now_ts - r["last_observed_at"]) < float(recheck_seconds):
+                continue
+            candidates.append(r)
+
+        candidates.sort(
+            key=lambda c: (
+                -len(c["samples"]),
+                c["last_observed_at"],
+                c["origin"],
+                c["destination"],
+                c["depart"],
+                c["return_date"].isoformat() if c["return_date"] else "",
+                c["adults"],
+            )
+        )
+
+        return [
+            Query(
+                origin=c["origin"],
+                destination=c["destination"],
+                depart=c["depart"],
+                adults=c["adults"],
+                currency="RUB",
+                return_date=c["return_date"],
+            )
+            for c in candidates[:limit]
+        ]
+
+    def count_searches_since(self, ts: float) -> int:
+        """Число различных замеров (search_id или минута) в price_history с observed_at >= ts."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT search_id, observed_at FROM price_history WHERE observed_at >= ?",
+                (float(ts),),
+            ).fetchall()
+        samples: set[str] = set()
+        for s_id, obs_at in rows:
+            sample_key = str(s_id) if s_id else f"m_{round(obs_at / 60.0)}"
+            samples.add(sample_key)
+        return len(samples)
+
+

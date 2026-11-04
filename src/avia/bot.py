@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from . import advice, analytics, charts
+from .bg_collector import BackgroundCollector
 from .config import Settings, load_settings
 from .dialog import (
     HELP,
@@ -28,6 +29,7 @@ from .filters import apply_criteria
 from .formatting import build_compact_report, build_report, date_ru, format_details
 from .guard import friendly_error
 from .history import PriceHistory
+from .models import Query
 from .offers import assign_ids, filter_by_baggage
 from .parsing import city_name
 from .pipeline import search
@@ -56,7 +58,17 @@ class Bot:
         self.busy: set[int] = set()
         self.users = UserStore(settings.storage_dir / "users.sqlite")
         self._search_sem = asyncio.Semaphore(settings.max_parallel_searches)
+        self._active_searches: int = 0
         self.history = PriceHistory(settings.storage_dir / "history.sqlite")
+        self.bg_collector: BackgroundCollector | None = None
+        if self.s.bg_collect:
+            self.bg_collector = BackgroundCollector(
+                history=self.history,
+                search_fn=self._bg_search,
+                is_idle=self._is_idle,
+                settings=self.s,
+            )
+        self._bg_task: asyncio.Task | None = None
         self._hist_times: dict[int, float] = {}
         if dialog is not None:
             self.dialog = dialog
@@ -288,8 +300,12 @@ class Bot:
             if isinstance(wait_msg, dict):
                 wait_msg_id = wait_msg.get("message_id")
 
-            async with self._search_sem:
-                results = await search(q, self.s)
+            self._active_searches += 1
+            try:
+                async with self._search_sem:
+                    results = await search(q, self.s)
+            finally:
+                self._active_searches -= 1
             results = assign_ids(results)
             try:
                 await asyncio.to_thread(self.history.annotate, q, results)
@@ -473,6 +489,18 @@ class Bot:
             except Exception:
                 log.exception("stats: coverage failed")
 
+            # 5. Фоновый сбор цен
+            try:
+                lines.append("")
+                if self.s.bg_collect:
+                    n = self.bg_collector.done_today if self.bg_collector is not None else 0
+                    m = self.s.bg_collect_max_per_day
+                    lines.append(f"Фоновый сбор: сегодня {n} из {m}")
+                else:
+                    lines.append("Фоновый сбор: выключен")
+            except Exception:
+                log.exception("stats: bg_collect failed")
+
             await self.send(chat_id, "\n".join(lines))
             return
         arg = arg.strip()
@@ -531,10 +559,21 @@ class Bot:
                 except Exception:
                     pass
 
-    async def _scheduler_search(self, q):
-        # телефоны общие: фоновый опрос стоит в той же очереди, что и поиски людей
+    def _is_idle(self) -> bool:
+        return not self.busy and self._active_searches == 0
+
+    async def _bg_search(self, q: Query):
         async with self._search_sem:
             return await search(q, self.s)
+
+    async def _scheduler_search(self, q):
+        # телефоны общие: фоновый опрос стоит в той же очереди, что и поиски людей
+        self._active_searches += 1
+        try:
+            async with self._search_sem:
+                return await search(q, self.s)
+        finally:
+            self._active_searches -= 1
 
     async def _scheduler_notify(self, chat_id: int, text: str, reply_markup: dict | None) -> None:
         await self.send(chat_id, text, reply_markup=reply_markup)
@@ -567,6 +606,15 @@ class Bot:
                 history=self.history,
             )
             self._scheduler_task = asyncio.create_task(scheduler.run_forever())
+        if self.s.bg_collect:
+            if self.bg_collector is None:
+                self.bg_collector = BackgroundCollector(
+                    history=self.history,
+                    search_fn=self._bg_search,
+                    is_idle=self._is_idle,
+                    settings=self.s,
+                )
+            self._bg_task = asyncio.create_task(self.bg_collector.run_forever())
         while True:
             try:
                 updates = await self.call(
