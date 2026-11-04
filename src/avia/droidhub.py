@@ -257,7 +257,7 @@ def candidates(
         listed = [d.strip() for d in devs if d and d.strip()]
         usable_listed = [d for d in listed if is_usable_phone(d)]
         if phone_extend:
-            others = get_other_usable_phones(set(usable_listed))
+            others = get_other_usable_phones(set(listed))
             return usable_listed + others
         return usable_listed
 
@@ -271,7 +271,7 @@ def candidates(
 
         usable_listed = [p for p in clean_site if is_usable_phone(p)]
         if phone_extend:
-            others = get_other_usable_phones(set(usable_listed))
+            others = get_other_usable_phones(set(clean_site))
             clean = usable_listed + others
         else:
             clean = usable_listed

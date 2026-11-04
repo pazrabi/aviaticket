@@ -726,7 +726,7 @@ class Bot:
             # Callback-запросы раздела Телефоны: adm:ph или adm:ph:hold:<id> или adm:ph:on:<id>
             if len(parts) >= 4:
                 action = parts[2]
-                phone_id = parts[3]
+                phone_id = ":".join(parts[3:])
                 if action == "hold":
                     await asyncio.to_thread(self.phones.set_status, phone_id, "hold")
                     if cq_id:

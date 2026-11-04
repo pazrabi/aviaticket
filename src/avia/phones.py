@@ -148,9 +148,9 @@ class PhoneRegistry:
 
     def _save_locked(self) -> None:
         """Сохраняет self._phones в phones.json через временный файл."""
+        tmp_path = self.storage_dir / f"phones.{uuid.uuid4().hex}.tmp"
         try:
             self.storage_dir.mkdir(parents=True, exist_ok=True)
-            tmp_path = self.storage_dir / f"phones.{uuid.uuid4().hex}.tmp"
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self._phones, f, ensure_ascii=False, indent=2)
                 f.flush()
@@ -158,6 +158,10 @@ class PhoneRegistry:
             os.replace(tmp_path, self.path)
         except Exception as e:
             logger.warning("Ошибка сохранения phones.json: %s", e)
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def refresh(self, devices: list[dict[str, Any]]) -> list[NewDevice]:
         """Обновляет состояние устройств и регистрирует новые.
@@ -170,9 +174,7 @@ class PhoneRegistry:
         new_devices: list[NewDevice] = []
 
         with self._lock:
-            is_first = self._is_first_refresh
-            if self._is_first_refresh:
-                self._is_first_refresh = False
+            is_first = self._is_first_refresh and len(self._phones) == 0
 
             changed = False
             for dev in devices:
@@ -217,6 +219,9 @@ class PhoneRegistry:
                     if entry.get("name") != name:
                         entry["name"] = name
                         changed = True
+
+            if changed and self._is_first_refresh:
+                self._is_first_refresh = False
 
             if changed:
                 self._save_locked()

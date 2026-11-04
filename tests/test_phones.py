@@ -463,3 +463,88 @@ async def test_admin_panel_phones_section_and_callbacks(tmp_path):
     }
     await fb.bot.handle_callback(cq_on)
     assert fb.bot.phones.get("d1")["status"] == "active"
+
+    # Телефон с сетевым adb id (ip:port с двоеточием)
+    fb.bot.phones.register("192.168.1.100:5555", name="Net Phone", status="active")
+    cq_hold_net = {
+        "id": "cq4",
+        "from": {"id": 100},
+        "message": {"chat": {"id": 100}, "message_id": 50},
+        "data": "adm:ph:hold:192.168.1.100:5555",
+    }
+    await fb.bot.handle_callback(cq_hold_net)
+    assert fb.bot.phones.get("192.168.1.100:5555")["status"] == "hold"
+
+    cq_on_net = {
+        "id": "cq5",
+        "from": {"id": 100},
+        "message": {"chat": {"id": 100}, "message_id": 50},
+        "data": "adm:ph:on:192.168.1.100:5555",
+    }
+    await fb.bot.handle_callback(cq_on_net)
+    assert fb.bot.phones.get("192.168.1.100:5555")["status"] == "active"
+
+
+def test_refresh_empty_first_response_does_not_break_silence(tmp_path):
+    """Пустой первый ответ хаба не должен снимать флаг первого молчаливого добавления."""
+    reg = PhoneRegistry(tmp_path / "phones.json")
+    # 1. Первый refresh возвращает пустой список устройств (хаб пуст / не инициализирован)
+    assert reg.refresh([]) == []
+    assert len(reg) == 0
+
+    # 2. Второй refresh возвращает первые устройства - они должны зарегистрироваться молча
+    devs = [
+        {"id": "p1", "name": "Phone One", "online": True},
+        {"id": "p2", "name": "Phone Two", "online": True},
+    ]
+    assert reg.refresh(devs) == []
+    assert len(reg) == 2
+
+    # 3. Третий refresh добавляет новое устройство p3 - вот оно уже возвращается как NewDevice
+    devs3 = devs + [{"id": "p3", "name": "Phone Three", "online": True}]
+    new3 = reg.refresh(devs3)
+    assert len(new3) == 1
+    assert new3[0].id == "p3"
+
+
+def test_candidates_unusable_listed_phone_not_in_others(tmp_path):
+    """Телефон, указанный в site.phone, но непригодный (hold/offline), не попадает в запасные (others)."""
+    reg = PhoneRegistry(tmp_path / "phones.json")
+    reg.register("redmi", name="Redmi", status="active", first_seen=10.0)
+    reg.register("realme", name="Realme", status="hold", first_seen=20.0)  # в site.phone, но hold
+    reg.register("pixel", name="Pixel", status="active", first_seen=30.0)   # запасной из реестра
+
+    site = SiteConfig(name="as", url_template="https://test", phone="redmi,realme")
+    settings = Settings(sites=[site], storage_dir=tmp_path, phones=reg)
+
+    cands = candidates(settings, site)
+    # realme не должен появиться в конце как запасной
+    assert list(cands) == ["redmi", "pixel"]
+
+    # Аналогично для auto
+    site_auto = SiteConfig(name="as_auto", url_template="https://test", phone="auto")
+    settings_auto = Settings(
+        sites=[site_auto],
+        storage_dir=tmp_path,
+        phones=reg,
+        droidhub_devices=["redmi", "realme"],
+    )
+    cands_auto = candidates(settings_auto, site_auto)
+    assert list(cands_auto) == ["redmi", "pixel"]
+
+
+def test_save_locked_cleans_up_tmp_file_on_error(tmp_path, monkeypatch):
+    """При ошибке записи временный файл .tmp удаляется и не остаётся на диске."""
+    reg = PhoneRegistry(tmp_path / "phones.json")
+    reg.register("p1", name="Phone 1")
+
+    # Имитируем ошибку при json.dump
+    def mock_dump(*args, **kwargs):
+        raise OSError("Disk full simulation")
+
+    monkeypatch.setattr(json, "dump", mock_dump)
+    reg._save_locked()
+
+    # Проверяем, что временных файлов .tmp в директории нет
+    tmp_files = list(tmp_path.glob("phones.*.tmp"))
+    assert tmp_files == []
