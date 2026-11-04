@@ -220,6 +220,32 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
         lines.append("Данных пока нет: метрики копятся с момента включения")
         return "\n".join(lines)
 
+    statuses = ctx.get("parser_statuses")
+    if statuses is None and summary:
+        statuses = {}
+        for s_name, item in summary.items():
+            if s_name != "_total":
+                runs = item.get("runs", 0)
+                ok = item.get("ok", 0)
+                part = item.get("partial", 0)
+                if runs >= 8:
+                    ok_pct = (ok / runs) * 100.0
+                    part_pct = (part / runs) * 100.0
+                    if ok_pct < 60.0:
+                        st = "сломан"
+                    elif part_pct > 60.0:
+                        st = "деградирует"
+                    else:
+                        st = "ок"
+                else:
+                    st = "мало данных"
+                statuses[s_name] = st
+
+    if statuses:
+        status_parts = [f"{escape(s)}: {escape(st)}" for s, st in sorted(statuses.items())]
+        lines.append(f"Статус: {' · '.join(status_parts)}")
+        lines.append("")
+
     def _fmt_site(name: str, item: dict[str, Any]) -> str:
         runs = item.get("runs", 0)
         ok = item.get("ok", 0)

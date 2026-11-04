@@ -81,6 +81,12 @@ class Settings:
     forecast_enabled: bool = True
     forecast_retrain_days: int = 7
     forecast_dir: Path | None = None
+    parser_watch_enabled: bool = True
+    parser_watch_hours: int = 6
+    parser_watch_min_runs: int = 8
+    parser_watch_min_ok_pct: int = 60
+    parser_watch_max_incomplete_pct: int = 60
+    parser_watch_cooldown_hours: int = 6
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -157,4 +163,10 @@ def load_settings(path: Path | None = None) -> Settings:
         forecast_enabled=os.getenv("FORECAST_ENABLED", "1") != "0",
         forecast_retrain_days=int(os.getenv("FORECAST_RETRAIN_DAYS", "7")),
         forecast_dir=Path(os.environ["FORECAST_DIR"]) if os.getenv("FORECAST_DIR") else None,
+        parser_watch_enabled=os.getenv("PARSER_WATCH_ENABLED", "1") not in ("0", "false", "False", "no"),
+        parser_watch_hours=int(os.getenv("PARSER_WATCH_HOURS", "6")),
+        parser_watch_min_runs=int(os.getenv("PARSER_WATCH_MIN_RUNS", "8")),
+        parser_watch_min_ok_pct=int(os.getenv("PARSER_WATCH_MIN_OK_PCT", "60")),
+        parser_watch_max_incomplete_pct=int(os.getenv("PARSER_WATCH_MAX_INCOMPLETE_PCT", "60")),
+        parser_watch_cooldown_hours=int(os.getenv("PARSER_WATCH_COOLDOWN_HOURS", "6")),
     )

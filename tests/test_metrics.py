@@ -262,3 +262,41 @@ def test_metrics_summary_by_device_and_by_site_device(tmp_path):
     assert by_site_dev[("tutu", "realme")]["runs"] == 2
     assert ("yandex", "redmi") in by_site_dev
     assert by_site_dev[("yandex", "redmi")]["runs"] == 1
+
+
+def test_watch_stats_and_parser_watch_state(tmp_path):
+    """watch_stats агрегирует запуски, а get_watch_state / set_watch_state сохраняют состояние."""
+    store = MetricsStore(tmp_path / "metrics.sqlite")
+    t0 = 500.0
+
+    store.record_run("user", "siteA", ok=True, partial=False, captcha=False, error=None, offers=2, elapsed=1.0, ts=t0 + 10)
+    store.record_run("user", "siteA", ok=False, partial=True, captcha=False, error="err", offers=0, elapsed=1.0, ts=t0 + 20)
+    store.record_run("user", "siteB", ok=True, partial=True, captcha=False, error=None, offers=1, elapsed=1.0, ts=t0 + 30)
+
+    stats = store.watch_stats(since_ts=t0)
+    assert stats["siteA"]["runs"] == 2
+    assert stats["siteA"]["ok"] == 1
+    assert stats["siteA"]["partial"] == 1
+
+    assert stats["siteB"]["runs"] == 1
+    assert stats["siteB"]["ok"] == 1
+    assert stats["siteB"]["partial"] == 1
+
+    # Проверка состояния parser_watch_state
+    assert store.get_watch_state("siteA") is None
+
+    store.set_watch_state("siteA", last_status="сломан", last_alert_ts=t0 + 50, last_alert_status="сломан")
+    st = store.get_watch_state("siteA")
+    assert st is not None
+    assert st["site"] == "siteA"
+    assert st["last_status"] == "сломан"
+    assert st["last_alert_ts"] == t0 + 50
+    assert st["last_alert_status"] == "сломан"
+
+    # Обновление состояния (upsert)
+    store.set_watch_state("siteA", last_status="ок", last_alert_ts=t0 + 100, last_alert_status="ок")
+    st2 = store.get_watch_state("siteA")
+    assert st2["last_status"] == "ок"
+    assert st2["last_alert_ts"] == t0 + 100
+    assert st2["last_alert_status"] == "ок"
+
