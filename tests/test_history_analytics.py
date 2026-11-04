@@ -1066,3 +1066,31 @@ def test_count_searches_since(tmp_path):
     assert h.count_searches_since(0) == 4
 
 
+
+
+def test_prev_price_compares_same_baggage_tariff_only(tmp_path):
+    """Тот же рейс в тарифах «с багажом» и «без» не сравнивается между собой (ложное «↓152 820 ₽»)."""
+    from datetime import date
+
+    from avia.history import PriceHistory
+    from avia.models import Offer, Query, SiteResult
+
+    h = PriceHistory(tmp_path / "h.sqlite")
+    q = Query("KUF", "EVN", date(2030, 12, 16), 1, "RUB", date(2030, 12, 20))
+
+    def offer(price, baggage):
+        o = Offer(site="kupibilet", price=price, airline="FlyOne", depart_time="10:15", arrive_time="13:30",
+                  transfers=0, baggage=baggage)
+        o.offer_id = "same_flights"
+        return o
+
+    # прошлый поиск: тариф с багажом дорогой
+    h.annotate(q, [SiteResult("kupibilet", True, [offer(192086, "с багажом")])], now=1_000_000)
+    # новый поиск: тариф без багажа дешёвый — прошлой цены у него нет, стрелки быть не должно
+    cheap = offer(39266, "без багажа")
+    h.annotate(q, [SiteResult("kupibilet", True, [cheap])], now=1_003_600)
+    assert cheap.prev_price is None
+    # а тот же тариф с багажом сравнивается с собой
+    rich = offer(190000, "с багажом")
+    h.annotate(q, [SiteResult("kupibilet", True, [rich])], now=1_007_200)
+    assert rich.prev_price == 192086

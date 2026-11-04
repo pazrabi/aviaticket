@@ -176,14 +176,19 @@ class PriceHistory:
 
         with self._connect() as db:
             for o in offers:
+                # один и тот же рейс может идти в разных тарифах (с багажом и без):
+                # предыдущую цену ищем только среди записей с тем же состоянием багажа
+                b_state = baggage_state(o)
+                baggage = "with" if b_state is True else ("without" if b_state is False else None)
                 last = db.execute(
                     "SELECT price, observed_at FROM price_history "
-                    "WHERE offer_id = ? AND currency = ? ORDER BY observed_at DESC, id DESC LIMIT 1",
-                    (o.offer_id, o.currency),
+                    "WHERE offer_id = ? AND currency = ? AND baggage IS ? "
+                    "ORDER BY observed_at DESC, id DESC LIMIT 1",
+                    (o.offer_id, o.currency, baggage),
                 ).fetchone()
                 low = db.execute(
-                    "SELECT MIN(price) FROM price_history WHERE offer_id = ? AND currency = ?",
-                    (o.offer_id, o.currency),
+                    "SELECT MIN(price) FROM price_history WHERE offer_id = ? AND currency = ? AND baggage IS ?",
+                    (o.offer_id, o.currency, baggage),
                 ).fetchone()
                 if last is not None:
                     o.prev_price, o.prev_at = int(last[0]), float(last[1])
@@ -192,8 +197,6 @@ class PriceHistory:
                 if fresh_same:
                     continue
 
-                b_state = baggage_state(o)
-                baggage = "with" if b_state is True else ("without" if b_state is False else None)
                 airline = o.airline
                 if isinstance(o.flight_numbers, list):
                     flight_numbers = ",".join(str(fn) for fn in o.flight_numbers) if o.flight_numbers else None
