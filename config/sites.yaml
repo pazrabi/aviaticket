@@ -24,7 +24,7 @@ sites:
     source: browser
     parser: aviasales
     enabled: true
-    phone: auto
+    phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu, Яндекса и OneTwoTrip
     phone_capture_json: ["/search/v3.2/results"]
     phone_wait_seconds: 45
     phone_wait_for: '"last_update_timestamp":0'
@@ -39,7 +39,7 @@ sites:
     source: browser
     parser: kupibilet
     enabled: true
-    phone: auto
+    phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu, Яндекса и OneTwoTrip
     phone_wait_seconds: 30
     phone_capture_json: ["/frontend_search"]
     url_template: "https://www.kupibilet.ru/search?route%5B0%5D=iatax%3A{origin}_{date_iso}_date_{date_iso}_iatax%3A{destination}&adult={adults}&child=0&infant=0&childrenAges=%5B%5D&cabinClass=Y&v=2&filter=%7B%22transportKind%22%3A%7B%22Airplane%22%3Atrue%2C%22Train%22%3Afalse%7D%7D"
@@ -101,7 +101,7 @@ sites:
     source: browser
     parser: ozon_travel
     enabled: true
-    phone: auto
+    phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu, Яндекса и OneTwoTrip
     phone_wait_seconds: 30
     phone_capture_json: ["aviaSearchResult"]
     url_template: "https://www.ozon.ru/travel/flight/search?Children=0&Dlts={adults}&Infants=0&ServiceClass=ECONOMY&dates=d{date_iso}&route={origin}{destination}"
