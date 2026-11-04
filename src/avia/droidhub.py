@@ -12,7 +12,8 @@ from typing import Any, Callable
 import httpx
 
 from .collector import Snapshot
-from .config import Settings, SiteConfig
+from .config import Settings
+from .sites import SiteConfig
 
 logger = logging.getLogger(__name__)
 
