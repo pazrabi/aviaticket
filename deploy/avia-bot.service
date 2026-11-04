@@ -1,0 +1,24 @@
+[Unit]
+Description=avia-bot (Telegram-бот цен авиабилетов)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=avia
+Group=avia
+WorkingDirectory=/home/avia/avia-bot
+ExecStart=/home/avia/avia-bot/.venv/bin/python -m avia.bot
+Restart=always
+RestartSec=5
+# аккуратная остановка: бот дожидается текущих поисков не дольше 30 секунд
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/avia/avia-bot
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
