@@ -21,7 +21,7 @@ from .guard import SearchGuard, friendly_error
 from .models import Offer, Query, SiteResult
 from .parsers import PARSERS
 from .parsers.travelpayouts import fetch_travelpayouts, search_url
-from .sites import build_url, SiteConfig
+from .sites import build_url
 from .tutu_ids import resolve_city
 from .yandex_ids import city_id
 

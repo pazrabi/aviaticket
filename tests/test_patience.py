@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from avia.collector import Snapshot
-from avia.config import Settings, load_settings
+from avia.config import Settings, SiteConfig, load_settings
 from avia.droidhub import (
     PreferenceList,
     _busy_devices,
@@ -18,12 +18,12 @@ from avia.droidhub import (
     acquire,
     advance_time,
     candidates,
+    fetch_page_snapshot,
     release,
     set_clock,
 )
 from avia.models import Query, SiteResult
 from avia.pipeline import _from_browser, _run_site
-from avia.sites import SiteConfig
 
 
 class FakeClock:
@@ -359,3 +359,119 @@ async def test_real_loop_timer_patience():
 
     await release(d_hold)
     await release("redmi")
+
+
+# ---------------------------------------------------------------------------
+# 9. Дополнительные тесты: допуск времени, перезавод таймера, PreferenceList в fetch
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_patience_float_tolerance_and_timer_rearm():
+    """Если таймер сработал с микросекундной погрешностью (< 1e-4), дедлайн считается наступившим."""
+    clock = FakeClock(100.0)
+    set_clock(clock)
+
+    # Занимаем предпочтительный realme
+    d_hold = await acquire(["realme"])
+
+    # Запрос с терпением 5 секунд
+    pref = PreferenceList(["realme", "redmi"], patience=5.0)
+    task = asyncio.create_task(acquire(pref))
+    await asyncio.sleep(0.001)
+
+    assert len(_waiters) == 1
+    w = _waiters[0]
+    assert w.timer_handle is not None
+
+    # Имитируем раннее срабатывание таймера на 4.99995 секунды (разница 5e-5 < 1e-4)
+    # По логике допуска дедлайн уже считается наступившим, и берётся запасной
+    advance_time(5.0 - 5e-5)
+    _dispatch()
+    await asyncio.sleep(0.001)
+
+    assert task.done()
+    assert task.result() == "redmi"
+
+    await release(d_hold)
+    await release("redmi")
+
+
+@pytest.mark.asyncio
+async def test_patience_timer_rearm_if_early():
+    """Если таймер терпения был сброшен раньше времени (now < deadline), _dispatch перезаводит его."""
+    clock = FakeClock(100.0)
+    set_clock(clock)
+
+    d_hold = await acquire(["realme"])
+    pref = PreferenceList(["realme", "redmi"], patience=5.0)
+    task = asyncio.create_task(acquire(pref))
+    await asyncio.sleep(0.001)
+
+    w = _waiters[0]
+    # Имитируем сброс таймера на 3-й секунде
+    advance_time(3.0)
+    if w.timer_handle:
+        w.timer_handle.cancel()
+    w.timer_handle = None
+
+    _dispatch()
+    # Таймер должен быть гарантированно перезаведён
+    assert w.timer_handle is not None
+    assert not task.done()
+
+    # Продвигаем время ещё на 2 секунды (истечение дедлайна)
+    advance_time(2.0)
+    await asyncio.sleep(0.001)
+    assert task.done()
+    assert task.result() == "redmi"
+
+    await release(d_hold)
+    await release("redmi")
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_snapshot_preserves_preferencelist(monkeypatch):
+    """fetch_page_snapshot сохраняет объект PreferenceList и его атрибуты prefer_order и patience."""
+    captured = {}
+
+    async def fake_any(settings, devs, url, **kwargs):
+        captured["devs"] = devs
+        captured["kwargs"] = kwargs
+        return Snapshot(url=url, text="ok", json_payloads=[]), True
+
+    monkeypatch.setattr("avia.droidhub.fetch_page_snapshot_any", fake_any)
+
+    settings = Settings(sites=[])
+    pref = PreferenceList(["realme", "redmi"], patience=7.5)
+
+    snap, fin = await fetch_page_snapshot(settings, pref, "https://example.com")
+    assert snap.text == "ok"
+    assert fin is True
+
+    # Проверяем, что devs сохранил тип PreferenceList
+    assert isinstance(captured["devs"], PreferenceList)
+    assert captured["devs"].prefer_order is True
+    assert captured["devs"].patience == 7.5
+    # И kwargs тоже содержат prefer_order и patience
+    assert captured["kwargs"]["prefer_order"] is True
+    assert captured["kwargs"]["patience"] == 7.5
+
+
+def test_site_config_from_avia_config():
+    """Проверка создания и валидации SiteConfig напрямую через импорт из avia.config."""
+    from avia.config import SiteConfig as CfgSiteConfig
+
+    s = CfgSiteConfig(
+        name="test",
+        url_template="https://test.com",
+        phone_patience_seconds=12,
+        phone_full_wait_seconds=50,
+        phone_full_wait_for='"done":true',
+    )
+    assert s.phone_patience_seconds == 12
+    assert s.phone_full_wait_seconds == 50
+    assert s.phone_full_wait_for == '"done":true'
+
+    with pytest.raises(ValueError, match="phone_patience_seconds must be >= 0"):
+        CfgSiteConfig(name="test", url_template="https://test.com", phone_patience_seconds=-5)

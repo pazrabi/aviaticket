@@ -11,7 +11,6 @@ from typing import Any, Callable
 
 import httpx
 
-from . import sites
 from .collector import Snapshot
 from .config import Settings, SiteConfig
 
@@ -241,9 +240,20 @@ def _dispatch() -> None:
             continue
 
         # Если действует терпение (предпочтительный порядок, терпение > 0, есть запасные,
-        # и дедлайн ещё не наступил), пробуем ТОЛЬКО предпочтительный (первый) телефон
-        if waiter.prefer_order and waiter.patience > 0 and len(waiter.candidates) > 1 and now < waiter.deadline:
+        # и дедлайн ещё не наступил с допуском 1e-4), пробуем ТОЛЬКО предпочтительный телефон
+        is_patience_active = (
+            waiter.prefer_order
+            and waiter.patience > 0
+            and len(waiter.candidates) > 1
+            and (waiter.deadline - now > 1e-4)
+        )
+        if is_patience_active:
             cand = waiter.candidates[:1]
+            if waiter.timer_handle is None:
+                loop = asyncio.get_running_loop()
+                waiter.timer_handle = loop.call_later(
+                    max(0.0, waiter.deadline - now), _on_patience_timeout, waiter
+                )
         else:
             cand = waiter.candidates
 
@@ -586,7 +596,7 @@ async def fetch_page_snapshot_any(
 
 async def fetch_page_snapshot(
     settings: Settings,
-    device_id: str | list[str],
+    device_id: str | list[str] | PreferenceList,
     url: str,
     *,
     wait_seconds: int = 40,
@@ -604,12 +614,24 @@ async def fetch_page_snapshot(
     """Открывает страницу на телефоне через droidhub и возвращает (Snapshot, finished).
 
     Сохраняет совместимость с прежней сигнатурой (device_id: str) и поддерживает
-    передачу списка кандидатов (device_id: list[str]).
+    передачу списка кандидатов (device_id: list[str] или PreferenceList).
     """
+    if prefer_order is None:
+        prefer_order = getattr(device_id, "prefer_order", None)
+
+    if patience is None:
+        if patience_seconds is not None:
+            patience = patience_seconds
+        elif phone_patience_seconds is not None:
+            patience = phone_patience_seconds
+        else:
+            patience = getattr(device_id, "patience", None)
+
     if isinstance(device_id, (list, tuple)):
+        devs = device_id if isinstance(device_id, list) else list(device_id)
         return await fetch_page_snapshot_any(
             settings,
-            list(device_id),
+            devs,
             url,
             wait_seconds=wait_seconds,
             capture_json=capture_json,
@@ -620,8 +642,6 @@ async def fetch_page_snapshot(
             stats=stats,
             prefer_order=prefer_order,
             patience=patience,
-            patience_seconds=patience_seconds,
-            phone_patience_seconds=phone_patience_seconds,
         )
     return await fetch_page_snapshot_any(
         settings,
@@ -636,6 +656,4 @@ async def fetch_page_snapshot(
         stats=stats,
         prefer_order=prefer_order,
         patience=patience,
-        patience_seconds=patience_seconds,
-        phone_patience_seconds=phone_patience_seconds,
     )
