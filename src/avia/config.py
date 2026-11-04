@@ -68,6 +68,15 @@ class Settings:
     bg_collect_interval_minutes: int = 20  # интервал между фоновыми поисками (мин)
     bg_collect_max_per_day: int = 48       # максимум фоновых поисков в сутки
     bg_collect_recheck_hours: int = 6      # минимальная пауза повтора маршрута (ч)
+    backup_dir: Path | None = None
+    backup_keep: int = 14
+    backup_hour: int = 4
+
+    def __post_init__(self) -> None:
+        if self.backup_dir is None:
+            self.backup_dir = self.storage_dir / "backups"
+        else:
+            self.backup_dir = Path(self.backup_dir)
 
 
 def load_settings(path: Path | None = None) -> Settings:
@@ -113,4 +122,7 @@ def load_settings(path: Path | None = None) -> Settings:
         bg_collect_interval_minutes=int(os.getenv("BG_COLLECT_INTERVAL_MIN", "20")),
         bg_collect_max_per_day=int(os.getenv("BG_COLLECT_MAX_PER_DAY", "48")),
         bg_collect_recheck_hours=int(os.getenv("BG_COLLECT_RECHECK_HOURS", "6")),
+        backup_dir=Path(os.environ["BACKUP_DIR"]) if os.getenv("BACKUP_DIR") else None,
+        backup_keep=int(os.getenv("BACKUP_KEEP", "14")),
+        backup_hour=int(os.getenv("BACKUP_HOUR", "4")),
     )
