@@ -286,6 +286,33 @@ def test_rebuild_route_daily_legacy_records_grouped_by_minute(tmp_path):
         assert row[2] == pytest.approx(10750.0)
 
 
+def test_rebuild_route_daily_default_yesterday_and_today(tmp_path):
+    """rebuild_route_daily() без аргументов пересчитывает сводки за вчера и сегодня."""
+    h = PriceHistory(tmp_path / "h.sqlite")
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    day_before = today - timedelta(days=5)
+
+    t_today = datetime.combine(today, datetime.min.time()).replace(hour=12, minute=0).timestamp()
+    t_yesterday = datetime.combine(yesterday, datetime.min.time()).replace(hour=12, minute=0).timestamp()
+    t_day_before = datetime.combine(day_before, datetime.min.time()).replace(hour=12, minute=0).timestamp()
+
+    h.annotate(Q, _make_res([Offer(site="s", price=6500, offer_id="tod1")]), now=t_today)
+    h.annotate(Q, _make_res([Offer(site="s", price=7000, offer_id="yest1")]), now=t_yesterday)
+    h.annotate(Q, _make_res([Offer(site="s", price=5000, offer_id="old1")]), now=t_day_before)
+
+    written = h.rebuild_route_daily()
+    assert written == 2
+
+    with h._connect() as db:
+        days_in_daily = {r[0]: r[1] for r in db.execute("SELECT day, min_price FROM route_daily").fetchall()}
+        assert yesterday.isoformat() in days_in_daily
+        assert today.isoformat() in days_in_daily
+        assert day_before.isoformat() not in days_in_daily
+        assert days_in_daily[yesterday.isoformat()] == 7000
+        assert days_in_daily[today.isoformat()] == 6500
+
+
 def test_prune_rolls_up_and_deletes_raw_records(tmp_path):
     """prune сворачивает дни старше keep_days в route_daily и удаляет только сырые price_history."""
     h = PriceHistory(tmp_path / "h.sqlite")
@@ -322,6 +349,42 @@ def test_prune_rolls_up_and_deletes_raw_records(tmp_path):
         assert daily_rows[0][0] == d_old.isoformat()
         assert daily_rows[0][1] == 8000
         assert daily_rows[0][2] == 1
+
+
+def test_prune_multiple_routes_on_same_day(tmp_path):
+    """prune корректно сворачивает все маршруты дня, даже если один из них уже был в route_daily."""
+    h = PriceHistory(tmp_path / "h.sqlite")
+    now_ts = datetime(2026, 11, 20, 12, 0, 0).timestamp()
+    t_old = now_ts - 60 * 86400
+    d_old = datetime.fromtimestamp(t_old).date()
+
+    q2 = Query(origin="MOW", destination="LED", depart=date(2026, 12, 1))
+
+    # Записываем замер по первому маршруту и вручную сворачиваем день
+    h.annotate(Q, _make_res([Offer(site="s", price=8000, offer_id="route1_old")]), now=t_old)
+    h.rebuild_route_daily(d_old)
+
+    with h._connect() as db:
+        # День d_old уже есть в route_daily
+        assert db.execute("SELECT COUNT(*) FROM route_daily WHERE day = ?", (d_old.isoformat(),)).fetchone()[0] == 1
+
+    # Позже добавляем замер по второму маршруту за тот же старый день
+    h.annotate(q2, _make_res([Offer(site="s", price=15000, offer_id="route2_old")]), now=t_old + 60)
+
+    # Вызываем prune: день d_old должен быть пересчитан для всех маршрутов,
+    # а не пропущен из-за наличия d_old в route_daily
+    deleted = h.prune(keep_days=45, now=now_ts)
+    assert deleted == 2  # удалены обе сырые записи
+
+    with h._connect() as db:
+        # В route_daily теперь должны быть записи по ОБОИМ маршрутам
+        rows = db.execute(
+            "SELECT origin, destination, min_price, samples FROM route_daily WHERE day = ? ORDER BY origin",
+            (d_old.isoformat(),),
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0] == ("KUF", "EVN", 8000, 1)
+        assert rows[1] == ("MOW", "LED", 15000, 1)
 
 
 def test_coverage_and_heartbeat(tmp_path):
@@ -371,6 +434,26 @@ def test_coverage_and_heartbeat(tmp_path):
     res_no_gap = h_cov.coverage(since=1000.0, until=1200.0, gap_seconds=3600.0)
     assert res_no_gap["gaps"] == []
     assert res_no_gap["covered_seconds"] == pytest.approx(200.0)
+
+
+def test_coverage_with_only_old_heartbeats(tmp_path):
+    """coverage не выходит за границы [since, until], когда heartbeat был только до since."""
+    h = PriceHistory(tmp_path / "h.sqlite")
+    # Метка планировщика только на 2000
+    h.record_heartbeat(2000.0)
+
+    # Запрос покрытия на [5000, 6000] с порогом 3600
+    # Промежуток между 2000 и 6000 равен 4000 (> 3600), поэтому весь интервал [5000, 6000] — пропуск
+    res = h.coverage(since=5000.0, until=6000.0, gap_seconds=3600.0)
+    assert res["gaps"] == [(5000.0, 6000.0)]
+    assert res["covered_seconds"] == 0.0
+
+    # Случай, когда heartbeat был незадолго до since (разрыв меньше gap_seconds)
+    # Например, heartbeat на 4900, запрос [5000, 6000] (интервал 1100 < 3600)
+    h.record_heartbeat(4900.0)
+    res_recent = h.coverage(since=5000.0, until=6000.0, gap_seconds=3600.0)
+    assert res_recent["gaps"] == []
+    assert res_recent["covered_seconds"] == pytest.approx(1000.0)
 
 
 def test_route_stats(tmp_path):

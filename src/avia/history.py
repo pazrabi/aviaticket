@@ -222,8 +222,7 @@ class PriceHistory:
         with self._connect() as db:
             days_to_rollup_rows = db.execute(
                 "SELECT DISTINCT date(observed_at, 'unixepoch', 'localtime') FROM price_history "
-                "WHERE observed_at < ? AND date(observed_at, 'unixepoch', 'localtime') NOT IN "
-                "(SELECT DISTINCT day FROM route_daily)",
+                "WHERE observed_at < ?",
                 (cutoff_ts,),
             ).fetchall()
 
@@ -293,7 +292,8 @@ class PriceHistory:
 
         last_pt = raw_points[-1]
         if last_pt < until and (until - last_pt) > gap_seconds:
-            raw_gaps.append((float(last_pt), float(until)))
+            g_start = max(float(since), float(last_pt))
+            raw_gaps.append((g_start, float(until)))
 
         # Объединение перекрывающихся или соприкасающихся интервалов
         merged_gaps: list[tuple[float, float]] = []
