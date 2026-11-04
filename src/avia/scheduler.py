@@ -25,7 +25,9 @@ def build_notification(
     now: float | None = None,
 ) -> str:
     """Формирует HTML-текст уведомления об изменении цены по подписке."""
-    lines: list[str] = ["🔔 <b>Цена изменилась</b>"]
+    is_rise = bool(reasons) and all(r.startswith("подорожала") for r in reasons)
+    head = "📈 <b>Цены дорожают</b>" if is_rise else "🔔 <b>Цена изменилась</b>"
+    lines: list[str] = [head]
 
     orig_name = escape(city_name(sub.origin))
     dest_name = escape(city_name(sub.destination))
@@ -36,7 +38,8 @@ def build_notification(
     lines.append(f"{orig_name} → {dest_name}, {dates}, пассажиров: {sub.adults}")
 
     reasons_str = "; ".join(escape(r) for r in reasons)
-    lines.append(f"Причина: {reasons_str}")
+    reason_prefix = "⚠️ Причина:" if is_rise else "Причина:"
+    lines.append(f"{reason_prefix} {reasons_str}")
 
     offer_str = offer_line(offer, baggage_mode=getattr(sub, "baggage_mode", "any"))
     site_html = f"<i>{escape(offer.site)}</i>"
@@ -48,6 +51,9 @@ def build_notification(
         site_part = site_html
 
     lines.append(f"{offer_str} · {site_part}")
+
+    if is_rise:
+        lines.append("Если планируете лететь, возможно, стоит не откладывать покупку.")
 
     if sub.criteria:
         desc = sub.criteria.describe()
