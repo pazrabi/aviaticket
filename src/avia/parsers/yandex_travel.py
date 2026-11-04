@@ -57,13 +57,17 @@ from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 import json
+import logging
 import re
 from typing import Any
 
 from ..collector import Snapshot
 from ..models import Leg, Offer, Query
+from ..offers import compute_offer_id
 from . import register_parser
 from .travelpayouts import format_duration
+
+logger = logging.getLogger(__name__)
 
 _BAGGAGE_PIECES_RE = re.compile(r"^(\d+)[a-zA-Z]")
 _CARRY_ON_PIECES_RE = re.compile(r"^\d+[a-zA-Z](\d+)")
@@ -275,8 +279,22 @@ def results_complete(snapshot: Snapshot | None) -> bool:
     True, если среди ответов '/api/avia/search/results' есть чанк с cont равным
     null/отсутствующим и progress.current == progress.all (если progress есть),
     иначе False.
+    Для текстового разбора (без валидного финального JSON) всегда False.
+    Если в тексте страницы указан неполный опрос партнёров ('Опрашиваем партнёров: N из M' при N < M),
+    выдача считается неполной (False).
     """
-    if not snapshot or not snapshot.json_payloads:
+    if not snapshot or getattr(snapshot, "blocked", False):
+        return False
+
+    text = getattr(snapshot, "text", "") or ""
+    if text:
+        m = re.search(r"Опрашиваем\s+партн[её]ров:\s*(\d+)\s+из\s+(\d+)", text)
+        if m:
+            cur, total = int(m.group(1)), int(m.group(2))
+            if cur < total:
+                return False
+
+    if not snapshot.json_payloads:
         return False
 
     for url, body in snapshot.json_payloads:
@@ -465,10 +483,218 @@ def _parse_leg(
     }
 
 
+_TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
+_AIRPORT_RE = re.compile(r"^[A-Z]{3}$")
+_PRICE_RE = re.compile(r"^\d+₽$")
+_BADGE_WORDS = {
+    "реклама",
+    "лучшая цена",
+    "популярный рейс",
+    "сначала рекомендуемые",
+    "смотреть все",
+    "выгодно",
+    "быстрее всего",
+    "дешевле всего",
+    "суперцена",
+}
+
+
+def _is_cabin_luggage_line(s: str) -> bool:
+    """Проверяет, содержит ли строка габариты ручной клади (например, '36×30×27 см')."""
+    s_l = s.lower()
+    return "см" in s_l and bool(re.search(r"\d+\s*[x×*]\s*\d+", s_l))
+
+
+def _parse_text_duration(text: str) -> tuple[str | None, int]:
+    """Разбирает текстовую длительность перелёта (например, '1 ч 45 м') в формат '1ч 45м' и минуты."""
+    cleaned = text.replace("\xa0", " ").strip()
+    days_m = re.search(r"(\d+)\s*д", cleaned)
+    hours_m = re.search(r"(\d+)\s*ч", cleaned)
+    mins_m = re.search(r"(\d+)\s*м", cleaned)
+    if not hours_m and not mins_m and not days_m:
+        return None, 0
+    days = int(days_m.group(1)) if days_m else 0
+    hours = int(hours_m.group(1)) if hours_m else 0
+    mins = int(mins_m.group(1)) if mins_m else 0
+    total_minutes = days * 24 * 60 + hours * 60 + mins
+    return format_duration(total_minutes), total_minutes
+
+
+def _parse_transfers_text(text: str) -> tuple[int | None, list[str] | None]:
+    """Разбирает строку пересадок: 'прямой', '1 пересадка', 'пересадка в XXX'."""
+    t_clean = text.strip()
+    t_lower = t_clean.lower()
+    if t_lower in ("прямой", "без пересадок"):
+        return 0, None
+    m_count = re.fullmatch(r"(\d+)\s+пересадк[иае]?", t_lower)
+    if m_count:
+        return int(m_count.group(1)), None
+    m_city = re.fullmatch(r"пересадка\s+в\s+(.+)", t_clean, re.IGNORECASE)
+    if m_city:
+        city = m_city.group(1).strip()
+        return 1, [city] if city else None
+    return None, None
+
+
+def _parse_yandex_travel_text(text: str | None, query: Query | None) -> list[Offer]:
+    """Разбирает карточки рейсов из текстового представления страницы Яндекс Путешествий."""
+    if not text:
+        return []
+
+    # Обратные билеты (RT) в текстовом представлении не подтверждены образцом
+    if query is not None and query.return_date is not None:
+        return []
+
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    n = len(lines)
+    if n == 0:
+        return []
+
+    offers: list[Offer] = []
+    seen_cards: set[tuple[str | None, str, str, str, str, int]] = set()
+
+    base_date = query.depart if query is not None else None
+    currency = str(query.currency or "RUB").upper() if query is not None else "RUB"
+
+    i = 0
+    while i < n:
+        if not _TIME_RE.match(lines[i]):
+            i += 1
+            continue
+
+        k = i
+        # Опорная связка: время вылета (k), длительность (k+1), время прилёта (k+2),
+        # аэропорт вылета (k+3), пересадки (k+4), аэропорт прилёта (k+5), цена (k+6)
+        if k + 6 >= n:
+            i += 1
+            continue
+
+        dur_line = lines[k + 1]
+        arr_line = lines[k + 2]
+        dep_apt = lines[k + 3]
+        transfers_line = lines[k + 4]
+        arr_apt = lines[k + 5]
+        price_line = lines[k + 6]
+
+        dur_str, dur_minutes = _parse_text_duration(dur_line)
+        if not dur_str:
+            i += 1
+            continue
+
+        m_arr = re.match(r"^(\d{1,2}:\d{2})(?:\s*\+(\d+))?$", arr_line)
+        if not m_arr:
+            i += 1
+            continue
+        arr_time = m_arr.group(1)
+        plus_days = int(m_arr.group(2)) if m_arr.group(2) else 0
+
+        if not _AIRPORT_RE.match(dep_apt):
+            i += 1
+            continue
+
+        transfers_count, layovers = _parse_transfers_text(transfers_line)
+        if transfers_count is None:
+            i += 1
+            continue
+
+        if not _AIRPORT_RE.match(arr_apt):
+            i += 1
+            continue
+
+        clean_price = re.sub(r"\s+", "", price_line)
+        if not _PRICE_RE.fullmatch(clean_price):
+            i += 1
+            continue
+
+        digits = "".join(re.findall(r"\d+", clean_price))
+        if not digits:
+            i += 1
+            continue
+        price = int(digits)
+        if price <= 0:
+            i += 1
+            continue
+
+        # Поиск авиакомпании и ручной клади перед временем вылета
+        carry_on = None
+        cur = k - 1
+        if cur >= 0 and _is_cabin_luggage_line(lines[cur]):
+            carry_on = "ручная кладь есть"
+            cur -= 1
+
+        airline = None
+        while cur >= 0:
+            val = lines[cur]
+            val_l = val.lower()
+            if val_l in _BADGE_WORDS or re.search(r"^\d+\s*вариант", val_l):
+                cur -= 1
+                continue
+            # Граница предыдущей карточки
+            if (
+                _PRICE_RE.match(re.sub(r"\s+", "", val))
+                or _TIME_RE.match(val)
+                or _AIRPORT_RE.match(val)
+                or _is_cabin_luggage_line(val)
+            ):
+                break
+            airline = val
+            break
+
+        if not airline:
+            i += 1
+            continue
+
+        # Дедупликация карточек (авиакомпания, время вылета, время прилёта, аэропорты, цена)
+        dep_time = lines[k]
+        card_key = (airline, dep_time, arr_time, dep_apt, arr_apt, price)
+        if card_key in seen_cards:
+            i = k + 7
+            continue
+        seen_cards.add(card_key)
+
+        dep_at = arr_at = None
+        if base_date is not None:
+            dep_at = f"{base_date.isoformat()}T{dep_time}"
+            days_offset = plus_days
+            if dur_minutes >= 24 * 60:
+                days_offset += dur_minutes // (24 * 60)
+            if arr_time < dep_time and plus_days == 0:
+                days_offset += 1
+            arr_at = f"{(base_date + timedelta(days=days_offset)).isoformat()}T{arr_time}"
+
+        offer = Offer(
+            site="yandex_travel",
+            price=price,
+            currency=currency,
+            airline=airline,
+            depart_time=dep_time,
+            arrive_time=arr_time,
+            duration=dur_str,
+            transfers=transfers_count,
+            baggage="без багажа",
+            carry_on=carry_on,
+            url=None,
+            flight_numbers=None,
+            aircraft=None,
+            layovers=layovers,
+            depart_at=dep_at,
+            arrive_at=arr_at,
+            back=None,
+        )
+        offer.offer_id = compute_offer_id(offer)
+        offers.append(offer)
+
+        i = k + 7
+
+    offers.sort(key=lambda o: o.price)
+    return offers
+
+
 @register_parser("yandex_travel")
 def parse_yandex_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
     """Разбирает JSON-ответы Яндекс Путешествий (/api/avia/search/results) из snapshot в список Offer."""
-    if not snapshot or not snapshot.json_payloads:
+    if not snapshot or getattr(snapshot, "blocked", False):
         return []
 
     flights_ref: dict[str, Any] = {}
@@ -481,7 +707,7 @@ def parse_yandex_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
     valid_chunks: list[dict[str, Any]] = []
     seen_portions: set[Any] = set()
 
-    for url, body in snapshot.json_payloads:
+    for url, body in (snapshot.json_payloads or []):
         if "/api/avia/search/results" not in url:
             continue
         try:
@@ -749,8 +975,19 @@ def parse_yandex_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
             except Exception:
                 continue
 
-    offers.sort(key=lambda o: o.price)
-    return offers
+    if offers:
+        offers.sort(key=lambda o: o.price)
+        return offers
+
+    # Запасной разбор по тексту страницы (snapshot.text),
+    # срабатывает ТОЛЬКО когда по JSON не получилось ни одного оффера
+    text = getattr(snapshot, "text", "") or ""
+    if text:
+        text_offers = _parse_yandex_travel_text(text, query)
+        logger.info("yandex: разобрано %d карточек из текста страницы (нет JSON)", len(text_offers))
+        return text_offers
+
+    return []
 
 
 # Привязываем results_complete к функции парсера для pipeline.py
