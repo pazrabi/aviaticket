@@ -228,3 +228,55 @@ async def test_pipeline_phone_auto_with_devices(monkeypatch):
     assert results[0].offers[0].price == 7700
     assert received_candidates == ["phone_a", "phone_b"]
 
+
+@pytest.mark.asyncio
+async def test_pipeline_passes_priority_weight_and_receives_stats(monkeypatch):
+    """Pipeline search передаёт priority и weight в _from_browser и SiteResult получает stats."""
+    received_kwargs = {}
+
+    async def fake_fetch_any(settings, candidates, url, **kwargs):
+        received_kwargs.update(kwargs)
+        st = kwargs.get("stats")
+        if st is not None:
+            st["device"] = "phone_a"
+            st["queue_wait"] = 0.35
+            st["fetch_seconds"] = 1.2
+            st["attempts"] = 1
+        return Snapshot(
+            url=url,
+            text="Билеты найдены",
+            json_payloads=[("/search/results", '{"tickets": [{"price": 5000}]}')],
+            blocked=False,
+        ), True
+
+    monkeypatch.setattr("avia.pipeline.fetch_page_snapshot_any", fake_fetch_any)
+
+    def dummy_parser(snap, q):
+        return [Offer(site="stat_site", price=5000)]
+
+    monkeypatch.setitem(PARSERS, "stat_parser", dummy_parser)
+
+    site = SiteConfig(
+        "stat_site",
+        "https://stat.test/{origin}{destination}",
+        phone="phone_a",
+        parser="stat_parser",
+        phone_wait_seconds=45,
+    )
+    settings = Settings(
+        sites=[site],
+        droidhub_url="https://hub.test",
+        droidhub_token="secret",
+    )
+    q = Query("MOW", "ALA", date(2026, 12, 10))
+
+    results = await search(q, settings, priority=1, guard=SearchGuard(min_interval=0.0, retry_delay=0.0))
+    assert len(results) == 1
+    res = results[0]
+    assert res.ok is True
+    assert res.device == "phone_a"
+    assert res.queue_wait == 0.35
+    assert res.fetch_seconds == 1.2
+    assert received_kwargs.get("priority") == 1
+    assert received_kwargs.get("weight") == 45
+

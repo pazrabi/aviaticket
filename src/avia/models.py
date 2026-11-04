@@ -66,3 +66,6 @@ class SiteResult:
     partial: bool = False
     cached: bool = False
     captcha: bool = False
+    device: str | None = None
+    queue_wait: float | None = None
+    fetch_seconds: float | None = None

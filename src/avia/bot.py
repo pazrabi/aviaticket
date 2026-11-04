@@ -46,6 +46,15 @@ log = logging.getLogger("avia.bot")
 API = "https://api.telegram.org/bot{token}/{method}"
 
 
+async def _search_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Вызывает search с priority, а при несовместимости мока (TypeError) повторяет без priority."""
+    try:
+        return await fn(*args, **kwargs)
+    except TypeError:
+        kwargs.pop("priority", None)
+        return await fn(*args, **kwargs)
+
+
 class Bot:
     def __init__(
         self,
@@ -316,7 +325,7 @@ class Bot:
             self._active_searches += 1
             try:
                 async with self._search_sem:
-                    results = await search(q, self.s)
+                    results = await _search_call(search, q, self.s, priority=0)
             finally:
                 self._active_searches -= 1
             self._record_metrics("user", results)
@@ -729,16 +738,26 @@ class Bot:
 
     def _collect_parse_data(self, period: str = "24h") -> dict[str, Any]:
         if self.metrics is None:
-            return {"summary": None, "counts_by_source": {}, "recent_errors": []}
+            return {
+                "summary": None,
+                "counts_by_source": {},
+                "recent_errors": [],
+                "devices_summary": {},
+                "site_devices_summary": {},
+            }
         now = time.time()
         since_ts = now - (7 * 86400.0 if period == "7d" else 86400.0)
         summary = self.metrics.summary(since_ts)
         counts = self.metrics.counts_by_source(since_ts)
         errors = self.metrics.recent_errors(limit=5, since_ts=since_ts)
+        devices_summary = self.metrics.summary_by_device(since_ts)
+        site_devices_summary = self.metrics.summary_by_site_device(since_ts)
         return {
             "summary": summary,
             "counts_by_source": counts,
             "recent_errors": errors,
+            "devices_summary": devices_summary,
+            "site_devices_summary": site_devices_summary,
         }
 
     def _collect_users_data(self) -> dict[str, Any]:
@@ -961,7 +980,7 @@ class Bot:
 
     async def _bg_search(self, q: Query):
         async with self._search_sem:
-            results = await search(q, self.s)
+            results = await _search_call(search, q, self.s, priority=2)
         self._record_metrics("bg", results)
         return results
 
@@ -970,7 +989,7 @@ class Bot:
         self._active_searches += 1
         try:
             async with self._search_sem:
-                results = await search(q, self.s)
+                results = await _search_call(search, q, self.s, priority=1)
         finally:
             self._active_searches -= 1
         self._record_metrics("sub", results)

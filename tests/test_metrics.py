@@ -235,3 +235,30 @@ async def test_bot_bg_and_scheduler_search_record_metrics(tmp_path, monkeypatch)
     res_sub = await bot._scheduler_search(q)
     assert res_sub == fake_results
     mock_metrics.record_results.assert_any_call("sub", fake_results)
+
+
+def test_metrics_summary_by_device_and_by_site_device(tmp_path):
+    """summary_by_device и summary_by_site_device строят сводки по устройствам."""
+    store = MetricsStore(tmp_path / "metrics.sqlite")
+    r1 = SiteResult(site="tutu", ok=True, offers=[], elapsed=1.5, device="realme", queue_wait=0.2, fetch_seconds=1.3)
+    r2 = SiteResult(site="tutu", ok=False, offers=[], elapsed=1.0, error="капча", device="realme", queue_wait=0.1, fetch_seconds=0.9)
+    r3 = SiteResult(site="yandex", ok=True, offers=[], elapsed=2.0, device="redmi", queue_wait=0.0, fetch_seconds=2.0)
+    store.record_results("user", [r1, r2, r3], ts=100.0)
+
+    by_dev = store.summary_by_device(since_ts=50.0)
+    assert "realme" in by_dev
+    assert by_dev["realme"]["runs"] == 2
+    assert by_dev["realme"]["ok"] == 1
+    assert by_dev["realme"]["captcha"] == 1
+    assert by_dev["realme"]["avg_fetch"] == 1.1
+    assert by_dev["realme"]["avg_queue_wait"] == 0.15
+
+    assert "redmi" in by_dev
+    assert by_dev["redmi"]["runs"] == 1
+    assert by_dev["redmi"]["ok"] == 1
+
+    by_site_dev = store.summary_by_site_device(since_ts=50.0)
+    assert ("tutu", "realme") in by_site_dev
+    assert by_site_dev[("tutu", "realme")]["runs"] == 2
+    assert ("yandex", "redmi") in by_site_dev
+    assert by_site_dev[("yandex", "redmi")]["runs"] == 1
