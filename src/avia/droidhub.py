@@ -7,12 +7,13 @@ from dataclasses import dataclass
 import json
 import logging
 import time
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
 from .collector import Snapshot
-from .config import Settings, SiteConfig
+from .config import Settings
+from .sites import SiteConfig
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +21,12 @@ logger = logging.getLogger(__name__)
 class PreferenceList(list):
     """Список устройств с фиксированным порядком предпочтения (не round-robin)."""
     prefer_order: bool = True
+    patience: float = 0.0
+
+    def __init__(self, iterable: Any = (), *, patience: float | None = None) -> None:
+        super().__init__(iterable)
+        if patience is not None:
+            self.patience = float(patience)
 
 
 @dataclass
@@ -30,6 +37,9 @@ class _Waiter:
     candidates: list[str]
     prefer_order: bool
     fut: asyncio.Future[str]
+    patience: float = 0.0
+    deadline: float = 0.0
+    timer_handle: asyncio.TimerHandle | None = None
 
     @property
     def key(self) -> tuple[int, int, int]:
@@ -46,6 +56,28 @@ _pool_loop: asyncio.AbstractEventLoop | None = None
 _rr_counter: int = 0
 _seq_counter: int = 0
 _waiters: list[_Waiter] = []
+_clock: Callable[[], float] | None = None
+
+
+def _time() -> float:
+    """Возвращает текущее время (монотонное или кастомные часы)."""
+    if _clock is not None:
+        return _clock()
+    return time.monotonic()
+
+
+def set_clock(clock: Callable[[], float] | None) -> None:
+    """Устанавливает функцию часов для тестов."""
+    global _clock
+    _clock = clock
+
+
+def advance_time(seconds: float) -> None:
+    """Продвигает виртуальное время и вызывает диспетчер (для тестов)."""
+    global _clock
+    if _clock is not None and hasattr(_clock, "advance"):
+        _clock.advance(seconds)
+    _dispatch()
 
 
 class DroidhubError(Exception):
@@ -96,14 +128,18 @@ def _get_pool_condition() -> asyncio.Condition:
 
 def _reset_pool() -> None:
     """Сброс состояния пула (для изоляции тестов)."""
-    global _pool_condition, _pool_loop, _rr_counter, _seq_counter, _waiters
+    global _pool_condition, _pool_loop, _rr_counter, _seq_counter, _waiters, _clock
     _busy_devices.clear()
     _device_locks.clear()
     _pool_condition = None
     _pool_loop = None
     _rr_counter = 0
     _seq_counter = 0
+    _clock = None
     for w in _waiters:
+        if w.timer_handle is not None:
+            w.timer_handle.cancel()
+            w.timer_handle = None
         if not w.fut.done():
             w.fut.cancel()
     _waiters.clear()
@@ -127,7 +163,8 @@ def candidates(settings: Settings, site: SiteConfig) -> list[str]:
             s = p.strip()
             if s and s not in clean:
                 clean.append(s)
-        return PreferenceList(clean)
+        patience = float(getattr(site, "phone_patience_seconds", 0) or 0)
+        return PreferenceList(clean, patience=patience)
     return [phone]
 
 
@@ -181,18 +218,51 @@ def _try_acquire(clean: list[str], prefer_order: bool) -> str | None:
         return None
 
 
+def _on_patience_timeout(waiter: _Waiter) -> None:
+    """Коллбэк таймера терпения: будит диспетчер, когда терпение истекло."""
+    waiter.timer_handle = None
+    if not waiter.fut.done():
+        _dispatch()
+
+
 def _dispatch() -> None:
     """Проверяет очередь ожидающих и назначает свободные устройства."""
     if not _waiters:
         return
+    now = _time()
     i = 0
     while i < len(_waiters):
         waiter = _waiters[i]
         if waiter.fut.done():
+            if waiter.timer_handle is not None:
+                waiter.timer_handle.cancel()
+                waiter.timer_handle = None
             _waiters.pop(i)
             continue
-        dev = _try_acquire(waiter.candidates, waiter.prefer_order)
+
+        # Если действует терпение (предпочтительный порядок, терпение > 0, есть запасные,
+        # и дедлайн ещё не наступил с допуском 1e-4), пробуем ТОЛЬКО предпочтительный телефон
+        is_patience_active = (
+            waiter.prefer_order
+            and waiter.patience > 0
+            and len(waiter.candidates) > 1
+            and (waiter.deadline - now > 1e-4)
+        )
+        if is_patience_active:
+            cand = waiter.candidates[:1]
+            if waiter.timer_handle is None:
+                loop = asyncio.get_running_loop()
+                waiter.timer_handle = loop.call_later(
+                    max(0.0, waiter.deadline - now), _on_patience_timeout, waiter
+                )
+        else:
+            cand = waiter.candidates
+
+        dev = _try_acquire(cand, waiter.prefer_order)
         if dev is not None:
+            if waiter.timer_handle is not None:
+                waiter.timer_handle.cancel()
+                waiter.timer_handle = None
             _waiters.pop(i)
             if not waiter.fut.done():
                 waiter.fut.set_result(dev)
@@ -206,6 +276,9 @@ async def acquire(
     weight: int = 0,
     *,
     prefer_order: bool | None = None,
+    patience: float | None = None,
+    patience_seconds: float | None = None,
+    phone_patience_seconds: float | None = None,
 ) -> str:
     """Ожидает, пока не освободится подходящее устройство из списка кандидатов.
 
@@ -216,6 +289,9 @@ async def acquire(
 
     Для prefer_order=True устройства проверяются в порядке списка;
     для round-robin (auto) — начиная со смещения счётчика round-robin.
+
+    Если задано терпение (patience > 0), пока предпочтительный телефон занят,
+    запасные не берутся до истечения N секунд.
     """
     _sync_loop_state()
     clean = _clean_candidates(candidates)
@@ -225,10 +301,20 @@ async def acquire(
     if prefer_order is None:
         prefer_order = getattr(candidates, "prefer_order", False)
 
+    if patience is None:
+        if patience_seconds is not None:
+            patience = patience_seconds
+        elif phone_patience_seconds is not None:
+            patience = phone_patience_seconds
+        else:
+            patience = getattr(candidates, "patience", 0.0)
+    patience_val = max(0.0, float(patience or 0.0))
+
     global _seq_counter
     _seq_counter += 1
     loop = asyncio.get_running_loop()
     fut: asyncio.Future[str] = loop.create_future()
+    now = _time()
     waiter = _Waiter(
         priority=priority,
         weight=weight,
@@ -236,6 +322,8 @@ async def acquire(
         candidates=clean,
         prefer_order=bool(prefer_order),
         fut=fut,
+        patience=patience_val,
+        deadline=now + patience_val,
     )
 
     # Вставляем в очередь с сохранением сортировки по (priority, -weight, seq)
@@ -248,9 +336,17 @@ async def acquire(
     if fut.done() and not fut.cancelled():
         return fut.result()
 
+    if waiter.prefer_order and waiter.patience > 0 and len(waiter.candidates) > 1:
+        if waiter.timer_handle is None:
+            rem = max(0.0, waiter.deadline - _time())
+            waiter.timer_handle = loop.call_later(rem, _on_patience_timeout, waiter)
+
     try:
         return await fut
     except asyncio.CancelledError:
+        if waiter.timer_handle is not None:
+            waiter.timer_handle.cancel()
+            waiter.timer_handle = None
         if fut.done() and not fut.cancelled():
             dev = fut.result()
             await release(dev)
@@ -405,6 +501,9 @@ async def fetch_page_snapshot_any(
     weight: int = 0,
     stats: dict | None = None,
     prefer_order: bool | None = None,
+    patience: float | None = None,
+    patience_seconds: float | None = None,
+    phone_patience_seconds: float | None = None,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на любом свободном телефоне из candidates.
 
@@ -422,6 +521,15 @@ async def fetch_page_snapshot_any(
     if prefer_order is None:
         prefer_order = getattr(candidates, "prefer_order", False)
 
+    if patience is None:
+        if patience_seconds is not None:
+            patience = patience_seconds
+        elif phone_patience_seconds is not None:
+            patience = phone_patience_seconds
+        else:
+            patience = getattr(candidates, "patience", 0.0)
+    patience_val = max(0.0, float(patience or 0.0))
+
     tried: set[str] = set()
     last_exc: Exception | None = None
     total_queue_wait: float = 0.0
@@ -433,7 +541,13 @@ async def fetch_page_snapshot_any(
             break
 
         t_acq_start = time.monotonic()
-        dev = await acquire(remaining, priority=priority, weight=weight, prefer_order=prefer_order)
+        dev = await acquire(
+            remaining,
+            priority=priority,
+            weight=weight,
+            prefer_order=prefer_order,
+            patience=patience_val,
+        )
         t_acq = time.monotonic() - t_acq_start
         total_queue_wait += t_acq
         attempts += 1
@@ -483,7 +597,7 @@ async def fetch_page_snapshot_any(
 
 async def fetch_page_snapshot(
     settings: Settings,
-    device_id: str | list[str],
+    device_id: str | list[str] | PreferenceList,
     url: str,
     *,
     wait_seconds: int = 40,
@@ -494,16 +608,31 @@ async def fetch_page_snapshot(
     weight: int = 0,
     stats: dict | None = None,
     prefer_order: bool | None = None,
+    patience: float | None = None,
+    patience_seconds: float | None = None,
+    phone_patience_seconds: float | None = None,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на телефоне через droidhub и возвращает (Snapshot, finished).
 
     Сохраняет совместимость с прежней сигнатурой (device_id: str) и поддерживает
-    передачу списка кандидатов (device_id: list[str]).
+    передачу списка кандидатов (device_id: list[str] или PreferenceList).
     """
+    if prefer_order is None:
+        prefer_order = getattr(device_id, "prefer_order", None)
+
+    if patience is None:
+        if patience_seconds is not None:
+            patience = patience_seconds
+        elif phone_patience_seconds is not None:
+            patience = phone_patience_seconds
+        else:
+            patience = getattr(device_id, "patience", None)
+
     if isinstance(device_id, (list, tuple)):
+        devs = device_id if isinstance(device_id, list) else list(device_id)
         return await fetch_page_snapshot_any(
             settings,
-            list(device_id),
+            devs,
             url,
             wait_seconds=wait_seconds,
             capture_json=capture_json,
@@ -513,6 +642,7 @@ async def fetch_page_snapshot(
             weight=weight,
             stats=stats,
             prefer_order=prefer_order,
+            patience=patience,
         )
     return await fetch_page_snapshot_any(
         settings,
@@ -526,4 +656,5 @@ async def fetch_page_snapshot(
         weight=weight,
         stats=stats,
         prefer_order=prefer_order,
+        patience=patience,
     )
