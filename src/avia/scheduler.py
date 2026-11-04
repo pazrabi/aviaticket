@@ -194,7 +194,7 @@ class Scheduler:
                                         self.history.route_stats, sub_query
                                     )
                                     site_stats = await asyncio.to_thread(
-                                        self.history.cheapest_site_stats, sub_query
+                                        self.history.cheapest_site_stats, sub_query, now=now
                                     )
                                     extra = analytics.summary_lines(stats, site_stats)[:3]
                                     if extra:

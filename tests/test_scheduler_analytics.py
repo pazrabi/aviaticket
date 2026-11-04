@@ -371,7 +371,7 @@ async def test_scheduler_run_once_includes_analytics_summary(store, history, clo
     q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 10), adults=1)
     sub = store.create(chat_id=101, query=q, baggage_mode="any", criteria=SearchCriteria(), now=clock())
 
-    # Заполняем 6 замеров по разным сайтам и ценам (12000, 11000, ...)
+    # Заполняем замеры по разным сайтам и ценам (минимум 5 с участием Купибилет)
     _seed_history_searches(
         history,
         q,
@@ -382,6 +382,7 @@ async def test_scheduler_run_once_includes_analytics_summary(store, history, clo
             (10500, "kupibilet"),
             (10000, "kupibilet"),
             (9500, "kupibilet"),
+            (9000, "kupibilet"),
         ],
         base_time=clock(),
     )
@@ -416,7 +417,7 @@ async def test_scheduler_run_once_includes_analytics_summary(store, history, clo
 
     # Проверяем строки аналитики
     assert "Дешевле, чем в" in text
-    assert "Купибилет" in text
+    assert "Чаще всего дешевле на Купибилет" in text
 
 
 @pytest.mark.asyncio
@@ -467,6 +468,54 @@ async def test_scheduler_run_once_analytics_error_does_not_break_notify(store, h
     # Уведомление отправлено успешно, но без строк аналитики
     assert "на 30% ниже обычного" in text
     assert "Дешевле, чем в" not in text
+
+
+@pytest.mark.asyncio
+async def test_scheduler_run_once_cheapest_site_stats_error_does_not_break_notify(store, history, clock, today):
+    """Сбой в history.cheapest_site_stats логируется, уведомление отправляется без extra_lines."""
+    q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 10), adults=1)
+    sub = store.create(chat_id=101, query=q, baggage_mode="any", criteria=SearchCriteria(), now=clock())
+
+    _seed_history_searches(
+        history,
+        q,
+        [(10000, "aviasales")] * 5,
+        base_time=clock(),
+    )
+
+    history.cheapest_site_stats = MagicMock(side_effect=RuntimeError("Corrupt cheapest_site_stats"))
+
+    async def search_fn(query: Query) -> list[SiteResult]:
+        return [
+            SiteResult(
+                site="aviasales",
+                ok=True,
+                offers=[Offer(site="aviasales", price=7000, currency="RUB", url="https://s.ru/1")],
+            )
+        ]
+
+    sent: list[tuple[int, str, dict | None]] = []
+
+    async def notify_fn(chat_id: int, text: str, markup: dict | None) -> None:
+        sent.append((chat_id, text, markup))
+
+    sched = Scheduler(
+        store=store,
+        search_fn=search_fn,
+        notify_fn=notify_fn,
+        history=history,
+        clock=clock,
+        today=today,
+    )
+
+    count = await sched.run_once()
+    assert count == 1
+    assert len(sent) == 1
+    _, text, _ = sent[0]
+
+    assert "на 30% ниже обычного" in text
+    assert "Дешевле, чем в" not in text
+    assert "Чаще всего дешевле на" not in text
 
 
 # --- 4. Тесты кнопки «📊 История» ---
