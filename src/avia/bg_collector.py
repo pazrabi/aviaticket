@@ -8,7 +8,7 @@ import time
 from typing import Any, Callable
 
 from .config import Settings
-from .history import PriceHistory
+from .history import PriceHistory, parse_seed_routes
 from .models import Query
 from .offers import assign_ids
 
@@ -37,11 +37,12 @@ class BackgroundCollector:
         self._cur_date: date = self._today()
         self._done_today: int = 0
         self._slots: dict[tuple[str, str, int], date] = {}
-        if hasattr(self.history, "get_bg_slots"):
+        self._last_attempt_at: dict[tuple[str, str, date], float] = {}
+        if isinstance(self.history, PriceHistory):
             try:
-                self._slots.update(self.history.get_bg_slots())
+                self._sync_slots()
             except Exception:
-                pass
+                log.exception("ошибка первичной синхронизации слотов")
 
     def _check_date(self) -> None:
         cur = self._today()
@@ -54,90 +55,33 @@ class BackgroundCollector:
         self._check_date()
         return self._done_today
 
-    def _parse_seed_routes(self) -> list[tuple[str, str]]:
-        routes: list[tuple[str, str]] = []
-        seed_list = self.s.bg_collect_seed_routes
-        if seed_list:
-            for item in seed_list:
-                if isinstance(item, str):
-                    for part in item.split(","):
-                        part = part.strip()
-                        if "-" in part:
-                            o, d = part.split("-", 1)
-                            o, d = o.strip().upper(), d.strip().upper()
-                            if o and d:
-                                routes.append((o, d))
-                                routes.append((d, o))
-                elif isinstance(item, (list, tuple)) and len(item) == 2:
-                    o, d = str(item[0]).strip().upper(), str(item[1]).strip().upper()
-                    if o and d:
-                        routes.append((o, d))
-                        routes.append((d, o))
-        return routes
-
     def _get_routes(self) -> list[tuple[str, str]]:
-        now = self._clock()
-        pop_routes: list[tuple[str, str, int]] = []
-        if hasattr(self.history, "popular_routes"):
+        if hasattr(self.history, "get_bg_routes"):
             try:
-                pop_routes = self.history.popular_routes(
-                    limit=self.s.bg_collect_top_routes,
-                    days=30,
-                    now=now,
+                return self.history.get_bg_routes(
+                    top_routes=self.s.bg_collect_top_routes,
+                    seed_routes=self.s.bg_collect_seed_routes,
+                    now=self._clock(),
                 )
             except Exception:
                 log.exception("ошибка получения популярных маршрутов")
-
-        routes: list[tuple[str, str]] = []
-        seen = set()
-        for orig, dest, _ in pop_routes:
-            pair = (orig.upper(), dest.upper())
-            if pair not in seen:
-                seen.add(pair)
-                routes.append(pair)
-
-        for pair in self._parse_seed_routes():
-            if pair not in seen:
-                seen.add(pair)
-                routes.append(pair)
-
-        return routes
+        return parse_seed_routes(self.s.bg_collect_seed_routes)
 
     def _sync_slots(self) -> list[tuple[str, str, date]]:
         """Обновляет и возвращает активные пары (route, depart_date)."""
-        today = self._today()
-        routes = self._get_routes()
-        horizons = self.s.bg_collect_horizons_days or [7, 14, 28, 56, 90]
-
-        if hasattr(self.history, "get_bg_slots"):
+        if hasattr(self.history, "sync_bg_slots"):
             try:
-                db_slots = self.history.get_bg_slots()
-                for k, v in db_slots.items():
-                    if k not in self._slots:
-                        self._slots[k] = v
+                return self.history.sync_bg_slots(
+                    today=self._today(),
+                    top_routes=self.s.bg_collect_top_routes,
+                    seed_routes=self.s.bg_collect_seed_routes,
+                    horizons_days=self.s.bg_collect_horizons_days,
+                    slots=self._slots,
+                    now=self._clock(),
+                )
             except Exception:
-                pass
-
-        active_pairs: list[tuple[str, str, date]] = []
-        seen_pairs: set[tuple[str, str, date]] = set()
-
-        for orig, dest in routes:
-            for h in horizons:
-                key = (orig, dest, h)
-                cur_date = self._slots.get(key)
-                if cur_date is None or cur_date < today:
-                    cur_date = today + timedelta(days=h)
-                    self._slots[key] = cur_date
-                    if hasattr(self.history, "set_bg_slot"):
-                        try:
-                            self.history.set_bg_slot(orig, dest, h, cur_date)
-                        except Exception:
-                            pass
-                pair = (orig, dest, cur_date)
-                if pair not in seen_pairs:
-                    seen_pairs.add(pair)
-                    active_pairs.append(pair)
-        return active_pairs
+                log.exception("ошибка синхронизации слотов")
+        return []
 
     @property
     def distinct_routes_count(self) -> int:
@@ -170,6 +114,7 @@ class BackgroundCollector:
                 seed_routes=self.s.bg_collect_seed_routes,
                 horizons_days=self.s.bg_collect_horizons_days,
                 slots=self._slots,
+                last_checked=self._last_attempt_at,
             )
 
         return self.history.collect_candidates(
@@ -201,6 +146,14 @@ class BackgroundCollector:
             return False
 
         q = candidates[0]
+        # Фиксируем факт проверки слота независимо от наличия билетов в выдаче
+        self._last_attempt_at[(q.origin.upper(), q.destination.upper(), q.depart)] = now
+        if hasattr(self.history, "mark_bg_slot_checked"):
+            try:
+                self.history.mark_bg_slot_checked(q.origin, q.destination, q.depart, now)
+            except Exception:
+                pass
+
         try:
             results = await self.search_fn(q)
         except asyncio.CancelledError:

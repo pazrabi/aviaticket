@@ -288,9 +288,9 @@ def test_slots_persistence_across_collector_instances(tmp_path):
         today=lambda: today,
     )
 
-    # Инициализируем слоты
-    pairs1 = collector1._sync_slots()
-    assert len(pairs1) > 0
+    # Слоты сохраняются в БД при обычной инициализации без ручного вызова _sync_slots
+    db_slots1 = history1.get_bg_slots()
+    assert len(db_slots1) > 0
 
     # Создаём новый collector на той же БД (симуляция перезапуска)
     history2 = PriceHistory(db_path)
@@ -308,6 +308,119 @@ def test_slots_persistence_across_collector_instances(tmp_path):
     assert len(slots2) > 0
     for key, dep in slots2.items():
         assert dep == today + timedelta(days=key[2])
+
+
+def test_slots_saved_to_db_on_collect_slot_candidates_with_external_dict(tmp_path):
+    """collect_slot_candidates всегда сохраняет слоты в БД даже при передаче внешнего словаря."""
+    db_path = tmp_path / "prices.sqlite"
+    history = PriceHistory(db_path)
+    today = date(2026, 11, 1)
+
+    # Изначально таблица слотов пуста
+    assert history.get_bg_slots() == {}
+
+    ext_slots = {}
+    candidates = history.collect_slot_candidates(
+        limit=5,
+        today=today,
+        seed_routes=["MOW-LED"],
+        horizons_days=[7, 14],
+        slots=ext_slots,
+    )
+    assert len(candidates) > 0
+
+    # Проверяем, что слоты записались в SQLite БД
+    db_slots = history.get_bg_slots()
+    assert len(db_slots) > 0
+    for key, dep in db_slots.items():
+        assert dep in (today + timedelta(days=7), today + timedelta(days=14))
+
+
+@pytest.mark.asyncio
+async def test_no_infinite_loop_on_empty_search_results(tmp_path):
+    """При пустой выдаче поиска факт проверки фиксируется, и сборщик не зацикливается на одном кандидате."""
+    db_path = tmp_path / "prices.sqlite"
+    history = PriceHistory(db_path)
+    search_mock = AsyncMock(return_value=[])  # Всегда пустая выдача (0 офферов)
+    is_idle = MagicMock(return_value=True)
+
+    today = date(2026, 11, 1)
+    clock_val = 1000000.0
+
+    settings = _make_settings(
+        bg_collect_seed_routes=["MOW-LED"],
+        bg_collect_horizons_days=[7],
+        bg_collect_recheck_hours=24,
+    )
+
+    collector = BackgroundCollector(
+        history=history,
+        search_fn=search_mock,
+        is_idle=is_idle,
+        settings=settings,
+        clock=lambda: clock_val,
+        today=lambda: today,
+    )
+
+    # 1. Первый запуск: выбирает первую пару
+    assert await collector.run_once() is True
+    assert search_mock.call_count == 1
+    q1 = search_mock.call_args[0][0]
+
+    # 2. Через 20 минут (1200 сек < 24 ч): не должен повторять q1, а взять вторую пару (LED->MOW)
+    clock_val += 1200.0
+    assert await collector.run_once() is True
+    assert search_mock.call_count == 2
+    q2 = search_mock.call_args[0][0]
+    assert (q1.origin, q1.destination) != (q2.origin, q2.destination)
+
+    # 3. Ещё через 20 минут: обе пары уже проверены, лимит не сжигается, run_once возвращает False
+    clock_val += 1200.0
+    assert await collector.run_once() is False
+    assert search_mock.call_count == 2
+
+    # 4. Перезапуск бота на той же БД: факт проверки сохранился в SQLite
+    collector_restarted = BackgroundCollector(
+        history=PriceHistory(db_path),
+        search_fn=search_mock,
+        is_idle=is_idle,
+        settings=settings,
+        clock=lambda: clock_val,
+        today=lambda: today,
+    )
+    assert await collector_restarted.run_once() is False
+    assert search_mock.call_count == 2
+
+
+def test_case_insensitive_airport_codes_in_history(tmp_path):
+    """Регистр кодов аэропортов в price_history не ломает маппинг проверок."""
+    db_path = tmp_path / "prices.sqlite"
+    history = PriceHistory(db_path)
+    today = date(2026, 11, 1)
+    now_ts = 1000000.0
+
+    # Вставляем запись в price_history с кодами в нижнем регистре
+    with history._connect() as db:
+        db.execute(
+            "INSERT INTO price_history "
+            "(offer_id, site, origin, destination, depart, adults, price, currency, observed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("o1", "site", "mow", "led", (today + timedelta(days=7)).isoformat(), 1, 5000, "RUB", now_ts - 3600),
+        )
+
+    candidates = history.collect_slot_candidates(
+        limit=10,
+        today=today,
+        now=now_ts,
+        recheck_seconds=24 * 3600,
+        seed_routes=["MOW-LED"],
+        horizons_days=[7],
+        top_routes=0,
+    )
+
+    # Пара MOW->LED на 7 дней была проверена 1 час назад (в нижнем регистре) -> должна быть отфильтрована!
+    mow_led_7 = [c for c in candidates if c.origin == "MOW" and c.destination == "LED"]
+    assert len(mow_led_7) == 0
 
 
 def test_admin_panel_bg_collect_display():

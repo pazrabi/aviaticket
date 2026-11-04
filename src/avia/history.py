@@ -60,10 +60,11 @@ CREATE TABLE IF NOT EXISTS scheduler_heartbeat (
 CREATE INDEX IF NOT EXISTS ix_heartbeat_ts ON scheduler_heartbeat (ts);
 
 CREATE TABLE IF NOT EXISTS bg_collect_slots (
-    origin      TEXT NOT NULL,
-    destination TEXT NOT NULL,
-    horizon     INTEGER NOT NULL,
-    depart      TEXT NOT NULL,
+    origin          TEXT NOT NULL,
+    destination     TEXT NOT NULL,
+    horizon         INTEGER NOT NULL,
+    depart          TEXT NOT NULL,
+    last_checked_at REAL,
     PRIMARY KEY (origin, destination, horizon)
 );
 """
@@ -121,7 +122,40 @@ def _model_day_prices(min_p: float, p25_p: float, med_p: float, count: int) -> l
     return prices
 
 
+def parse_seed_routes(seed_routes: list[str] | list[tuple[str, str]] | None) -> list[tuple[str, str]]:
+    """Парсит seed-маршруты в список пар (origin, destination) в обе стороны."""
+    if seed_routes is None:
+        raw_seeds = ["MOW-LED", "MOW-AER", "MOW-KUF", "MOW-OVB", "MOW-SVX", "MOW-KZN"]
+    else:
+        raw_seeds = seed_routes
+
+    routes: list[tuple[str, str]] = []
+    seen = set()
+
+    for item in raw_seeds:
+        if isinstance(item, str):
+            for part in item.split(","):
+                part = part.strip()
+                if "-" in part:
+                    o, d = part.split("-", 1)
+                    o, d = o.strip().upper(), d.strip().upper()
+                    if o and d:
+                        for r in [(o, d), (d, o)]:
+                            if r not in seen:
+                                seen.add(r)
+                                routes.append(r)
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            o, d = str(item[0]).strip().upper(), str(item[1]).strip().upper()
+            if o and d:
+                for r in [(o, d), (d, o)]:
+                    if r not in seen:
+                        seen.add(r)
+                        routes.append(r)
+    return routes
+
+
 class PriceHistory:
+    parse_seed_routes = staticmethod(parse_seed_routes)
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -159,6 +193,10 @@ class PriceHistory:
             "CREATE INDEX IF NOT EXISTS ix_price_observed_at "
             "ON price_history (observed_at)"
         )
+        info_slots = db.execute("PRAGMA table_info(bg_collect_slots)").fetchall()
+        existing_slot_cols = {col[1] for col in info_slots}
+        if "last_checked_at" not in existing_slot_cols:
+            db.execute("ALTER TABLE bg_collect_slots ADD COLUMN last_checked_at REAL")
 
     def annotate(
         self,
@@ -920,33 +958,116 @@ class PriceHistory:
         for orig, dest, h, dep in rows:
             d = _normalize_date(dep)
             if d:
-                res[(orig, dest, int(h))] = d
+                res[(orig.upper(), dest.upper(), int(h))] = d
         return res
 
-    def set_bg_slot(self, origin: str, destination: str, horizon: int, depart: date) -> None:
+    def get_bg_slot_last_checks(self) -> dict[tuple[str, str, date], float]:
+        """Возвращает {(origin, destination, depart_date): last_checked_at} из таблицы слотов."""
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT origin, destination, depart, last_checked_at FROM bg_collect_slots "
+                "WHERE last_checked_at IS NOT NULL"
+            ).fetchall()
+        res: dict[tuple[str, str, date], float] = {}
+        for orig, dest, dep, lca in rows:
+            d = _normalize_date(dep)
+            if d and lca is not None:
+                res[(orig.upper(), dest.upper(), d)] = float(lca)
+        return res
+
+    def set_bg_slot(
+        self,
+        origin: str,
+        destination: str,
+        horizon: int,
+        depart: date,
+        last_checked_at: float | None = None,
+    ) -> None:
         """Сохраняет или обновляет слот в БД."""
         with self._connect() as db:
+            row = db.execute(
+                "SELECT depart, last_checked_at FROM bg_collect_slots "
+                "WHERE origin = ? AND destination = ? AND horizon = ?",
+                (origin.upper(), destination.upper(), int(horizon)),
+            ).fetchone()
+            if row is not None:
+                old_dep, old_lca = row
+                if old_dep == depart.isoformat():
+                    lca = last_checked_at if last_checked_at is not None else old_lca
+                    db.execute(
+                        "UPDATE bg_collect_slots SET last_checked_at = ? "
+                        "WHERE origin = ? AND destination = ? AND horizon = ?",
+                        (lca, origin.upper(), destination.upper(), int(horizon)),
+                    )
+                    return
             db.execute(
-                "INSERT OR REPLACE INTO bg_collect_slots (origin, destination, horizon, depart) "
-                "VALUES (?, ?, ?, ?)",
-                (origin, destination, int(horizon), depart.isoformat()),
+                "INSERT INTO bg_collect_slots (origin, destination, horizon, depart, last_checked_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(origin, destination, horizon) DO UPDATE SET "
+                "depart = excluded.depart, "
+                "last_checked_at = excluded.last_checked_at",
+                (origin.upper(), destination.upper(), int(horizon), depart.isoformat(), last_checked_at),
             )
 
-    def collect_slot_candidates(
+    def mark_bg_slot_checked(
         self,
-        limit: int = 5,
-        today: date | datetime | str | None = None,
+        origin: str,
+        destination: str,
+        depart: date | datetime | str,
+        checked_at: float | None = None,
+    ) -> None:
+        """Отмечает время последней проверки слота (даже если билетов не найдено)."""
+        dep_d = _normalize_date(depart)
+        if not dep_d:
+            return
+        now_ts = time.time() if checked_at is None else float(checked_at)
+        with self._connect() as db:
+            db.execute(
+                "UPDATE bg_collect_slots SET last_checked_at = ? "
+                "WHERE origin = ? AND destination = ? AND depart = ?",
+                (now_ts, origin.upper(), destination.upper(), dep_d.isoformat()),
+            )
+
+    def get_bg_routes(
+        self,
+        top_routes: int = 12,
+        seed_routes: list[str] | list[tuple[str, str]] | None = None,
         now: float | None = None,
-        recheck_seconds: float = 24 * 3600,
+    ) -> list[tuple[str, str]]:
+        """Возвращает уникальные маршруты: популярные за 30 дней + seed-маршруты в обе стороны."""
+        now_ts = time.time() if now is None else float(now)
+        routes: list[tuple[str, str]] = []
+        seen = set()
+
+        if top_routes > 0:
+            try:
+                pop_routes = self.popular_routes(limit=top_routes, days=30, now=now_ts)
+            except Exception:
+                pop_routes = []
+            for orig, dest, _ in pop_routes:
+                pair = (orig.upper(), dest.upper())
+                if pair not in seen:
+                    seen.add(pair)
+                    routes.append(pair)
+
+        seeds = parse_seed_routes(seed_routes)
+        for pair in seeds:
+            if pair not in seen:
+                seen.add(pair)
+                routes.append(pair)
+
+        return routes
+
+    def sync_bg_slots(
+        self,
+        today: date | datetime | str | None = None,
         top_routes: int = 12,
         seed_routes: list[str] | list[tuple[str, str]] | None = None,
         horizons_days: list[int] | None = None,
         slots: dict[tuple[str, str, int], date] | None = None,
-    ) -> list[Query]:
-        """Кандидаты для фонового сбора по фиксированным слотам (маршрут, горизонт)."""
-        if limit <= 0:
-            return []
-
+        now: float | None = None,
+    ) -> list[tuple[str, str, date]]:
+        """Синхронизирует слоты в БД и возвращает список активных пар (orig, dest, depart_date)."""
         now_ts = time.time() if now is None else float(now)
         if today is None:
             today_date = datetime.fromtimestamp(now_ts).date() if now is not None else date.today()
@@ -960,66 +1081,79 @@ class PriceHistory:
         else:
             horizons = [int(h) for h in horizons_days]
 
-        # 1. Топ-N популярных направлений за 30 дней
-        pop_routes = self.popular_routes(limit=top_routes, days=30, now=now_ts) if top_routes > 0 else []
-        routes: list[tuple[str, str]] = []
-        seen_routes: set[tuple[str, str]] = set()
-
-        for orig, dest, _ in pop_routes:
-            r = (orig.upper(), dest.upper())
-            if r not in seen_routes:
-                seen_routes.add(r)
-                routes.append(r)
-
-        # 2. Seed-маршруты из параметров/конфига (в обе стороны)
-        if seed_routes is None:
-            raw_seeds = ["MOW-LED", "MOW-AER", "MOW-KUF", "MOW-OVB", "MOW-SVX", "MOW-KZN"]
-        else:
-            raw_seeds = seed_routes
-
-        for item in raw_seeds:
-            if isinstance(item, str):
-                for part in item.split(","):
-                    part = part.strip()
-                    if "-" in part:
-                        o, d = part.split("-", 1)
-                        o, d = o.strip().upper(), d.strip().upper()
-                        if o and d:
-                            for r in [(o, d), (d, o)]:
-                                if r not in seen_routes:
-                                    seen_routes.add(r)
-                                    routes.append(r)
-            elif isinstance(item, (list, tuple)) and len(item) == 2:
-                o, d = str(item[0]).strip().upper(), str(item[1]).strip().upper()
-                if o and d:
-                    for r in [(o, d), (d, o)]:
-                        if r not in seen_routes:
-                            seen_routes.add(r)
-                            routes.append(r)
-
+        routes = self.get_bg_routes(top_routes=top_routes, seed_routes=seed_routes, now=now_ts)
         if not routes:
             return []
 
-        # 3. Слоты (маршрут, горизонт) -> фиксированная дата вылета
-        use_db_slots = False
-        if slots is None:
-            slots = self.get_bg_slots()
-            use_db_slots = True
+        # Загружаем существующие слоты из БД
+        db_slots = self.get_bg_slots()
 
-        active_pairs: set[tuple[str, str, date]] = set()
+        # Если передан внешний словарь слотов, синхронизируем с ним
+        target_slots = slots if slots is not None else {}
+        for k, v in db_slots.items():
+            if k not in target_slots:
+                target_slots[k] = v
+
+        active_pairs: list[tuple[str, str, date]] = []
+        seen_pairs: set[tuple[str, str, date]] = set()
+
         for orig, dest in routes:
             for h in horizons:
                 key = (orig, dest, h)
-                cur_date = slots.get(key)
+                cur_date = target_slots.get(key)
                 if cur_date is None or cur_date < today_date:
                     cur_date = today_date + timedelta(days=h)
-                    slots[key] = cur_date
-                    if use_db_slots:
-                        try:
-                            self.set_bg_slot(orig, dest, h, cur_date)
-                        except Exception:
-                            pass
-                active_pairs.add((orig, dest, cur_date))
+                    target_slots[key] = cur_date
+                    try:
+                        self.set_bg_slot(orig, dest, h, cur_date)
+                    except Exception:
+                        pass
+                elif key not in db_slots:
+                    try:
+                        self.set_bg_slot(orig, dest, h, cur_date)
+                    except Exception:
+                        pass
+                pair = (orig, dest, cur_date)
+                if pair not in seen_pairs:
+                    seen_pairs.add(pair)
+                    active_pairs.append(pair)
+
+        return active_pairs
+
+    def collect_slot_candidates(
+        self,
+        limit: int = 5,
+        today: date | datetime | str | None = None,
+        now: float | None = None,
+        recheck_seconds: float = 24 * 3600,
+        top_routes: int = 12,
+        seed_routes: list[str] | list[tuple[str, str]] | None = None,
+        horizons_days: list[int] | None = None,
+        slots: dict[tuple[str, str, int], date] | None = None,
+        last_checked: dict[tuple[str, str, date], float] | None = None,
+    ) -> list[Query]:
+        """Кандидаты для фонового сбора по фиксированным слотам (маршрут, горизонт)."""
+        if limit <= 0:
+            return []
+
+        now_ts = time.time() if now is None else float(now)
+        if today is None:
+            today_date = datetime.fromtimestamp(now_ts).date() if now is not None else date.today()
+        else:
+            today_date = _normalize_date(today)
+            if today_date is None:
+                today_date = date.today()
+
+        active_pairs = self.sync_bg_slots(
+            today=today_date,
+            top_routes=top_routes,
+            seed_routes=seed_routes,
+            horizons_days=horizons_days,
+            slots=slots,
+            now=now_ts,
+        )
+        if not active_pairs:
+            return []
 
         # 4. Проверяем историю: когда пара проверялась в последний раз (в одну сторону)
         with self._connect() as db:
@@ -1034,13 +1168,28 @@ class PriceHistory:
         last_seen_map: dict[tuple[str, str, date], float] = {}
         for o, d, dep, obs in rows:
             dep_d = _normalize_date(dep)
-            if dep_d:
-                last_seen_map[(o, d, dep_d)] = float(obs)
+            if dep_d and obs is not None:
+                last_seen_map[(o.upper(), d.upper(), dep_d)] = max(
+                    last_seen_map.get((o.upper(), d.upper(), dep_d), 0.0),
+                    float(obs),
+                )
+
+        # Учитываем проверки слотов без найденных рейсов (из таблицы слотов)
+        slot_checks = self.get_bg_slot_last_checks()
+        for key, ts in slot_checks.items():
+            last_seen_map[key] = max(last_seen_map.get(key, 0.0), float(ts))
+
+        # Учитываем проверки из локального кэша попыток (если передан)
+        if last_checked:
+            for (o, d, dep_d), ts in last_checked.items():
+                if ts is not None:
+                    k = (o.upper(), d.upper(), dep_d)
+                    last_seen_map[k] = max(last_seen_map.get(k, 0.0), float(ts))
 
         # 5. Фильтрация по recheck_seconds и формирование кандидатов
         candidates: list[dict] = []
         for orig, dest, dep_date in active_pairs:
-            obs_at = last_seen_map.get((orig, dest, dep_date), 0.0)
+            obs_at = last_seen_map.get((orig.upper(), dest.upper(), dep_date), 0.0)
             if obs_at > 0.0 and (now_ts - obs_at) < float(recheck_seconds):
                 continue
             candidates.append({
