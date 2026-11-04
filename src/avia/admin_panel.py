@@ -159,7 +159,16 @@ def build_overview(ctx: dict[str, Any]) -> str:
 
     s_today = ctx.get("searches_today", 0)
     bg_info = ctx.get("bg_searches", "выключен")
-    lines.append(f"Поисков сегодня: людей — {s_today}, фоновых — {bg_info}")
+    lines.append(f"Поисков сегодня: людей — {s_today}, фоновых — {escape(str(bg_info))}")
+
+    bg_pairs = ctx.get("bg_active_pairs", ctx.get("bg_pairs"))
+    bg_routes = ctx.get("bg_routes", ctx.get("bg_distinct_routes"))
+    if bg_pairs is not None and bg_routes is not None and str(bg_info) != "выключен":
+        lines.append(
+            f"Фоновый сбор: {escape(str(bg_pairs))} активных пар (маршрут+дата) · "
+            f"{escape(str(bg_routes))} маршрутов · "
+            f"{escape(str(bg_info))} сделано сегодня"
+        )
 
     active_subs = ctx.get("active_subs", 0)
     lines.append(f"Активных подписок: {active_subs}")
@@ -457,6 +466,18 @@ def build_tickets(ctx: dict[str, Any]) -> str:
     if fc is not None or "forecast" in ctx:
         lines.append("")
         lines.extend(format_forecast_block(fc))
+
+    bg_pairs = ctx.get("bg_active_pairs", ctx.get("bg_pairs"))
+    bg_routes = ctx.get("bg_routes", ctx.get("bg_distinct_routes"))
+    bg_done = ctx.get("bg_done", ctx.get("bg_searches"))
+    if bg_pairs is not None and bg_routes is not None and bg_done and str(bg_done) != "выключен":
+        lines.append("")
+        lines.append("<b>Фоновый сбор:</b>")
+        lines.append(
+            f"• Активных пар (маршрут+дата): {escape(str(bg_pairs))}\n"
+            f"• Различных маршрутов: {escape(str(bg_routes))}\n"
+            f"• Сделано сегодня: {escape(str(bg_done))}"
+        )
 
     return truncate_text("\n".join(lines))
 

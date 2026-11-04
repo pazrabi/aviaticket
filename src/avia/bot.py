@@ -711,9 +711,13 @@ class Bot:
         st = self.users.stats() if self.users else {}
         s_user = st.get("today", 0)
 
+        bg_pairs = None
+        bg_routes = None
         if self.s.bg_collect:
             done = self.bg_collector.done_today if self.bg_collector else 0
             bg_info = f"{done} из {self.s.bg_collect_max_per_day}"
+            bg_pairs = self.bg_collector.active_pairs_count if self.bg_collector else 0
+            bg_routes = self.bg_collector.distinct_routes_count if self.bg_collector else 0
         else:
             bg_info = "выключен"
 
@@ -750,6 +754,8 @@ class Bot:
             "users_new_24h": u_new,
             "searches_today": s_user,
             "bg_searches": bg_info,
+            "bg_active_pairs": bg_pairs,
+            "bg_routes": bg_routes,
             "active_subs": active_subs,
             "busy_searches": busy_cnt,
             "last_backup_at": last_b,
@@ -870,6 +876,15 @@ class Bot:
         sites = self.history.site_share(days=7, now=now) if self.history else []
         fc = self._collect_forecast_data().get("forecast")
 
+        bg_pairs = None
+        bg_routes = None
+        bg_done = None
+        if self.s.bg_collect:
+            done = self.bg_collector.done_today if self.bg_collector else 0
+            bg_done = f"{done} из {self.s.bg_collect_max_per_day}"
+            bg_pairs = self.bg_collector.active_pairs_count if self.bg_collector else 0
+            bg_routes = self.bg_collector.distinct_routes_count if self.bg_collector else 0
+
         return {
             "routes_count": t_overview.get("routes_count", 0),
             "searches_count": t_overview.get("searches_count", 0),
@@ -883,6 +898,9 @@ class Bot:
             },
             "site_share": sites,
             "forecast": fc,
+            "bg_active_pairs": bg_pairs,
+            "bg_routes": bg_routes,
+            "bg_done": bg_done,
         }
 
     def _collect_forecast_data(self) -> dict[str, Any]:

@@ -26,8 +26,8 @@ def _make_settings(**kwargs) -> Settings:
         "tg_allowed_ids": {1},
         "bg_collect": True,
         "bg_collect_interval_minutes": 20,
-        "bg_collect_max_per_day": 48,
-        "bg_collect_recheck_hours": 6,
+        "bg_collect_max_per_day": 120,
+        "bg_collect_recheck_hours": 24,
     }
     defaults.update(kwargs)
     return Settings(**defaults)
@@ -39,14 +39,20 @@ def test_settings_bg_collect_defaults_and_env(monkeypatch):
     s_def = Settings(sites=[])
     assert s_def.bg_collect is False
     assert s_def.bg_collect_interval_minutes == 20
-    assert s_def.bg_collect_max_per_day == 48
-    assert s_def.bg_collect_recheck_hours == 6
+    assert s_def.bg_collect_max_per_day == 120
+    assert s_def.bg_collect_recheck_hours == 24
+    assert s_def.bg_collect_top_routes == 12
+    assert "MOW-LED" in s_def.bg_collect_seed_routes
+    assert s_def.bg_collect_horizons_days == [7, 14, 28, 56, 90]
 
     # 2. Через load_settings с заданными переменными окружения
     monkeypatch.setenv("BG_COLLECT", "1")
     monkeypatch.setenv("BG_COLLECT_INTERVAL_MIN", "15")
     monkeypatch.setenv("BG_COLLECT_MAX_PER_DAY", "100")
     monkeypatch.setenv("BG_COLLECT_RECHECK_HOURS", "8")
+    monkeypatch.setenv("BG_COLLECT_TOP_ROUTES", "15")
+    monkeypatch.setenv("BG_COLLECT_SEED_ROUTES", "MOW-LED,KUF-EVN")
+    monkeypatch.setenv("BG_COLLECT_HORIZONS_DAYS", "3,10,30")
     monkeypatch.setenv("TG_BOT_TOKEN", "dummy_token")
     monkeypatch.setenv("TG_ALLOWED_IDS", "123")
 
@@ -55,6 +61,14 @@ def test_settings_bg_collect_defaults_and_env(monkeypatch):
     assert s.bg_collect_interval_minutes == 15
     assert s.bg_collect_max_per_day == 100
     assert s.bg_collect_recheck_hours == 8
+    assert s.bg_collect_top_routes == 15
+    assert s.bg_collect_seed_routes == ["MOW-LED", "KUF-EVN"]
+    assert s.bg_collect_horizons_days == [3, 10, 30]
+
+    # Проверка пустого BG_COLLECT_SEED_ROUTES
+    monkeypatch.setenv("BG_COLLECT_SEED_ROUTES", "")
+    s_empty = load_settings()
+    assert s_empty.bg_collect_seed_routes == []
 
 
 @pytest.mark.asyncio

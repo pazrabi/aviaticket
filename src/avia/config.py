@@ -66,8 +66,15 @@ class Settings:
     max_parallel_searches: int = 2  # одновременных поисков во всём боте (телефоны одни на всех)
     bg_collect: bool = False       # фоновый сбор цен по популярным маршрутам
     bg_collect_interval_minutes: int = 20  # интервал между фоновыми поисками (мин)
-    bg_collect_max_per_day: int = 48       # максимум фоновых поисков в сутки
-    bg_collect_recheck_hours: int = 6      # минимальная пауза повтора маршрута (ч)
+    bg_collect_max_per_day: int = 120      # максимум фоновых поисков в сутки
+    bg_collect_recheck_hours: int = 24     # минимальная пауза повтора маршрута (ч)
+    bg_collect_top_routes: int = 12        # число популярных маршрутов из истории
+    bg_collect_seed_routes: list[str] = field(
+        default_factory=lambda: ["MOW-LED", "MOW-AER", "MOW-KUF", "MOW-OVB", "MOW-SVX", "MOW-KZN"]
+    )
+    bg_collect_horizons_days: list[int] = field(
+        default_factory=lambda: [7, 14, 28, 56, 90]
+    )
     backup_dir: Path | None = None
     backup_keep: int = 14
     backup_hour: int = 4
@@ -102,6 +109,18 @@ def load_settings(path: Path | None = None) -> Settings:
     droidhub_devices = [
         x.strip() for x in os.getenv("DROIDHUB_DEVICES", "").split(",") if x.strip()
     ]
+    env_seed = os.getenv("BG_COLLECT_SEED_ROUTES")
+    if env_seed is not None:
+        bg_seed_routes = [x.strip() for x in env_seed.split(",") if x.strip()]
+    else:
+        bg_seed_routes = ["MOW-LED", "MOW-AER", "MOW-KUF", "MOW-OVB", "MOW-SVX", "MOW-KZN"]
+
+    env_horizons = os.getenv("BG_COLLECT_HORIZONS_DAYS")
+    if env_horizons is not None:
+        bg_horizons = [int(x.strip()) for x in env_horizons.split(",") if x.strip()]
+    else:
+        bg_horizons = [7, 14, 28, 56, 90]
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -127,8 +146,11 @@ def load_settings(path: Path | None = None) -> Settings:
         max_parallel_searches=max(1, int(os.getenv("MAX_PARALLEL_SEARCHES", "2"))),
         bg_collect=os.getenv("BG_COLLECT", "0") == "1",
         bg_collect_interval_minutes=int(os.getenv("BG_COLLECT_INTERVAL_MIN", "20")),
-        bg_collect_max_per_day=int(os.getenv("BG_COLLECT_MAX_PER_DAY", "48")),
-        bg_collect_recheck_hours=int(os.getenv("BG_COLLECT_RECHECK_HOURS", "6")),
+        bg_collect_max_per_day=int(os.getenv("BG_COLLECT_MAX_PER_DAY", "120")),
+        bg_collect_recheck_hours=int(os.getenv("BG_COLLECT_RECHECK_HOURS", "24")),
+        bg_collect_top_routes=int(os.getenv("BG_COLLECT_TOP_ROUTES", "12")),
+        bg_collect_seed_routes=bg_seed_routes,
+        bg_collect_horizons_days=bg_horizons,
         backup_dir=Path(os.environ["BACKUP_DIR"]) if os.getenv("BACKUP_DIR") else None,
         backup_keep=int(os.getenv("BACKUP_KEEP", "14")),
         backup_hour=int(os.getenv("BACKUP_HOUR", "4")),
