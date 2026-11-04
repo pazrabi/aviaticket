@@ -472,3 +472,60 @@ def test_dialog_number_on_step_is_not_offer_number():
     assert dialog.sessions[chat_id].step == Step.DATE
     assert "⚠️" in rep[0].text
     assert "site1" not in rep[0].text
+
+
+def test_dialog_search_finished():
+    """search_finished переводит SEARCHING в DONE, но не трогает чужой диалог."""
+    dialog = make_dialog()
+    chat_id = 999
+
+    # Нет сессии -> None
+    assert dialog.search_finished(chat_id, "d1") is None
+
+    # Сессия с dialog_id "d1" в шаге SEARCHING
+    dialog.sessions[chat_id] = Session(step=Step.SEARCHING, dialog_id="d1")
+
+    # dialog_id не совпадает -> None, сессия не меняется
+    assert dialog.search_finished(chat_id, "d2") is None
+    assert dialog.sessions[chat_id].step == Step.SEARCHING
+
+    # dialog_id совпадает -> переводит в DONE
+    res = dialog.search_finished(chat_id, "d1")
+    assert res is not None
+    assert res.step == Step.DONE
+    assert dialog.sessions[chat_id].step == Step.DONE
+
+    # dialog_id is None -> также переводит в DONE
+    dialog.sessions[chat_id] = Session(step=Step.SEARCHING, dialog_id="d3")
+    res2 = dialog.search_finished(chat_id, None)
+    assert res2 is not None
+    assert res2.step == Step.DONE
+
+
+def test_dialog_search_request_has_dialog_id():
+    """Все 3 точки создания SearchRequest записывают dialog_id."""
+    dialog = make_dialog()
+    chat_id = 888
+
+    # 1. /price
+    res = dialog.on_text(chat_id, "/price MOW ALA 10.12")
+    assert len(res) == 1
+    req = res[0]
+    assert isinstance(req, SearchRequest)
+    assert req.dialog_id is not None
+    assert dialog.sessions[chat_id].dialog_id == req.dialog_id
+    assert dialog.sessions[chat_id].step == Step.SEARCHING
+
+    # 2. Выбор багажа в диалоге
+    dialog.on_callback(chat_id, "menu:go")
+    dialog.on_text(chat_id, "MOW")
+    dialog.on_text(chat_id, "ALA")
+    dialog.on_text(chat_id, "10.12")
+    dialog.on_callback(chat_id, f"trip:{dialog.sessions[chat_id].dialog_id}:ow")
+    d_id = dialog.sessions[chat_id].dialog_id
+    res_bag = dialog.on_callback(chat_id, f"bag:{d_id}:any")
+    assert len(res_bag) == 1
+    req_bag = res_bag[0]
+    assert isinstance(req_bag, SearchRequest)
+    assert req_bag.dialog_id == d_id
+    assert dialog.sessions[chat_id].step == Step.SEARCHING

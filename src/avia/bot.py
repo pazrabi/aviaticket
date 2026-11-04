@@ -314,24 +314,54 @@ class Bot:
             log.exception("history chart failed")
             await self.send(chat_id, "Не удалось построить график")
 
+    def _session_after_search(self, chat_id: int, req: SearchRequest) -> str:
+        """Обновляет шаг сессии после поиска и возвращает dialog_id для кнопок выдачи."""
+        session = self.dialog.search_finished(chat_id, req.dialog_id)
+        if session is not None:
+            return session.dialog_id
+        if self.dialog.sessions.get(chat_id) is not None:
+            return req.dialog_id or secrets.token_hex(2)
+        d_id = req.dialog_id or secrets.token_hex(2)
+        session = Session(
+            step=Step.DONE,
+            origin=req.query.origin,
+            destination=req.query.destination,
+            depart=req.query.depart,
+            return_date=req.query.return_date,
+            adults=req.query.adults,
+            baggage_mode=req.baggage_mode,
+            criteria=req.criteria,
+            dialog_id=d_id,
+        )
+        self.dialog.sessions[chat_id] = session
+        return session.dialog_id
+
     async def _run_search(self, chat_id: int, req: SearchRequest):
         if chat_id in self.busy:
+            self.dialog.search_finished(chat_id, req.dialog_id)
             await self.send(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите.")
             return
+        charged = chat_id not in self.s.tg_allowed_ids
         if (
-            chat_id not in self.s.tg_allowed_ids
+            charged
             and not self.users.try_use_search(chat_id, self.s.daily_search_limit)
         ):
+            self.dialog.search_finished(chat_id, req.dialog_id)
+            kb = [[("🔔 Мои отслеживания", "menu:track")]]
             await self.send(
                 chat_id,
                 f"😴 На сегодня лимит поисков исчерпан ({self.s.daily_search_limit}). Завтра можно снова, "
                 "отслеживания продолжают работать.",
+                reply_markup=to_reply_markup(kb),
             )
             return
         self.busy.add(chat_id)
         q = req.query
         baggage_mode = req.baggage_mode
         wait_msg_id = None
+        search_failed = False
+        any_site_ok = False
+        delivered_chunks = 0
         try:
             wait_msg = await self.send(
                 chat_id,
@@ -355,6 +385,7 @@ class Bot:
                 self._active_searches -= 1
             self._record_metrics("user", results)
             results = assign_ids(results)
+            any_site_ok = any(r.ok for r in results)
             try:
                 await asyncio.to_thread(self.history.annotate, q, results)
             except Exception:
@@ -370,32 +401,11 @@ class Bot:
                 dropped_criteria=dropped_criteria,
             )
 
-            session = self.dialog.sessions.get(chat_id)
-            if session is None or not session.dialog_id:
-                session = Session(
-                    step=Step.DONE,
-                    origin=q.origin,
-                    destination=q.destination,
-                    depart=q.depart,
-                    return_date=q.return_date,
-                    adults=q.adults,
-                    baggage_mode=baggage_mode,
-                    criteria=req.criteria,
-                    dialog_id=secrets.token_hex(2),
-                )
-                self.dialog.sessions[chat_id] = session
-            else:
-                session.step = Step.DONE
-
-            d_id = session.dialog_id
+            d_id = self._session_after_search(chat_id, req)
             shown_ids = {o.offer_id for o in flat if o.offer_id}
             has_more = any(o.offer_id not in shown_ids for o in pool)
             kb = compact_keyboard(d_id, has_more=has_more)
             reply_markup = to_reply_markup(kb)
-
-            for i, chunk in enumerate(chunks):
-                rm = reply_markup if i == len(chunks) - 1 else None
-                await self.send(chat_id, chunk, reply_markup=rm)
 
             self.store.put(
                 chat_id,
@@ -410,11 +420,28 @@ class Bot:
                 dropped_baggage=dropped_baggage,
                 dropped_criteria=dropped_criteria,
             )
+
+            for i, chunk in enumerate(chunks):
+                rm = reply_markup if i == len(chunks) - 1 else None
+                await self.send(chat_id, chunk, reply_markup=rm)
+                delivered_chunks += 1
         except Exception as e:
             log.exception("search failed")
-            await self.send(chat_id, f"⚠️ {escape(friendly_error(e))}")
+            if delivered_chunks == 0:
+                search_failed = True
+            self.dialog.search_finished(chat_id, req.dialog_id)
+            err_kb = to_reply_markup([[("🔎 Найти билет", "menu:go")]])
+            try:
+                await self.send(chat_id, f"⚠️ {escape(friendly_error(e))}", reply_markup=err_kb)
+            except Exception:
+                log.exception("не удалось отправить сообщение об ошибке")
         finally:
             self.busy.discard(chat_id)
+            if charged and (search_failed or not any_site_ok or delivered_chunks == 0):
+                try:
+                    self.users.refund_search(chat_id)
+                except Exception:
+                    log.exception("не удалось вернуть попытку поиска")
             if wait_msg_id is not None:
                 try:
                     await self.call("deleteMessage", chat_id=chat_id, message_id=wait_msg_id)
@@ -1012,11 +1039,15 @@ class Bot:
                     answer_text = item.answer
                     break
 
-            if answer_text:
-                await self.call("answerCallbackQuery", callback_query_id=cq_id, text=answer_text)
-            else:
-                await self.call("answerCallbackQuery", callback_query_id=cq_id)
-            answered = True
+            try:
+                if answer_text:
+                    await self.call("answerCallbackQuery", callback_query_id=cq_id, text=answer_text)
+                else:
+                    await self.call("answerCallbackQuery", callback_query_id=cq_id)
+                answered = True
+            except Exception as e:
+                log.warning("answerCallbackQuery failed: %s", e)
+                answered = True
 
             await self._process_actions(chat_id, actions, message_id=message_id)
         finally:
