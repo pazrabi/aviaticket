@@ -219,3 +219,18 @@ def test_bot_backup_now_and_last_backup_at(tmp_path):
     assert len(created) == 1
     assert bot.last_backup_at is not None
     assert bot.last_backup_at > 0
+
+
+def test_backup_works_when_state_dir_path_contains_profiles_or_backups(tmp_path):
+    """Имена каталогов «profiles»/«backups» в пути к state не должны отключать бэкап."""
+    import sqlite3
+
+    from avia.backup import backup_all
+
+    state = tmp_path / "profiles" / "backups" / "state"
+    state.mkdir(parents=True)
+    with sqlite3.connect(state / "users.sqlite") as db:
+        db.execute("create table t (x)")
+        db.execute("insert into t values (1)")
+    made = backup_all(state, tmp_path / "out", keep=3)
+    assert len(made) == 1 and made[0].name.startswith("users-")

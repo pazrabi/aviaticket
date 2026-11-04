@@ -1,6 +1,7 @@
 """Ежедневные бэкапы баз данных SQLite и управление архивами."""
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import datetime
 import gzip
 import logging
@@ -55,7 +56,6 @@ def backup_all(
     sqlite_files = [
         f for f in sorted(state_path.iterdir())
         if f.is_file() and f.suffix == ".sqlite" and not f.name.startswith(".")
-        and "backups" not in f.parts and "profiles" not in f.parts
     ]
 
     for src_file in sqlite_files:
@@ -66,12 +66,12 @@ def backup_all(
         tmp_path = Path(tmp_file_name)
 
         try:
-            with sqlite3.connect(src_file) as src_conn:
-                with sqlite3.connect(tmp_path) as dst_conn:
+            with closing(sqlite3.connect(src_file)) as src_conn:
+                with closing(sqlite3.connect(tmp_path)) as dst_conn:
                     src_conn.backup(dst_conn)
 
             # 2. Проверка целостности PRAGMA integrity_check == 'ok'
-            with sqlite3.connect(tmp_path) as chk_conn:
+            with closing(sqlite3.connect(tmp_path)) as chk_conn:
                 row = chk_conn.execute("PRAGMA integrity_check").fetchone()
                 if not row or str(row[0]).lower() != "ok":
                     log.error("Целостность базы %s нарушена (integrity_check=%s), бэкап пропущен", src_file.name, row)
@@ -80,12 +80,19 @@ def backup_all(
             # 3. Сжатие в dest_dir/<имя>-YYYYMMDD-HHMM.sqlite.gz
             target_name = f"{base_name}-{ts_str}.sqlite.gz"
             target_file = dest_path / target_name
-            tmp_gz = dest_path / f".{target_name}.tmp"
-
-            with open(tmp_path, "rb") as f_in:
-                with gzip.open(tmp_gz, "wb") as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-            tmp_gz.replace(target_file)
+            # уникальное имя временного файла: параллельные бэкапы не затирают друг друга
+            with tempfile.NamedTemporaryFile(
+                dir=dest_path, prefix=f".{target_name}.", suffix=".tmp", delete=False
+            ) as tmp_out:
+                tmp_gz = Path(tmp_out.name)
+            try:
+                with open(tmp_path, "rb") as f_in:
+                    with gzip.open(tmp_gz, "wb") as f_out:
+                        shutil.copyfileobj(f_in, f_out)
+                tmp_gz.replace(target_file)
+            finally:
+                if tmp_gz.exists():
+                    tmp_gz.unlink(missing_ok=True)
 
             if now is not None:
                 mtime = dt.timestamp()
