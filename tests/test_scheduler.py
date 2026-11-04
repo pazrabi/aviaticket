@@ -498,13 +498,15 @@ def test_build_notification_text_and_markup():
     # Разметка
     markup = build_notification_markup(sub)
     assert "inline_keyboard" in markup
-    assert len(markup["inline_keyboard"]) == 2
+    assert len(markup["inline_keyboard"]) == 3
 
-    r1, r3 = markup["inline_keyboard"]
+    r1, r2, r3 = markup["inline_keyboard"]
     assert r1[0]["text"] == "🎯 Порог цены"
     assert r1[0]["callback_data"] == "thr:42"
     assert r1[1]["text"] == "🔕 Отписаться"
     assert r1[1]["callback_data"] == "unsub:42"
+    assert r2[0]["text"] == "📊 История"
+    assert r2[0]["callback_data"] == "hist:sub:42"
     assert r3[0]["text"] == "🔎 Новый поиск"
     assert r3[0]["callback_data"] == "menu:go"
 

@@ -7,6 +7,7 @@ import logging
 import time
 from typing import Any, Callable
 
+from . import analytics
 from .filters import apply_criteria
 from .formatting import date_ru, offer_card
 from .history import PriceHistory
@@ -23,6 +24,7 @@ def build_notification(
     offer: Offer,
     reasons: list[str],
     now: float | None = None,
+    extra_lines: list[str] | None = None,
 ) -> str:
     """Формирует HTML-текст уведомления об изменении цены по подписке."""
     is_rise = bool(reasons) and all(r.startswith("подорожала") for r in reasons)
@@ -42,14 +44,19 @@ def build_notification(
     lines.append(f"{'⚠️' if is_rise else '📈'} Причина: {'; '.join(escape(r) for r in reasons)}")
     lines.append("")
     lines.extend(offer_card(offer, q, number=1, baggage_mode=getattr(sub, "baggage_mode", "any"))[1:])
-    if is_rise:
-        lines.append("")
-        lines.append("Если планируете лететь, возможно, стоит не откладывать покупку.")
 
     if sub.criteria:
         desc = sub.criteria.describe()
         if desc:
             lines.append(f"⚙️ {', '.join(escape(d) for d in desc)}")
+
+    if extra_lines:
+        lines.append("")
+        lines.extend(extra_lines)
+
+    if is_rise:
+        lines.append("")
+        lines.append("Если планируете лететь, возможно, стоит не откладывать покупку.")
 
     text = "\n".join(lines)
     if len(text) > 4096:
@@ -65,6 +72,7 @@ def build_notification_markup(sub: Subscription) -> dict[str, Any]:
                 {"text": "🎯 Порог цены", "callback_data": f"thr:{sub.id}"},
                 {"text": "🔕 Отписаться", "callback_data": f"unsub:{sub.id}"},
             ],
+            [{"text": "📊 История", "callback_data": f"hist:sub:{sub.id}"}],
             [{"text": "🔎 Новый поиск", "callback_data": "menu:go"}],
         ]
     }
@@ -141,16 +149,34 @@ class Scheduler:
                         best = min(candidates, key=lambda o: o.price)
 
                         now = self.clock()
-                        recent = self.store.recent_prices(
-                            sub.id, now - self.rules.median_window_seconds
-                        )
+                        recent_prices: list[int] | None = None
+                        if self.history is not None:
+                            try:
+                                route_prices = await asyncio.to_thread(
+                                    self.history.route_search_minima,
+                                    sub_query,
+                                    now - self.rules.median_window_seconds,
+                                    now,
+                                )
+                                if len(route_prices) >= self.rules.median_min_points:
+                                    recent_prices = route_prices
+                            except Exception:
+                                log.exception(
+                                    "Ошибка истории цен маршрута для подписки %s", sub.id
+                                )
+
+                        if recent_prices is None:
+                            recent_prices = self.store.recent_prices(
+                                sub.id, now - self.rules.median_window_seconds
+                            )
+
                         ref = self.store.first_price(sub.id)
                         reasons = evaluate(
                             sub,
                             best.price,
                             best.offer_id,
                             now,
-                            recent,
+                            recent_prices,
                             self.rules,
                             reference_price=ref,
                         )
@@ -161,7 +187,27 @@ class Scheduler:
                         self.store.mark_checked(sub.id, now)
 
                         if reasons:
-                            text = build_notification(sub, best, reasons, now=now)
+                            extra_lines: list[str] | None = None
+                            if self.history is not None:
+                                try:
+                                    stats = await asyncio.to_thread(
+                                        self.history.route_stats, sub_query
+                                    )
+                                    site_stats = await asyncio.to_thread(
+                                        self.history.cheapest_site_stats, sub_query, now=now
+                                    )
+                                    extra = analytics.summary_lines(stats, site_stats)[:3]
+                                    if extra:
+                                        extra_lines = extra
+                                except Exception:
+                                    log.exception(
+                                        "Ошибка расчёта аналитики для подписки %s", sub.id
+                                    )
+                                    extra_lines = None
+
+                            text = build_notification(
+                                sub, best, reasons, now=now, extra_lines=extra_lines
+                            )
                             markup = build_notification_markup(sub)
                             try:
                                 await self.notify_fn(sub.chat_id, text, markup)
