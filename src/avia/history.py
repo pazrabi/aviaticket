@@ -526,3 +526,220 @@ class PriceHistory:
             return "down"
         else:
             return "flat"
+
+    def route_series(
+        self,
+        q: Query,
+        days: int = 30,
+        now: float | None = None,
+    ) -> list[tuple[float, int]]:
+        """Точки (timestamp, лучшая цена замера) для графика маршрута q за указанное число дней."""
+        if days <= 0:
+            return []
+        now_ts = time.time() if now is None else float(now)
+        since_ts = now_ts - days * 86400.0
+
+        depart_d = _normalize_date(q.depart)
+        depart_str = depart_d.isoformat() if depart_d else str(q.depart)
+        ret_d = _normalize_date(q.return_date)
+        ret_str = ret_d.isoformat() if ret_d else None
+        ret_daily = ret_str or ""
+
+        with self._connect() as db:
+            if ret_str is None:
+                cond_ret = "return_date IS NULL"
+                raw_rows = db.execute(
+                    "SELECT price, search_id, observed_at FROM price_history "
+                    f"WHERE origin = ? AND destination = ? AND depart = ? AND {cond_ret} AND adults = ? "
+                    "AND observed_at >= ? AND observed_at <= ? "
+                    "ORDER BY observed_at ASC",
+                    (q.origin, q.destination, depart_str, q.adults, since_ts, now_ts),
+                ).fetchall()
+            else:
+                cond_ret = "return_date = ?"
+                raw_rows = db.execute(
+                    "SELECT price, search_id, observed_at FROM price_history "
+                    f"WHERE origin = ? AND destination = ? AND depart = ? AND {cond_ret} AND adults = ? "
+                    "AND observed_at >= ? AND observed_at <= ? "
+                    "ORDER BY observed_at ASC",
+                    (q.origin, q.destination, depart_str, ret_str, q.adults, since_ts, now_ts),
+                ).fetchall()
+
+            daily_rows = db.execute(
+                "SELECT day, median_price FROM route_daily "
+                "WHERE origin = ? AND destination = ? AND depart = ? AND return_date = ? AND adults = ? "
+                "ORDER BY day ASC",
+                (q.origin, q.destination, depart_str, ret_daily, q.adults),
+            ).fetchall()
+
+        raw_searches_dict: dict[str, dict] = {}
+        for price, s_id, obs_at in raw_rows:
+            sample_key = str(s_id) if s_id else f"m_{round(obs_at / 60.0)}"
+            if sample_key not in raw_searches_dict:
+                raw_searches_dict[sample_key] = {"prices": [], "ts": obs_at}
+            raw_searches_dict[sample_key]["prices"].append(int(price))
+            raw_searches_dict[sample_key]["ts"] = min(raw_searches_dict[sample_key]["ts"], obs_at)
+
+        raw_samples: list[tuple[float, int, str]] = []
+        for s in raw_searches_dict.values():
+            best_p = min(s["prices"])
+            ts = float(s["ts"])
+            day_s = datetime.fromtimestamp(ts).date().isoformat()
+            raw_samples.append((ts, best_p, day_s))
+
+        raw_days = {s[2] for s in raw_samples}
+
+        older_samples: list[tuple[float, int]] = []
+        for day_val, med_p in daily_rows:
+            d_obj = date.fromisoformat(day_val)
+            day_ts = datetime.combine(d_obj, dt_time(12, 0)).timestamp()
+            if day_ts < since_ts or day_ts > now_ts:
+                continue
+            if day_val not in raw_days:
+                older_samples.append((day_ts, int(round(float(med_p)))))
+
+        combined: list[tuple[float, int]] = older_samples + [(s[0], s[1]) for s in raw_samples]
+        combined.sort(key=lambda x: x[0])
+        return combined
+
+    def route_search_minima(
+        self,
+        q: Query,
+        since_ts: float,
+        until_ts: float | None = None,
+    ) -> list[int]:
+        """Список лучших цен каждого замера для маршрута q за указанный период времени."""
+        depart_d = _normalize_date(q.depart)
+        depart_str = depart_d.isoformat() if depart_d else str(q.depart)
+        ret_d = _normalize_date(q.return_date)
+        ret_str = ret_d.isoformat() if ret_d else None
+
+        since_val = float(since_ts)
+        until_val = float(until_ts) if until_ts is not None else None
+
+        cond_ret = "return_date IS NULL" if ret_str is None else "return_date = ?"
+        sql = (
+            "SELECT price, search_id, observed_at FROM price_history "
+            f"WHERE origin = ? AND destination = ? AND depart = ? AND {cond_ret} AND adults = ? "
+            "AND observed_at >= ? "
+        )
+        params: list[object] = [q.origin, q.destination, depart_str]
+        if ret_str is not None:
+            params.append(ret_str)
+        params.extend([q.adults, since_val])
+
+        if until_val is not None:
+            sql += "AND observed_at <= ? "
+            params.append(until_val)
+
+        sql += "ORDER BY observed_at ASC"
+
+        with self._connect() as db:
+            rows = db.execute(sql, tuple(params)).fetchall()
+
+        searches: dict[str, dict] = {}
+        for price, s_id, obs_at in rows:
+            sample_key = str(s_id) if s_id else f"m_{round(obs_at / 60.0)}"
+            if sample_key not in searches:
+                searches[sample_key] = {"prices": [], "ts": obs_at}
+            searches[sample_key]["prices"].append(int(price))
+            searches[sample_key]["ts"] = min(searches[sample_key]["ts"], obs_at)
+
+        ordered = sorted(searches.values(), key=lambda s: s["ts"])
+        return [min(s["prices"]) for s in ordered]
+
+    def cheapest_site_stats(
+        self,
+        q: Query,
+        days: int = 30,
+        now: float | None = None,
+    ) -> list[tuple[str, int, int]]:
+        """По сайтам маршрута q: (site, число побед, число участий), сортировка по числу побед по убыванию."""
+        if days <= 0:
+            return []
+        now_ts = time.time() if now is None else float(now)
+        since_ts = now_ts - days * 86400.0
+
+        depart_d = _normalize_date(q.depart)
+        depart_str = depart_d.isoformat() if depart_d else str(q.depart)
+        ret_d = _normalize_date(q.return_date)
+        ret_str = ret_d.isoformat() if ret_d else None
+
+        cond_ret = "return_date IS NULL" if ret_str is None else "return_date = ?"
+        sql = (
+            "SELECT site, price, search_id, observed_at FROM price_history "
+            f"WHERE origin = ? AND destination = ? AND depart = ? AND {cond_ret} AND adults = ? "
+            "AND observed_at >= ? AND observed_at <= ? "
+            "ORDER BY observed_at ASC"
+        )
+        params: list[object] = [q.origin, q.destination, depart_str]
+        if ret_str is not None:
+            params.append(ret_str)
+        params.extend([q.adults, since_ts, now_ts])
+
+        with self._connect() as db:
+            rows = db.execute(sql, tuple(params)).fetchall()
+
+        searches: dict[str, dict[str, list[int]]] = {}
+        for site, price, s_id, obs_at in rows:
+            sample_key = str(s_id) if s_id else f"m_{round(obs_at / 60.0)}"
+            if sample_key not in searches:
+                searches[sample_key] = {}
+            if site not in searches[sample_key]:
+                searches[sample_key][site] = []
+            searches[sample_key][site].append(int(price))
+
+        wins: dict[str, int] = {}
+        participated: dict[str, int] = {}
+
+        for sample_key, site_prices in searches.items():
+            all_prices = [p for prices in site_prices.values() for p in prices]
+            if not all_prices:
+                continue
+            best_p = min(all_prices)
+
+            for site, prices in site_prices.items():
+                participated[site] = participated.get(site, 0) + 1
+                if min(prices) == best_p:
+                    wins[site] = wins.get(site, 0) + 1
+
+        stats = [
+            (site, wins.get(site, 0), participated[site])
+            for site in participated
+        ]
+        stats.sort(key=lambda x: (-x[1], -x[2], x[0]))
+        return stats
+
+    def popular_routes(
+        self,
+        limit: int = 10,
+        days: int = 7,
+        now: float | None = None,
+    ) -> list[tuple[str, str, int]]:
+        """Популярные направления за days дней: (origin, destination, число поисков) по убыванию."""
+        if limit <= 0 or days <= 0:
+            return []
+        now_ts = time.time() if now is None else float(now)
+        since_ts = now_ts - days * 86400.0
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT origin, destination, search_id, observed_at FROM price_history "
+                "WHERE observed_at >= ? AND observed_at <= ?",
+                (since_ts, now_ts),
+            ).fetchall()
+
+        route_samples: dict[tuple[str, str], set[str]] = {}
+        for origin, destination, s_id, obs_at in rows:
+            sample_key = str(s_id) if s_id else f"m_{round(obs_at / 60.0)}"
+            key = (origin, destination)
+            if key not in route_samples:
+                route_samples[key] = set()
+            route_samples[key].add(sample_key)
+
+        result = [
+            (orig, dest, len(samples))
+            for (orig, dest), samples in route_samples.items()
+        ]
+        result.sort(key=lambda x: (-x[2], x[0], x[1]))
+        return result[:limit]

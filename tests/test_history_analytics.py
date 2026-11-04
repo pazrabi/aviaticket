@@ -758,3 +758,189 @@ def test_rebuild_route_daily_accepts_datetime_and_str(tmp_path):
     h = PriceHistory(tmp_path / "h.sqlite")
     assert h.rebuild_route_daily(datetime(2026, 1, 1, 12, 0)) == 0
     assert h.rebuild_route_daily("2026-01-01") == 0
+
+
+def test_route_series_raw_and_daily_combination(tmp_path):
+    """route_series возвращает хронологические точки цен из raw и свёрнутых route_daily."""
+    h = PriceHistory(tmp_path / "h.sqlite")
+    base_dt = datetime(2026, 11, 20, 12, 0, 0)
+    now_ts = base_dt.timestamp()
+
+    # Вставляем старый день в route_daily (10 дней назад, 2026-11-10)
+    old_date = (base_dt - timedelta(days=10)).date().isoformat()
+    with sqlite3.connect(h.path) as db:
+        db.execute(
+            "INSERT INTO route_daily (origin, destination, depart, return_date, adults, day, min_price, p25_price, median_price, samples) "
+            "VALUES ('KUF', 'EVN', '2026-12-01', '', 1, ?, 9000, 9500.0, 10000.0, 5)",
+            (old_date,),
+        )
+
+    # Вставляем свежие замеры в price_history (сегодня и вчера)
+    # Замер 1: два предложения в одном search_id (12 000 и 11 000) -> минимум 11 000
+    h.annotate(
+        Q,
+        _make_res([
+            Offer(site="s1", price=12000, offer_id="o1"),
+            Offer(site="s2", price=11000, offer_id="o2"),
+        ]),
+        now=now_ts - 86400,
+        search_id="search_1",
+    )
+    # Замер 2: один билет на 10 500
+    h.annotate(
+        Q,
+        _make_res([Offer(site="s1", price=10500, offer_id="o3")]),
+        now=now_ts,
+        search_id="search_2",
+    )
+
+    series = h.route_series(Q, days=30, now=now_ts)
+    # Должно быть 3 точки: 1 из route_daily (медиана 10000), 2 из сырых (11000 и 10500)
+    assert len(series) == 3
+    # Проверяем хронологическую сортировку
+    assert series[0][1] == 10000  # день из route_daily
+    assert series[1][1] == 11000  # минимум search_1
+    assert series[2][1] == 10500  # минимум search_2
+    assert series[0][0] < series[1][0] < series[2][0]
+
+    # Если день есть в сырых записях, он не дублируется из route_daily
+    today_date = base_dt.date().isoformat()
+    with sqlite3.connect(h.path) as db:
+        db.execute(
+            "INSERT INTO route_daily (origin, destination, depart, return_date, adults, day, min_price, p25_price, median_price, samples) "
+            "VALUES ('KUF', 'EVN', '2026-12-01', '', 1, ?, 7000, 7000.0, 7000.0, 1)",
+            (today_date,),
+        )
+    series_dedup = h.route_series(Q, days=30, now=now_ts)
+    assert len(series_dedup) == 3
+
+
+def test_route_series_fallback_minute_grouping_and_roundtrip(tmp_path):
+    """route_series группирует записи без search_id по минуте и учитывает return_date."""
+    h = PriceHistory(tmp_path / "h.sqlite")
+    now_ts = 1700000000.0
+
+    # Записи без search_id в одну минуту
+    with sqlite3.connect(h.path) as db:
+        db.execute(
+            "INSERT INTO price_history (offer_id, site, origin, destination, depart, return_date, adults, price, currency, observed_at, search_id) "
+            "VALUES ('o1', 's1', 'KUF', 'EVN', '2026-12-01', '2026-12-10', 1, 20000, 'RUB', ?, NULL)",
+            (now_ts,),
+        )
+        db.execute(
+            "INSERT INTO price_history (offer_id, site, origin, destination, depart, return_date, adults, price, currency, observed_at, search_id) "
+            "VALUES ('o2', 's2', 'KUF', 'EVN', '2026-12-01', '2026-12-10', 1, 18500, 'RUB', ?, NULL)",
+            (now_ts + 3,),
+        )
+
+    # Для Q_ROUND должен найтись минимум 18 500
+    series = h.route_series(Q_ROUND, days=5, now=now_ts + 60)
+    assert len(series) == 1
+    assert series[0][1] == 18500
+
+    # Для Q (в одну сторону) записей быть не должно
+    assert h.route_series(Q, days=5, now=now_ts + 60) == []
+
+
+def test_route_search_minima(tmp_path):
+    """route_search_minima возвращает хронологический список минимумов за период."""
+    h = PriceHistory(tmp_path / "h.sqlite")
+    now_ts = 100000.0
+
+    # Добавляем 3 замера
+    h.annotate(Q, _make_res([Offer(site="s", price=15000, offer_id="o1")]), now=now_ts, search_id="s1")
+    h.annotate(
+        Q,
+        _make_res([Offer(site="s", price=14000, offer_id="o2"), Offer(site="s", price=13000, offer_id="o3")]),
+        now=now_ts + 1000,
+        search_id="s2",
+    )
+    h.annotate(Q, _make_res([Offer(site="s", price=16000, offer_id="o4")]), now=now_ts + 2000, search_id="s3")
+
+    # Полный период
+    minima = h.route_search_minima(Q, since_ts=now_ts - 100)
+    assert minima == [15000, 13000, 16000]
+
+    # С ограничением until_ts
+    minima_limited = h.route_search_minima(Q, since_ts=now_ts - 100, until_ts=now_ts + 1500)
+    assert minima_limited == [15000, 13000]
+
+
+def test_cheapest_site_stats(tmp_path):
+    """cheapest_site_stats подсчитывает число побед и участий каждого сайта по убыванию побед."""
+    h = PriceHistory(tmp_path / "h.sqlite")
+    now_ts = 200000.0
+
+    # Замер 1: aviasales 10000 (победа), kupibilet 10500, tutu 12000
+    h.annotate(
+        Q,
+        [
+            SiteResult(site="aviasales", ok=True, offers=[Offer(site="aviasales", price=10000, offer_id="o1")]),
+            SiteResult(site="kupibilet", ok=True, offers=[Offer(site="kupibilet", price=10500, offer_id="o2")]),
+            SiteResult(site="tutu", ok=True, offers=[Offer(site="tutu", price=12000, offer_id="o3")]),
+        ],
+        now=now_ts,
+        search_id="s1",
+    )
+
+    # Замер 2: aviasales 11000, kupibilet 9500 (победа)
+    h.annotate(
+        Q,
+        [
+            SiteResult(site="aviasales", ok=True, offers=[Offer(site="aviasales", price=11000, offer_id="o4")]),
+            SiteResult(site="kupibilet", ok=True, offers=[Offer(site="kupibilet", price=9500, offer_id="o5")]),
+        ],
+        now=now_ts + 300,
+        search_id="s2",
+    )
+
+    # Замер 3 (ничья): aviasales 9000 (победа), kupibilet 9000 (победа)
+    h.annotate(
+        Q,
+        [
+            SiteResult(site="aviasales", ok=True, offers=[Offer(site="aviasales", price=9000, offer_id="o6")]),
+            SiteResult(site="kupibilet", ok=True, offers=[Offer(site="kupibilet", price=9000, offer_id="o7")]),
+        ],
+        now=now_ts + 600,
+        search_id="s3",
+    )
+
+    stats = h.cheapest_site_stats(Q, days=7, now=now_ts + 1000)
+    # kupibilet: 2 победы из 3 замеров
+    # aviasales: 2 победы из 3 замеров
+    # tutu: 0 побед из 1 замера
+    assert len(stats) == 3
+    site_dict = {site: (wins, total) for site, wins, total in stats}
+    assert site_dict["kupibilet"] == (2, 3)
+    assert site_dict["aviasales"] == (2, 3)
+    assert site_dict["tutu"] == (0, 1)
+    # tutu должен быть последним (0 побед)
+    assert stats[-1][0] == "tutu"
+
+
+def test_popular_routes(tmp_path):
+    """popular_routes возвращает маршруты по числу различных замеров за период."""
+    h = PriceHistory(tmp_path / "h.sqlite")
+    now_ts = 500000.0
+
+    # Маршрут 1: KUF -> EVN (3 замера)
+    h.annotate(Query(origin="KUF", destination="EVN", depart=date(2026, 12, 1)), _make_res([Offer(site="s", price=10000, offer_id="o1")]), now=now_ts, search_id="sr1")
+    h.annotate(Query(origin="KUF", destination="EVN", depart=date(2026, 12, 1)), _make_res([Offer(site="s", price=10000, offer_id="o2")]), now=now_ts + 100, search_id="sr2")
+    h.annotate(Query(origin="KUF", destination="EVN", depart=date(2026, 12, 1)), _make_res([Offer(site="s", price=10000, offer_id="o3")]), now=now_ts + 200, search_id="sr3")
+
+    # Маршрут 2: MOW -> AER (2 замера, но во 2-м замере 2 билета - должен считаться за 1 замер)
+    h.annotate(Query(origin="MOW", destination="AER", depart=date(2026, 12, 5)), _make_res([Offer(site="s", price=5000, offer_id="o4")]), now=now_ts + 300, search_id="sr4")
+    h.annotate(
+        Query(origin="MOW", destination="AER", depart=date(2026, 12, 5)),
+        _make_res([Offer(site="s", price=4900, offer_id="o5"), Offer(site="s", price=5100, offer_id="o6")]),
+        now=now_ts + 400,
+        search_id="sr5",
+    )
+
+    # Маршрут 3: LED -> DXB (1 замер)
+    h.annotate(Query(origin="LED", destination="DXB", depart=date(2026, 12, 10)), _make_res([Offer(site="s", price=25000, offer_id="o7")]), now=now_ts + 500, search_id="sr6")
+
+    popular = h.popular_routes(limit=2, days=7, now=now_ts + 1000)
+    assert len(popular) == 2
+    assert popular[0] == ("KUF", "EVN", 3)
+    assert popular[1] == ("MOW", "AER", 2)
