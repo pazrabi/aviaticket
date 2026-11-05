@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from html import escape
@@ -28,10 +29,23 @@ DEFAULT_CONTROL_DESTINATION = "LED"
 DEFAULT_CONTROL_DAYS_AHEAD = 35
 
 # Таймауты
-MAX_OVERALL_CHECK_SECONDS = 900.0  # всего не более ~15 минут
+PASSES_PER_SITE = 5  # проходов на каждый сайт: сразу хватает замеров (speed_min_samples) для таблицы скоростей
+MIN_OK_SHARE = 0.4  # доля успешных проходов для вердикта «ок» (как порог ok_rate в таблице скоростей)
+MAX_OVERALL_CHECK_SECONDS = 2400.0  # всего не более ~40 минут
 
 # Словарь активных проверок: phone_id -> asyncio.Task (хранится только в памяти)
 _active_checks: dict[str, asyncio.Task] = {}
+
+
+class _BgMetrics:
+    """Обёртка над MetricsStore: пишет замер как фоновый (priority=1)."""
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+
+    def record_run(self, **kwargs: Any) -> Any:
+        kwargs["priority"] = 1
+        return self._store.record_run(**kwargs)
 
 
 def is_checking(phone_id: str) -> bool:
@@ -68,13 +82,14 @@ class PassResult:
 
 @dataclass
 class SiteCheckResult:
-    """Итог проверки одного сайта (2 прохода)."""
+    """Итог проверки одного сайта (PASSES_PER_SITE проходов + фоновые для сайтов с полным режимом)."""
     site_name: str
     passes: list[PassResult] = field(default_factory=list)
     verdict: str = "не ок"  # "ок" или "не ок"
     reason: str = ""        # 502, капча, пусто, неполно, цена расходится
     ref_price: float | None = None
     price_note: str = ""
+    bg_passes: list[PassResult] = field(default_factory=list)  # проходы в полном (фоновом) режиме
 
 
 @dataclass
@@ -280,12 +295,12 @@ def evaluate_site(
     passes: list[PassResult],
     ref_price: float | None = None,
 ) -> SiteCheckResult:
-    """Вычисляет вердикт по сайту на основе двух проходов."""
-    has_ok_pass = False
+    """Вердикт по сайту: «ок», если доля хороших проходов не ниже MIN_OK_SHARE."""
     price_note = ""
     if ref_price is None:
         price_note = "эталон отсутствует, сверка пропущена"
 
+    good = 0
     for p in passes:
         if not p.ok or p.captcha or p.offers_count == 0:
             continue
@@ -295,8 +310,8 @@ def evaluate_site(
             diff = abs(p.min_price - ref_price) / ref_price
             if diff > 0.15:
                 continue
-        has_ok_pass = True
-        break
+        good += 1
+    has_ok_pass = bool(passes) and good / len(passes) >= MIN_OK_SHARE
 
     if has_ok_pass:
         return SiteCheckResult(
@@ -342,6 +357,32 @@ def evaluate_site(
     )
 
 
+def _summarize_passes(title: str, passes: list[PassResult]) -> str:
+    """Одна строка по набору проходов: успехи, медиана времени, цена, причины сбоев."""
+    if not passes:
+        return f"• {title}: нет данных"
+    oks = [p for p in passes if p.ok and p.min_price is not None]
+    parts = [f"ок {len(oks)}/{len(passes)}"]
+    if oks:
+        times = sorted(p.elapsed for p in oks)
+        med = times[len(times) // 2]
+        prices = [p.min_price for p in oks if p.min_price is not None]
+        parts.append(f"медиана {med:.0f} с")
+        parts.append(f"цена от {min(prices):,} ₽".replace(",", " "))
+        parts.append(f"офферов до {max(p.offers_count for p in oks)}")
+        if not all(p.results_complete for p in oks):
+            parts.append("выдача неполная")
+    errs: dict[str, int] = {}
+    for p in passes:
+        if p.captcha:
+            errs["капча"] = errs.get("капча", 0) + 1
+        elif p.error and not p.ok:
+            errs[p.error] = errs.get(p.error, 0) + 1
+    if errs:
+        parts.append("сбои: " + ", ".join(f"{escape(k)}×{v}" for k, v in errs.items()))
+    return f"• {title}: " + ", ".join(parts)
+
+
 def format_phone_check_report(
     phone_name: str,
     phone_id: str,
@@ -360,18 +401,9 @@ def format_phone_check_report(
     for s_name, res in site_results.items():
         verdict_badge = "✅ <b>ок</b>" if res.verdict == "ок" else f"❌ <b>не ок ({escape(res.reason)})</b>"
         lines.append(f"<b>{escape(s_name)}:</b>")
-        for p in res.passes:
-            if p.ok and p.min_price is not None:
-                compl_str = "полная выдача" if p.results_complete else "неполная"
-                lines.append(
-                    f"• Проход {p.pass_num}: {p.elapsed:.1f} с, {p.min_price:,} ₽, {p.offers_count} офферов ({compl_str})".replace(",", " ")
-                )
-            elif p.captcha:
-                lines.append(f"• Проход {p.pass_num}: {p.elapsed:.1f} с, капча")
-            elif p.error:
-                lines.append(f"• Проход {p.pass_num}: {p.elapsed:.1f} с, ошибка: {escape(p.error)}")
-            else:
-                lines.append(f"• Проход {p.pass_num}: {p.elapsed:.1f} с, 0 офферов")
+        lines.append(_summarize_passes("проходы", res.passes))
+        if res.bg_passes:
+            lines.append(_summarize_passes("полный режим (фон)", res.bg_passes))
 
         if res.price_note:
             lines.append(f"• Сверка цен: {escape(res.price_note)}")
@@ -436,7 +468,7 @@ async def _do_run_phone_check(
 
     for s_idx, site in enumerate(phone_sites):
         passes: list[PassResult] = []
-        for p_num in (1, 2):
+        for p_num in range(1, PASSES_PER_SITE + 1):
             p_res = await run_site_pass(
                 settings=settings,
                 site=site,
@@ -446,13 +478,39 @@ async def _do_run_phone_check(
                 metrics=metrics_store,
             )
             passes.append(p_res)
+            # Телефон не отвечает: два первых прохода первого сайта подряд 502 — дальше не тратим время
+            if s_idx == 0 and p_num == 2 and all(p.error == "502" for p in passes):
+                break
+
+        bg_passes: list[PassResult] = []
+        if (
+            not (s_idx == 0 and len(passes) == 2 and all(p.error == "502" for p in passes))
+            and getattr(site, "phone_full_wait_seconds", None)
+        ):
+            # Полный режим (его используют подписки и фон): отдельные замеры класса «bg»
+            full_site = copy.copy(site)
+            full_site.phone_wait_seconds = site.phone_full_wait_seconds
+            full_site.phone_wait_for = getattr(site, "phone_full_wait_for", "") or ""
+            bg_metrics = _BgMetrics(metrics_store) if metrics_store is not None else None
+            for p_num in range(1, PASSES_PER_SITE + 1):
+                bg_passes.append(
+                    await run_site_pass(
+                        settings=settings,
+                        site=full_site,
+                        query=query,
+                        device_id=phone_id,
+                        pass_num=p_num,
+                        metrics=bg_metrics,
+                    )
+                )
 
         ref_price = get_reference_price(settings, site.name, query, exclude_device=phone_id)
         s_eval = evaluate_site(site.name, passes, ref_price=ref_price)
+        s_eval.bg_passes = bg_passes
         site_results[site.name] = s_eval
 
         # Проверка на неотвечающий телефон: если все проходы 502 за короткое время
-        if s_idx == 0 and all(p.error == "502" for p in passes):
+        if s_idx == 0 and passes and all(p.error == "502" for p in passes):
             unresponsive = True
             break
 
@@ -553,12 +611,12 @@ async def run_phone_check(
             timeout=MAX_OVERALL_CHECK_SECONDS,
         )
     except asyncio.TimeoutError:
-        logger.warning("Превышен общий таймаут проверки телефона %s (15 мин)", clean_id)
-        note = "Не допущен: превышен общий лимит времени (15 мин)"
+        logger.warning("Превышен общий таймаут проверки телефона %s (40 мин)", clean_id)
+        note = "Не допущен: превышен общий лимит времени (40 мин)"
         reg.set_note(clean_id, note)
         report_text = (
             f"📱 <b>Результаты проверки {escape(phone_name)}</b> (<code>{escape(clean_id)}</code>)\n\n"
-            f"❌ <b>Ошибка:</b> превышен общий лимит времени проверки (15 минут).\n"
+            f"❌ <b>Ошибка:</b> превышен общий лимит времени проверки (40 минут).\n"
             f"<b>Итог:</b> <b>не допущен:</b> таймаут"
         )
         if bot is not None:

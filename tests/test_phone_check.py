@@ -457,7 +457,7 @@ async def test_metrics_site_runs_recorded(tmp_path, monkeypatch):
             "SELECT source, site, device, priority, min_price FROM site_runs WHERE device = ?",
             ("dev_m",),
         ).fetchall()
-        assert len(rows) == 2  # 2 прохода
+        assert len(rows) == 5  # PASSES_PER_SITE проходов
         for r in rows:
             assert r[0] == "phone_check"
             assert r[1] == "s_metrics"
@@ -673,3 +673,54 @@ def test_site_runs_initial_schema_has_min_price(tmp_path):
         assert "priority" in cols
     finally:
         conn.close()
+
+
+# 13. Пять проходов на сайт, фоновые замеры полного режима, доля успехов
+@pytest.mark.asyncio
+async def test_five_passes_and_background_mode(tmp_path, monkeypatch):
+    from avia.metrics import MetricsStore
+
+    metrics_db = tmp_path / "metrics.sqlite"
+    metrics = MetricsStore(metrics_db)
+
+    site = SiteConfig(
+        name="s_full", url_template="https://sf", phone="auto", parser="p_full",
+        phone_wait_seconds=10, phone_full_wait_seconds=40, phone_full_wait_for="END",
+    )
+
+    def parser_full(snap, q):
+        return [Offer(site="s_full", price=5000)]
+
+    parser_full.results_complete = lambda snap: True
+    PARSERS["p_full"] = parser_full
+
+    reg = PhoneRegistry(tmp_path / "phones.json", phones_new_policy="check")
+    reg.register("dev_f", name="Dev F", status="new")
+    settings = Settings(sites=[site], storage_dir=tmp_path, phones=reg)
+
+    waits: list[int] = []
+
+    async def mock_snap(s, device_id, url, **kwargs):
+        waits.append(kwargs.get("wait_seconds"))
+        return Snapshot(url=url, text="OK", blocked=False), True
+
+    monkeypatch.setattr("avia.phone_check.fetch_page_snapshot", mock_snap)
+
+    report = await run_phone_check(settings, "dev_f", metrics=metrics)
+
+    assert waits == [10] * 5 + [40] * 5
+    assert report.site_results["s_full"].verdict == "ок"
+    with sqlite3.connect(metrics_db) as conn:
+        by_prio = dict(
+            conn.execute("SELECT priority, COUNT(*) FROM site_runs WHERE device = 'dev_f' GROUP BY priority").fetchall()
+        )
+    assert by_prio == {0: 5, 1: 5}
+    assert "ок 5/5" in report.message
+    assert "полный режим (фон)" in report.message
+
+
+def test_verdict_by_share_of_good_passes():
+    good = PassResult(pass_num=1, ok=True, offers_count=10, min_price=5000, results_complete=True)
+    bad = PassResult(pass_num=2, ok=False, error="502")
+    assert evaluate_site("s", [good, good, bad, bad, bad]).verdict == "ок"      # 2/5 = 0.4
+    assert evaluate_site("s", [good, bad, bad, bad, bad]).verdict == "не ок"    # 1/5
