@@ -460,5 +460,5 @@ def test_admin_panel_telephones_block_with_data_and_without_data():
     }
     txt_full = admin_panel.build_parse(ctx_with_devs, "24h")
     assert "realme: 10 запусков · ок 80% · неполных 1 · капч 1 · ср. запрос 3.4 с · ср. ожидание 0.5 с" in txt_full
-    assert "tutu × realme: 10 запусков · ок 80% · неполных 1 · капч 1 · ср. запрос 3.4 с · ср. ожидание 0.5 с" in txt_full
+    assert "tutu × realme: 10 · ок 80% · неполн. 1 · капч 1 · 3.4 с" in txt_full
     assert len(txt_full) <= 3800

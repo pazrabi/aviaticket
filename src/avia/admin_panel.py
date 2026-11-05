@@ -117,9 +117,19 @@ def make_section_keyboard(section: str, period: str = "24h") -> dict[str, Any]:
                     {"text": p24, "callback_data": "adm:parse:24h"},
                     {"text": p7, "callback_data": "adm:parse:7d"},
                 ],
+                [{"text": "🧭 Порядок телефонов", "callback_data": "adm:ord"}],
                 [
                     {"text": "◀ Назад", "callback_data": "adm:home"},
                     {"text": "🔄 Обновить", "callback_data": f"adm:parse:{period}"},
+                ],
+            ]
+        }
+    if section == "ord":
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "◀ К парсингу", "callback_data": "adm:parse:24h"},
+                    {"text": "🔄 Обновить", "callback_data": "adm:ord"},
                 ],
             ]
         }
@@ -334,15 +344,34 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
                 t = item.get("avg_fetch", 0.0)
                 w = item.get("avg_queue_wait", 0.0)
                 pair_line = (
-                    f"{escape(str(s_name))} × {escape(str(dev_name))}: {runs} запусков · "
-                    f"ок {pct}% · неполных {part} · капч {capt} · "
-                    f"ср. запрос {t:.1f} с · ср. ожидание {w:.1f} с"
+                    f"{escape(str(s_name))} × {escape(str(dev_name))}: {runs} · "
+                    f"ок {pct}% · неполн. {part} · капч {capt} · {t:.1f} с"
                 )
                 if len("\n".join(lines)) + len(pair_line) + 2 > 3700:
                     break
                 lines.append(pair_line)
 
     errors = ctx.get("recent_errors", [])
+    lines.append("")
+    lines.append("<b>Последние ошибки:</b>")
+    if errors:
+        for err in errors[:5]:
+            ts = err.get("ts", 0.0)
+            time_str = datetime.fromtimestamp(ts).strftime("%H:%M")
+            site_name = escape(str(err.get("site", "—")))
+            raw_err = str(err.get("error", "—"))
+            if len(raw_err) > 80:
+                raw_err = raw_err[:80] + "…"
+            lines.append(f"• {time_str} {site_name}: {escape(raw_err)}")
+    else:
+        lines.append("—")
+
+    return truncate_text("\n".join(lines))
+
+
+def build_phone_order(ctx: dict[str, Any]) -> str:
+    """Подраздел «Порядок телефонов» (вынесен из Парсинга, чтобы влезало в сообщение)."""
+    lines = ["🧭 <b>Порядок телефонов</b>"]
     # Блок: Порядок телефонов по каждому сайту
     settings = ctx.get("settings")
     if settings is None:
@@ -452,20 +481,8 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
         except Exception:
             pass
 
-    lines.append("")
-    lines.append("<b>Последние ошибки:</b>")
-    if errors:
-        for err in errors[:5]:
-            ts = err.get("ts", 0.0)
-            time_str = datetime.fromtimestamp(ts).strftime("%H:%M")
-            site_name = escape(str(err.get("site", "—")))
-            raw_err = str(err.get("error", "—"))
-            if len(raw_err) > 80:
-                raw_err = raw_err[:80] + "…"
-            lines.append(f"• {time_str} {site_name}: {escape(raw_err)}")
-    else:
-        lines.append("—")
-
+    if len(lines) == 1:
+        lines.append("Данных пока нет")
     return truncate_text("\n".join(lines))
 
 

@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from avia.admin_panel import build_parse
+from avia.admin_panel import build_parse, build_phone_order
 from avia.config import Settings, SiteConfig
 from avia.droidhub import PreferenceList, candidates
 from avia.metrics import MetricsStore
@@ -403,7 +403,7 @@ def test_admin_panel_phone_order_block(tmp_path):
         "recent_errors": [],
     }
 
-    text = build_parse(ctx, period="24h")
+    text = build_phone_order(ctx)
     assert "Порядок телефонов:" in text
     assert "as:" in text
     assert "люди: pixel (3.5 с · 100% · n=5)" in text
@@ -839,7 +839,7 @@ async def test_no_duplicate_failure_record_on_last_candidate(tmp_path, monkeypat
 
 def test_admin_panel_shows_hold_and_low_battery_badges(tmp_path):
     """В блоке 'Порядок телефонов' отображаются бейджи [заморозка] и [пониженная батарея] для отсеянных телефонов."""
-    from avia.admin_panel import build_parse
+    from avia.admin_panel import build_phone_order
     from avia.phones import PhoneRegistry
 
     db_path = tmp_path / "metrics.sqlite"
@@ -869,7 +869,7 @@ def test_admin_panel_shows_hold_and_low_battery_badges(tmp_path):
         "recent_errors": [],
     }
 
-    text = build_parse(ctx, period="24h")
+    text = build_phone_order(ctx)
     assert "Порядок телефонов:" in text
     assert "test_site:" in text
     assert "p_hold" in text

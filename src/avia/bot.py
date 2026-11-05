@@ -819,6 +819,8 @@ class Bot:
             elif section == "parse":
                 ctx = await asyncio.to_thread(self._collect_parse_data, period)
                 text = admin_panel.build_parse(ctx, period=period)
+            elif section == "ord":
+                text = admin_panel.build_phone_order({"settings": self.s})
             elif section == "users":
                 ctx = await asyncio.to_thread(self._collect_users_data)
                 text = admin_panel.build_users(ctx)
@@ -849,6 +851,7 @@ class Bot:
             headers = {
                 "over": "📊 <b>Обзор</b>",
                 "parse": "🌐 <b>Парсинг</b>",
+                "ord": "🧭 <b>Порядок телефонов</b>",
                 "users": "👥 <b>Пользователи</b>",
                 "db": "🗄 <b>База</b>",
                 "tickets": "🎫 <b>Билеты</b>",

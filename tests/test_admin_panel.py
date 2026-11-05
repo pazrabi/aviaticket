@@ -654,8 +654,8 @@ def test_build_parse_telephones_and_site_device():
     txt = admin_panel.build_parse(ctx, "24h")
     assert "realme: 12 запусков · ок 83% · неполных 1 · капч 1 · ср. запрос 3.2 с · ср. ожидание 0.4 с" in txt
     assert "redmi: 8 запусков · ок 100% · неполных 0 · капч 0 · ср. запрос 2.1 с · ср. ожидание 0.1 с" in txt
-    assert "tutu × realme: 10 запусков · ок 90% · неполных 0 · капч 1 · ср. запрос 3.5 с · ср. ожидание 0.4 с" in txt
-    assert "onetwotrip × redmi: 8 запусков · ок 100% · неполных 0 · капч 0 · ср. запрос 2.1 с · ср. ожидание 0.1 с" in txt
+    assert "tutu × realme: 10 · ок 90% · неполн. 0 · капч 1 · 3.5 с" in txt
+    assert "onetwotrip × redmi: 8 · ок 100% · неполн. 0 · капч 0 · 2.1 с" in txt
     # Пара с 2 запусками не должна отображаться
     assert "onetwotrip × realme" not in txt
     assert len(txt) <= 3800
