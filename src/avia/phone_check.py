@@ -110,8 +110,8 @@ def get_reference_price(
                 cols = {row[1] for row in db.execute("PRAGMA table_info(site_runs)").fetchall()}
                 if "min_price" in cols:
                     query_sql = (
-                        "SELECT min_price FROM site_runs WHERE site = ? AND min_price IS NOT NULL "
-                        "AND min_price > 0 AND ts >= ?"
+                        "SELECT min_price FROM site_runs WHERE site = ? AND source = 'phone_check' "
+                        "AND min_price IS NOT NULL AND min_price > 0 AND ts >= ?"
                     )
                     params: list[Any] = [site_name, since_ts]
                     if "device" in cols and exclude_device:
@@ -310,6 +310,7 @@ def evaluate_site(
 
     # Причины «не ок»: 502, капча, пусто, неполно, цена расходится
     reason = "не ок"
+    non_empty_errs = [p.error for p in passes if p.error and p.error not in ("пусто", "неполно")]
     if all(p.error == "502" for p in passes):
         reason = "502"
     elif any(p.captcha or p.error == "капча" for p in passes):
@@ -321,10 +322,12 @@ def evaluate_site(
         for p in passes
     ):
         reason = "цена расходится"
-    elif all(p.offers_count == 0 for p in passes):
-        reason = "пусто"
-    elif any(not p.results_complete and p.offers_count < 5 for p in passes):
+    elif non_empty_errs:
+        reason = non_empty_errs[0]
+    elif any(not p.results_complete and 0 < p.offers_count < 5 for p in passes):
         reason = "неполно"
+    elif all(p.offers_count == 0 for p in passes) or all(p.error == "пусто" for p in passes):
+        reason = "пусто"
     else:
         errs = [p.error for p in passes if p.error]
         reason = errs[0] if errs else "не ок"
@@ -406,6 +409,7 @@ async def _do_run_phone_check(
     phone_entry = reg.get(phone_id) or {}
     phone_name = phone_entry.get("name") or phone_id
     prev_status = phone_entry.get("status", "new")
+    existing_deny = list(phone_entry.get("sites_deny", []))
 
     # Контрольный маршрут
     ctrl_depart = date.today() + timedelta(days=DEFAULT_CONTROL_DAYS_AHEAD)
@@ -461,13 +465,13 @@ async def _do_run_phone_check(
     elif ok_sites:
         if prev_status == "new":
             reg.set_status(phone_id, "active")
-            reg.set_sites(phone_id, allow=ok_sites)
+            reg.set_sites(phone_id, allow=ok_sites, deny=existing_deny)
             reg.set_note(phone_id, f"Допущен на: {', '.join(ok_sites)}")
         elif prev_status == "hold":
-            reg.set_sites(phone_id, allow=ok_sites)
+            reg.set_sites(phone_id, allow=ok_sites, deny=existing_deny)
             reg.set_note(phone_id, f"Проверен (hold): {', '.join(ok_sites)}")
         else:  # active
-            reg.set_sites(phone_id, allow=ok_sites)
+            reg.set_sites(phone_id, allow=ok_sites, deny=existing_deny)
             reg.set_note(phone_id, f"Проверен: {', '.join(ok_sites)}")
     else:
         reason_parts = [f"{s} ({site_results[s].reason})" for s in site_results]
@@ -532,6 +536,9 @@ async def run_phone_check(
         reg = PhoneRegistry(settings.storage_dir)
         settings.phones = reg
 
+    phone_entry = reg.get(clean_id) or {}
+    phone_name = phone_entry.get("name") or clean_id
+
     reg.set_checking(clean_id, True)
 
     try:
@@ -547,17 +554,49 @@ async def run_phone_check(
         )
     except asyncio.TimeoutError:
         logger.warning("Превышен общий таймаут проверки телефона %s (15 мин)", clean_id)
+        note = "Не допущен: превышен общий лимит времени (15 мин)"
+        reg.set_note(clean_id, note)
+        report_text = (
+            f"📱 <b>Результаты проверки {escape(phone_name)}</b> (<code>{escape(clean_id)}</code>)\n\n"
+            f"❌ <b>Ошибка:</b> превышен общий лимит времени проверки (15 минут).\n"
+            f"<b>Итог:</b> <b>не допущен:</b> таймаут"
+        )
+        if bot is not None:
+            recipients = set(getattr(settings, "tg_allowed_ids", set()))
+            if initiated_by_chat_id:
+                recipients.add(initiated_by_chat_id)
+            for chat_id in recipients:
+                try:
+                    await bot.send(chat_id, report_text)
+                except Exception as e:
+                    logger.warning("Ошибка отправки отчёта проверки чату %s: %s", chat_id, e)
         return PhoneCheckReport(
             phone_id=clean_id,
-            phone_name=clean_id,
-            message="Превышен общий лимит времени",
+            phone_name=phone_name,
+            message=report_text,
         )
     except Exception as exc:
         logger.exception("Исключение при проверке телефона %s: %s", clean_id, exc)
+        note = f"Не допущен: ошибка проверки ({exc})"
+        reg.set_note(clean_id, note)
+        report_text = (
+            f"📱 <b>Результаты проверки {escape(phone_name)}</b> (<code>{escape(clean_id)}</code>)\n\n"
+            f"❌ <b>Ошибка при проверке:</b> {escape(str(exc))}\n"
+            f"<b>Итог:</b> <b>не допущен:</b> ошибка"
+        )
+        if bot is not None:
+            recipients = set(getattr(settings, "tg_allowed_ids", set()))
+            if initiated_by_chat_id:
+                recipients.add(initiated_by_chat_id)
+            for chat_id in recipients:
+                try:
+                    await bot.send(chat_id, report_text)
+                except Exception as e:
+                    logger.warning("Ошибка отправки отчёта проверки чату %s: %s", chat_id, e)
         return PhoneCheckReport(
             phone_id=clean_id,
-            phone_name=clean_id,
-            message=str(exc),
+            phone_name=phone_name,
+            message=report_text,
         )
     finally:
         reg.set_checking(clean_id, False)

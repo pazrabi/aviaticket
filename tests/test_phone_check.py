@@ -17,6 +17,7 @@ from avia.droidhub import DroidhubError, candidates
 from avia.models import Offer, Query
 from avia.parsers import PARSERS
 from avia.phone_check import (
+    PassResult,
     evaluate_site,
     get_reference_price,
     is_checking,
@@ -486,3 +487,193 @@ def test_checking_status_display_in_admin_panel(tmp_path):
     assert reg.all()["dev_chk"]["checking"] is False
     text_after = build_phones({"phones": list(reg.all().values())})
     assert "ожидает проверки" in text_after
+
+
+# 13. Общий таймаут проверки: сохранение причины в реестре и отправка отчёта админам
+@pytest.mark.asyncio
+async def test_phone_check_overall_timeout_notifies_and_records_note(tmp_path, monkeypatch):
+    import avia.phone_check as pc
+
+    site = SiteConfig(name="s1", url_template="https://s1", phone="auto")
+    settings = Settings(
+        sites=[site],
+        storage_dir=tmp_path,
+        tg_allowed_ids={111},
+        phones_new_policy="check",
+    )
+    fb = FakeBot(settings)
+    fb.bot.phones.register("dev_timeout", name="Dev Timeout", status="new")
+
+    monkeypatch.setattr(pc, "MAX_OVERALL_CHECK_SECONDS", 0.05)
+
+    async def hanging_snapshot(*args, **kwargs):
+        await asyncio.sleep(1.0)
+        return None, False
+
+    monkeypatch.setattr("avia.phone_check.fetch_page_snapshot", hanging_snapshot)
+
+    report = await run_phone_check(settings, "dev_timeout", bot=fb.bot, initiated_by_chat_id=222)
+    assert "превышен общий лимит времени" in report.message.lower()
+
+    entry = fb.bot.phones.get("dev_timeout")
+    assert entry["status"] == "new"
+    assert "превышен общий лимит времени" in entry["note"].lower()
+
+    # Админам и инициатору отправлено сообщение
+    recipients = {m["chat_id"] for m in fb.sent_messages if "chat_id" in m}
+    assert 111 in recipients
+    assert 222 in recipients
+    assert not is_checking("dev_timeout")
+
+
+# 14. Необработанное исключение при проверке: сохранение причины и отправка отчёта админам
+@pytest.mark.asyncio
+async def test_phone_check_exception_notifies_and_records_note(tmp_path, monkeypatch):
+    site = SiteConfig(name="s1", url_template="https://s1", phone="auto")
+    settings = Settings(
+        sites=[site],
+        storage_dir=tmp_path,
+        tg_allowed_ids={333},
+        phones_new_policy="check",
+    )
+    fb = FakeBot(settings)
+    fb.bot.phones.register("dev_err", name="Dev Err", status="new")
+
+    async def failing_snapshot(*args, **kwargs):
+        raise RuntimeError("Hub crashed unexpectedly")
+
+    monkeypatch.setattr("avia.phone_check._do_run_phone_check", failing_snapshot)
+
+    report = await run_phone_check(settings, "dev_err", bot=fb.bot, initiated_by_chat_id=444)
+    assert "Hub crashed unexpectedly" in report.message
+
+    entry = fb.bot.phones.get("dev_err")
+    assert entry["status"] == "new"
+    assert "Hub crashed unexpectedly" in entry["note"]
+
+    recipients = {m["chat_id"] for m in fb.sent_messages if "chat_id" in m}
+    assert 333 in recipients
+    assert 444 in recipients
+    assert not is_checking("dev_err")
+
+
+# 15. Сохранение sites_deny при допуске и перепроверке
+@pytest.mark.asyncio
+async def test_phone_check_preserves_existing_sites_deny(tmp_path, monkeypatch):
+    site_ok = SiteConfig(name="site_allow_me", url_template="https://ok", phone="auto", parser="p_ok2")
+
+    def parser_ok(snap, q):
+        return [Offer(site="site_allow_me", price=5000)]
+
+    parser_ok.results_complete = lambda snap: True
+    PARSERS["p_ok2"] = parser_ok
+
+    settings = Settings(
+        sites=[site_ok],
+        storage_dir=tmp_path,
+        tg_allowed_ids={100},
+        phones_new_policy="check",
+    )
+    fb = FakeBot(settings)
+    # Телефон с преднастроенным sites_deny
+    fb.bot.phones.register("dev_deny", name="Dev Deny", status="new", sites_deny=["banned_site"])
+
+    async def mock_snap(s, device_id, url, **kwargs):
+        return Snapshot(url=url, text="OK", blocked=False), True
+
+    monkeypatch.setattr("avia.phone_check.fetch_page_snapshot", mock_snap)
+
+    report = await run_phone_check(settings, "dev_deny", bot=fb.bot)
+    assert report.admitted is True
+
+    entry = fb.bot.phones.get("dev_deny")
+    assert entry["status"] == "active"
+    assert entry["sites_allow"] == ["site_allow_me"]
+    # sites_deny НЕ стёрт!
+    assert entry["sites_deny"] == ["banned_site"]
+
+
+# 16. Сетевые ошибки и таймаут проходов не классифицируются ошибочно как «пусто»
+def test_evaluate_site_error_distinction():
+    # Проходы с таймаутом
+    timeout_passes = [
+        PassResult(pass_num=1, ok=False, offers_count=0, error="таймаут"),
+        PassResult(pass_num=2, ok=False, offers_count=0, error="таймаут"),
+    ]
+    res_timeout = evaluate_site("s_to", timeout_passes)
+    assert res_timeout.verdict == "не ок"
+    assert res_timeout.reason == "таймаут"
+
+    # Проходы без парсера
+    no_parser_passes = [
+        PassResult(pass_num=1, ok=False, offers_count=0, error="нет парсера"),
+        PassResult(pass_num=2, ok=False, offers_count=0, error="нет парсера"),
+    ]
+    res_no_parser = evaluate_site("s_np", no_parser_passes)
+    assert res_no_parser.verdict == "не ок"
+    assert res_no_parser.reason == "нет парсера"
+
+    # Честное «пусто»: парсер отработал, но офферов нет
+    empty_passes = [
+        PassResult(pass_num=1, ok=False, offers_count=0, error="пусто"),
+        PassResult(pass_num=2, ok=False, offers_count=0, error="пусто"),
+    ]
+    res_empty = evaluate_site("s_empty", empty_passes)
+    assert res_empty.verdict == "не ок"
+    assert res_empty.reason == "пусто"
+
+
+# 17. Эталонная цена фильтрует по source = 'phone_check'
+def test_reference_price_filters_by_source_phone_check(tmp_path):
+    from avia.metrics import MetricsStore
+
+    metrics_db = tmp_path / "metrics.sqlite"
+    metrics = MetricsStore(metrics_db)
+    # Инициализируем схему
+    metrics._ensure_schema()
+
+    query = Query(
+        origin="MOW",
+        destination="LED",
+        depart=date.today() + timedelta(days=35),
+        adults=1,
+    )
+    now = time.time()
+
+    # Записываем замер от обычного поиска (другой маршрут / другая цена)
+    with sqlite3.connect(metrics_db) as conn:
+        conn.execute(
+            """INSERT INTO site_runs (ts, source, site, ok, partial, captcha, offers, elapsed, min_price)
+               VALUES (?, 'search', 's_ref', 1, 0, 0, 10, 2.0, 1000.0)""",
+            (now,),
+        )
+
+    settings = Settings(sites=[], storage_dir=tmp_path)
+    # Замер из 'search' НЕ должен считаться эталоном для проверки телефона
+    assert get_reference_price(settings, "s_ref", query, now=now) is None
+
+    # Добавляем замер от 'phone_check'
+    with sqlite3.connect(metrics_db) as conn:
+        conn.execute(
+            """INSERT INTO site_runs (ts, source, site, ok, partial, captcha, offers, elapsed, min_price)
+               VALUES (?, 'phone_check', 's_ref', 1, 0, 0, 10, 2.0, 7500.0)""",
+            (now,),
+        )
+
+    # Теперь эталон равен 7500.0
+    assert get_reference_price(settings, "s_ref", query, now=now) == 7500.0
+
+
+# 18. Колонка min_price присутствует в начальной схеме site_runs
+def test_site_runs_initial_schema_has_min_price(tmp_path):
+    from avia.metrics import MetricsStore
+
+    metrics_db = tmp_path / "test_initial_schema.sqlite"
+    metrics = MetricsStore(metrics_db)
+    conn = metrics._connect()
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(site_runs)").fetchall()}
+        assert "min_price" in cols
+        assert "priority" in cols
+    finally:
+        conn.close()

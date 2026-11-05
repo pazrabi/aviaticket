@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS site_runs (
     device        TEXT,
     queue_wait    REAL,
     fetch_seconds REAL,
-    priority      INTEGER
+    priority      INTEGER,
+    min_price     REAL
 );
 CREATE INDEX IF NOT EXISTS ix_site_runs_ts ON site_runs (ts);
 CREATE INDEX IF NOT EXISTS ix_site_runs_site_ts ON site_runs (site, ts);

@@ -13,6 +13,8 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
+_UNSET: Any = object()
+
 
 class NewDevice(str):
     """Информация о новом зарегистрированном устройстве (строка-id с доступом к полям)."""
@@ -363,7 +365,7 @@ class PhoneRegistry:
     def set_sites(
         self,
         id: str,
-        allow: list[str] | None = None,
+        allow: list[str] | None | object = _UNSET,
         deny: list[str] | None = None,
     ) -> bool:
         """Устанавливает списки разрешённых/запрещённых сайтов."""
@@ -372,14 +374,13 @@ class PhoneRegistry:
             entry = self._phones.get(clean_id)
             if entry is None:
                 return False
-            if allow is not None:
-                entry["sites_allow"] = [str(s).strip() for s in allow if str(s).strip()]
-            else:
-                entry["sites_allow"] = None
+            if allow is not _UNSET:
+                if allow is not None:
+                    entry["sites_allow"] = [str(s).strip() for s in allow if str(s).strip()]
+                else:
+                    entry["sites_allow"] = None
             if deny is not None:
                 entry["sites_deny"] = [str(s).strip() for s in deny if str(s).strip()]
-            else:
-                entry["sites_deny"] = []
             self._save_locked()
             return True
 
