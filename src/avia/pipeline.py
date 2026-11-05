@@ -35,6 +35,22 @@ guard = SearchGuard()
 EMPTY_RETRY_DELAY: float = 3.0
 
 
+def _hit_time_cap(priority: int, cur_stats: dict[str, Any], wait_seconds: Any) -> bool:
+    """Живой поиск упёрся в лимит ожидания страницы и ничего не получил.
+
+    Другой телефон будет ждать тот же срок с тем же итогом, поэтому живой запрос
+    не гоняем по кругу: он вернёт то, что есть, а не удвоит время ответа.
+    """
+    if priority != 0:
+        return False
+    try:
+        fetched = float(cur_stats.get("fetch_seconds") or 0.0)
+        cap = float(wait_seconds or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return cap > 0 and fetched >= cap * 0.8
+
+
 class ParserEmptyError(Exception):
     """Исключение при 0 вариантов от парсера на непустой странице."""
 
@@ -324,7 +340,7 @@ async def _from_browser(
             try:
                 offers, page_url, partial = await _process_snapshot(site, snap, q, settings, partial=partial)
             except ParserEmptyError as exc:
-                if remaining_cands:
+                if remaining_cands and not _hit_time_cap(priority, cur_stats, wait_seconds):
                     try:
                         from .droidhub import _record_failure
                         _record_failure(
@@ -356,7 +372,7 @@ async def _from_browser(
 
             # Проверка: неполная выдача без офферов
             if partial and not offers:
-                if remaining_cands:
+                if remaining_cands and not _hit_time_cap(priority, cur_stats, wait_seconds):
                     try:
                         from .droidhub import _record_failure
                         _record_failure(

@@ -751,3 +751,12 @@ async def test_recheck_single_pass(tmp_path, monkeypatch):
     await run_phone_check(settings, "dev_re", bot=fb.bot, per_site=1)
     assert len(calls) == 1
     assert fb.bot.phones.get("dev_re")["sites_allow"] == ["s1"]
+
+
+def test_hit_time_cap_only_for_live_slow_attempts():
+    from avia.pipeline import _hit_time_cap
+
+    assert _hit_time_cap(0, {"fetch_seconds": 48.0}, 45) is True
+    assert _hit_time_cap(0, {"fetch_seconds": 12.0}, 45) is False
+    assert _hit_time_cap(1, {"fetch_seconds": 48.0}, 45) is False
+    assert _hit_time_cap(0, {}, 45) is False
