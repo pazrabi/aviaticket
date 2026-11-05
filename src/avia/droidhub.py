@@ -23,11 +23,20 @@ class PreferenceList(list):
     """Список устройств с фиксированным порядком предпочтения (не round-robin)."""
     prefer_order: bool = True
     patience: float = 0.0
+    preferred_count: int = 1
 
-    def __init__(self, iterable: Any = (), *, patience: float | None = None) -> None:
+    def __init__(
+        self,
+        iterable: Any = (),
+        *,
+        patience: float | None = None,
+        preferred_count: int | None = None,
+    ) -> None:
         super().__init__(iterable)
         if patience is not None:
             self.patience = float(patience)
+        if preferred_count is not None:
+            self.preferred_count = int(preferred_count)
 
 
 @dataclass
@@ -41,6 +50,7 @@ class _Waiter:
     patience: float = 0.0
     deadline: float = 0.0
     timer_handle: asyncio.TimerHandle | None = None
+    preferred_count: int = 1
 
     @property
     def key(self) -> tuple[int, int, int]:
@@ -162,6 +172,7 @@ def _get_registry(settings: Settings) -> Any | None:
                     phones_new_policy=getattr(settings, "phones_new_policy", "active"),
                     phones_snapshot_ttl_seconds=getattr(settings, "phones_snapshot_ttl_seconds", 180),
                     phones_hold=getattr(settings, "phones_hold", None),
+                    phone_min_battery=getattr(settings, "phone_min_battery", 15),
                 )
                 return reg
             except Exception as e:
@@ -190,6 +201,7 @@ def candidates(
     settings: Settings,
     site: SiteConfig,
     registry: Any | None = None,
+    priority: int = 0,
 ) -> list[str]:
     """Возвращает список идентификаторов устройств для сайта.
 
@@ -202,6 +214,7 @@ def candidates(
     Одиночный phone остаётся закреплённым за этим телефоном без расширения (при заморозке не используется).
     Поле phone_extend: false отключает добавление запасных.
     При пустом/недоступном реестре — прежнее поведение по site.phone и DROIDHUB_DEVICES.
+    При включённом SPEED_ROUTING=1 порядок кандидатов переупорядочивается по реальным замерам скорости.
     """
     phone = (getattr(site, "phone", None) or "").strip()
     if not phone:
@@ -213,12 +226,13 @@ def candidates(
     phone_extend = getattr(site, "phone_extend", True)
     if phone_extend is None:
         phone_extend = True
+    speed_routing_enabled = getattr(settings, "speed_routing", True)
 
     def is_usable_phone(dev_id: str) -> bool:
         if dev_id in phones_hold:
             return False
         if reg is not None and dev_id in reg:
-            return bool(reg.is_usable(dev_id, site_name))
+            return bool(reg.is_usable(dev_id, site_name, ignore_battery=not speed_routing_enabled))
         # Телефоны, которых нет в реестре, но перечислены в site.phone,
         # остаются пригодными (обратная совместимость), если не заморожены.
         return True
@@ -246,7 +260,7 @@ def candidates(
             if (
                 clean_id not in exclude
                 and clean_id not in phones_hold
-                and reg.is_usable(clean_id, site_name)
+                and reg.is_usable(clean_id, site_name, ignore_battery=not speed_routing_enabled)
             ):
                 others.append(clean_id)
         return others
@@ -258,8 +272,22 @@ def candidates(
         usable_listed = [d for d in listed if is_usable_phone(d)]
         if phone_extend:
             others = get_other_usable_phones(set(listed))
-            return usable_listed + others
-        return usable_listed
+            clean = usable_listed + others
+        else:
+            clean = usable_listed
+
+        if not clean:
+            return []
+        if not speed_routing_enabled or len(clean) == 1:
+            return clean
+        try:
+            from .speed import get_speed_table
+            table = get_speed_table(settings)
+            res = table.order_candidates(site, clean, priority=priority)
+            return list(res)
+        except Exception as e:
+            logger.warning("Ошибка speed_routing для auto (%s): %s", site_name, e)
+            return clean
 
     # Случай 2: список через запятую
     if "," in phone:
@@ -277,7 +305,20 @@ def candidates(
             clean = usable_listed
 
         patience = float(getattr(site, "phone_patience_seconds", 0) or 0)
-        return PreferenceList(clean, patience=patience)
+        if not clean:
+            return []
+        if not speed_routing_enabled or len(clean) == 1:
+            return PreferenceList(clean, patience=patience)
+        try:
+            from .speed import get_speed_table
+            table = get_speed_table(settings)
+            res = table.order_candidates(site, clean, priority=priority)
+            if isinstance(res, PreferenceList):
+                return res
+            return PreferenceList(res, patience=patience)
+        except Exception as e:
+            logger.warning("Ошибка speed_routing для списка (%s): %s", site_name, e)
+            return PreferenceList(clean, patience=patience)
 
     # Случай 3: одиночный телефон
     if not is_usable_phone(phone):
@@ -355,15 +396,16 @@ def _dispatch() -> None:
             continue
 
         # Если действует терпение (предпочтительный порядок, терпение > 0, есть запасные,
-        # и дедлайн ещё не наступил с допуском 1e-4), пробуем ТОЛЬКО предпочтительный телефон
+        # и дедлайн ещё не наступил с допуском 1e-4), пробуем ТОЛЬКО предпочтительные телефоны
+        pref_cnt = getattr(waiter, "preferred_count", 1) or 1
         is_patience_active = (
             waiter.prefer_order
             and waiter.patience > 0
-            and len(waiter.candidates) > 1
+            and len(waiter.candidates) > pref_cnt
             and (waiter.deadline - now > 1e-4)
         )
         if is_patience_active:
-            cand = waiter.candidates[:1]
+            cand = waiter.candidates[:pref_cnt]
             if waiter.timer_handle is None:
                 loop = asyncio.get_running_loop()
                 waiter.timer_handle = loop.call_later(
@@ -393,6 +435,7 @@ async def acquire(
     patience: float | None = None,
     patience_seconds: float | None = None,
     phone_patience_seconds: float | None = None,
+    preferred_count: int | None = None,
 ) -> str:
     """Ожидает, пока не освободится подходящее устройство из списка кандидатов.
 
@@ -424,6 +467,10 @@ async def acquire(
             patience = getattr(candidates, "patience", 0.0)
     patience_val = max(0.0, float(patience or 0.0))
 
+    if preferred_count is None:
+        preferred_count = getattr(candidates, "preferred_count", 1)
+    preferred_count_val = max(1, min(int(preferred_count or 1), len(clean)))
+
     global _seq_counter
     _seq_counter += 1
     loop = asyncio.get_running_loop()
@@ -438,6 +485,7 @@ async def acquire(
         fut=fut,
         patience=patience_val,
         deadline=now + patience_val,
+        preferred_count=preferred_count_val,
     )
 
     # Вставляем в очередь с сохранением сортировки по (priority, -weight, seq)
@@ -450,7 +498,7 @@ async def acquire(
     if fut.done() and not fut.cancelled():
         return fut.result()
 
-    if waiter.prefer_order and waiter.patience > 0 and len(waiter.candidates) > 1:
+    if waiter.prefer_order and waiter.patience > 0 and len(waiter.candidates) > waiter.preferred_count:
         if waiter.timer_handle is None:
             rem = max(0.0, waiter.deadline - _time())
             waiter.timer_handle = loop.call_later(rem, _on_patience_timeout, waiter)
@@ -602,6 +650,63 @@ async def _fetch_device_snapshot(
         return snap, finished
 
 
+def _infer_site_name(url: str) -> str:
+    url_l = str(url).lower()
+    for s in ("aviasales", "yandex", "tutu", "kupibilet", "onetwotrip", "ozon"):
+        if s in url_l:
+            return s
+    return "site"
+
+
+def _record_failure(
+    settings: Settings,
+    site: str,
+    device: str,
+    priority: int,
+    error: str,
+    *,
+    captcha: bool = False,
+    partial: bool = False,
+    offers: int = 0,
+    fetch_seconds: float | None = None,
+    queue_wait: float | None = None,
+) -> None:
+    try:
+        from .metrics import MetricsStore
+        metrics = getattr(settings, "metrics", None)
+        if metrics is None:
+            storage_dir = getattr(settings, "storage_dir", None)
+            if storage_dir is not None:
+                metrics_path = Path(storage_dir) / "metrics.sqlite"
+                if metrics_path.exists():
+                    metrics = MetricsStore(metrics_path)
+        if metrics is not None:
+            source = "user" if priority == 0 else ("sub" if priority == 1 else "bg")
+            is_ok = 1 if (partial and offers > 0) else 0
+            metrics.record_run(
+                source=source,
+                site=site,
+                ok=is_ok,
+                partial=partial,
+                captcha=captcha,
+                error=error,
+                offers=offers,
+                elapsed=fetch_seconds or 0.0,
+                device=device,
+                queue_wait=queue_wait,
+                fetch_seconds=fetch_seconds,
+                priority=priority,
+            )
+            try:
+                from .speed import get_speed_table
+                table = get_speed_table(settings)
+                table.invalidate()
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("Не удалось записать провал в метрики (%s): %s", device, e)
+
+
 async def fetch_page_snapshot_any(
     settings: Settings,
     candidates: list[str],
@@ -618,6 +723,8 @@ async def fetch_page_snapshot_any(
     patience: float | None = None,
     patience_seconds: float | None = None,
     phone_patience_seconds: float | None = None,
+    site_name: str | None = None,
+    preferred_count: int | None = None,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на любом свободном телефоне из candidates.
 
@@ -626,7 +733,7 @@ async def fetch_page_snapshot_any(
     и есть другие непробованные кандидаты — повторяет на следующем свободном устройстве.
     Каждое устройство опрашивается максимум один раз за вызов.
     Ошибки авторизации (401/403) пробрасываются сразу.
-    Капча не считается исключением и не повторяется.
+    При капче на устройстве запрос повторяется на следующем кандидате.
     """
     clean_candidates = _clean_candidates(candidates)
     if not clean_candidates:
@@ -634,6 +741,9 @@ async def fetch_page_snapshot_any(
 
     if prefer_order is None:
         prefer_order = getattr(candidates, "prefer_order", False)
+
+    if preferred_count is None:
+        preferred_count = getattr(candidates, "preferred_count", 1)
 
     if patience is None:
         if patience_seconds is not None:
@@ -649,10 +759,16 @@ async def fetch_page_snapshot_any(
     total_queue_wait: float = 0.0
     attempts: int = 0
 
+    pref_base = preferred_count or 1
+    pref_set = set(clean_candidates[:pref_base])
+
     while len(tried) < len(clean_candidates):
         remaining = [c for c in clean_candidates if c not in tried]
         if not remaining:
             break
+
+        rem_pref = sum(1 for c in remaining if c in pref_set)
+        acq_pref = max(1, rem_pref) if rem_pref > 0 else 1
 
         t_acq_start = time.monotonic()
         dev = await acquire(
@@ -661,6 +777,7 @@ async def fetch_page_snapshot_any(
             weight=weight,
             prefer_order=prefer_order,
             patience=patience_val,
+            preferred_count=acq_pref,
         )
         t_acq = time.monotonic() - t_acq_start
         total_queue_wait += t_acq
@@ -692,6 +809,17 @@ async def fetch_page_snapshot_any(
             if stats is not None:
                 stats["fetch_seconds"] = fetch_sec
             last_exc = exc
+            eff_site = site_name or _infer_site_name(url)
+            _record_failure(
+                settings=settings,
+                site=eff_site,
+                device=dev,
+                priority=priority,
+                error=str(exc),
+                captcha=False,
+                fetch_seconds=fetch_sec,
+                queue_wait=t_acq,
+            )
             if not _is_retryable_error(exc):
                 raise
             if not any(c for c in clean_candidates if c not in tried):
@@ -725,6 +853,8 @@ async def fetch_page_snapshot(
     patience: float | None = None,
     patience_seconds: float | None = None,
     phone_patience_seconds: float | None = None,
+    site_name: str | None = None,
+    preferred_count: int | None = None,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на телефоне через droidhub и возвращает (Snapshot, finished).
 
@@ -733,6 +863,9 @@ async def fetch_page_snapshot(
     """
     if prefer_order is None:
         prefer_order = getattr(device_id, "prefer_order", None)
+
+    if preferred_count is None:
+        preferred_count = getattr(device_id, "preferred_count", None)
 
     if patience is None:
         if patience_seconds is not None:
@@ -757,6 +890,8 @@ async def fetch_page_snapshot(
             stats=stats,
             prefer_order=prefer_order,
             patience=patience,
+            site_name=site_name,
+            preferred_count=preferred_count,
         )
     return await fetch_page_snapshot_any(
         settings,
@@ -771,4 +906,6 @@ async def fetch_page_snapshot(
         stats=stats,
         prefer_order=prefer_order,
         patience=patience,
+        site_name=site_name,
+        preferred_count=preferred_count,
     )

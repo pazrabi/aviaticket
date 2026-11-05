@@ -343,6 +343,66 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
                 lines.append(pair_line)
 
     errors = ctx.get("recent_errors", [])
+    # Блок: Порядок телефонов по каждому сайту
+    settings = ctx.get("settings")
+    if settings is None:
+        try:
+            from .config import load_settings
+            settings = load_settings()
+        except Exception:
+            settings = None
+
+    if settings and getattr(settings, "sites", None):
+        try:
+            from .droidhub import candidates, _get_registry, _get_phones_hold
+            from .speed import get_speed_table
+            speed_table = get_speed_table(settings)
+            reg = getattr(settings, "phones", None) or _get_registry(settings)
+            reg_all = reg.all() if reg else {}
+            phones_hold = _get_phones_hold(settings)
+
+            phone_sites = [s for s in settings.sites if getattr(s, "phone", None)]
+            if phone_sites:
+                order_lines = ["", "<b>Порядок телефонов:</b>"]
+                for s in phone_sites:
+                    live_cands = candidates(settings, s, priority=0)
+                    bg_cands = candidates(settings, s, priority=1)
+                    if not live_cands and not bg_cands:
+                        continue
+
+                    def _fmt_cand(dev: str, c_name: str) -> str:
+                        st = speed_table.get_stats(s.name, dev, c_name)
+                        pst = speed_table.get_pair_status(s.name, dev)
+                        p_info = reg_all.get(dev, {})
+                        med_str = f"{st.median_fetch:.1f} с" if st.median_fetch is not None else "—"
+                        pct_str = f"{round(st.ok_rate * 100)}%" if st.n > 0 else "—"
+                        badges = []
+                        if pst.in_quarantine:
+                            badges.append("карантин")
+                        elif pst.awaiting_trial:
+                            badges.append("пробный")
+                        if p_info.get("low_battery"):
+                            badges.append("пониженная батарея")
+                        if dev in phones_hold or p_info.get("status") == "hold" or p_info.get("is_hold_env"):
+                            badges.append("заморозка")
+                        badge_str = f" [{', '.join(badges)}]" if badges else ""
+                        return f"{escape(dev)} ({med_str} · {pct_str} · n={st.n}){badge_str}"
+
+                    live_str = ", ".join(_fmt_cand(d, "live") for d in live_cands) if live_cands else "нет"
+                    bg_str = ", ".join(_fmt_cand(d, "bg") for d in bg_cands) if bg_cands else "нет"
+
+                    order_lines.append(f"<b>{escape(s.name)}:</b>")
+                    order_lines.append(f"• люди: {live_str}")
+                    order_lines.append(f"• фон: {bg_str}")
+
+                if len(order_lines) > 2:
+                    for ol in order_lines:
+                        if len("\n".join(lines)) + len(ol) + 2 > 3700:
+                            break
+                        lines.append(ol)
+        except Exception:
+            pass
+
     lines.append("")
     lines.append("<b>Последние ошибки:</b>")
     if errors:
@@ -701,7 +761,11 @@ def build_phones(ctx: dict[str, Any]) -> str:
 
             # Батарея
             batt = p.get("battery")
-            batt_str = f"{batt}%" if batt is not None else "—"
+            charging = p.get("charging", False)
+            ch_str = " ⚡" if charging else ""
+            batt_str = f"{batt}%{ch_str}" if batt is not None else "—"
+            if p.get("low_battery"):
+                batt_str += " (пониженная батарея 🪫)"
             lines.append(f"• Батарея: {batt_str}")
 
             # Сайты

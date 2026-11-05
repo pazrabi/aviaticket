@@ -12,6 +12,7 @@ from .collector import fetch_snapshot, Snapshot
 from .config import Settings, SiteConfig
 from .droidhub import (
     DroidhubError,
+    PreferenceList,
     candidates,
     fetch_page_snapshot_any,
     phone_enabled,
@@ -237,21 +238,98 @@ async def _from_browser(
     patience = getattr(site, "phone_patience_seconds", 0) or 0
 
     if phone_enabled(settings, site):
-        snap, finished = await fetch_page_snapshot_any(
-            settings,
-            candidates(settings, site),
-            url,
-            wait_seconds=wait_seconds,
-            capture_json=site.phone_capture_json,
-            wait_for=wait_for,
-            priority=priority,
-            weight=effective_weight,
-            stats=stats,
-            patience=patience,
-        )
-        if snap.blocked:
-            raise RuntimeError("сайт показал капчу на телефоне")
-        partial = not finished
+        cand_list = candidates(settings, site, priority=priority)
+        patience = getattr(cand_list, "patience", patience)
+        preferred_count = getattr(cand_list, "preferred_count", None)
+
+        remaining_cands = list(cand_list)
+        last_snap = None
+        last_finished = True
+        last_exc: Exception | None = None
+
+        while remaining_cands:
+            cur_stats: dict[str, Any] = {}
+            pref_arg = (
+                PreferenceList(remaining_cands, patience=patience, preferred_count=preferred_count)
+                if isinstance(cand_list, PreferenceList)
+                else remaining_cands
+            )
+            try:
+                snap, finished = await fetch_page_snapshot_any(
+                    settings,
+                    pref_arg,
+                    url,
+                    wait_seconds=wait_seconds,
+                    capture_json=site.phone_capture_json,
+                    wait_for=wait_for,
+                    priority=priority,
+                    weight=effective_weight,
+                    stats=cur_stats,
+                    patience=patience,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if stats is not None:
+                    stats.update(cur_stats)
+                raise
+
+            if stats is not None:
+                stats.update(cur_stats)
+
+            used_dev = cur_stats.get("device")
+            if used_dev and used_dev in remaining_cands:
+                remaining_cands.remove(used_dev)
+            elif remaining_cands:
+                remaining_cands.pop(0)
+
+            if snap.blocked:
+                try:
+                    from .droidhub import _record_failure
+                    _record_failure(
+                        settings=settings,
+                        site=site.name,
+                        device=used_dev or "unknown",
+                        priority=priority,
+                        error="сайт показал капчу на телефоне",
+                        captcha=True,
+                        fetch_seconds=cur_stats.get("fetch_seconds"),
+                        queue_wait=cur_stats.get("queue_wait"),
+                    )
+                except Exception:
+                    pass
+                if remaining_cands:
+                    log.warning("Сайт %s: капча на телефоне %s, пробуем следующий телефон", site.name, used_dev)
+                    continue
+                raise RuntimeError("сайт показал капчу на телефоне")
+
+            partial = not finished
+            offers, page_url, partial = await _process_snapshot(site, snap, q, settings, partial=partial)
+
+            # Проверка: неполная выдача без офферов
+            if partial and not offers and remaining_cands:
+                try:
+                    from .droidhub import _record_failure
+                    _record_failure(
+                        settings=settings,
+                        site=site.name,
+                        device=used_dev or "unknown",
+                        priority=priority,
+                        error="неполная выдача без офферов",
+                        partial=True,
+                        offers=0,
+                        fetch_seconds=cur_stats.get("fetch_seconds"),
+                        queue_wait=cur_stats.get("queue_wait"),
+                    )
+                except Exception:
+                    pass
+                log.warning("Сайт %s: неполная выдача без офферов на телефоне %s, пробуем следующий телефон", site.name, used_dev)
+                continue
+
+            return offers, page_url, partial
+
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("не удалось получить данные ни с одного телефона")
     else:
         snap = await fetch_snapshot(
             url,
@@ -263,8 +341,7 @@ async def _from_browser(
         if snap.blocked:
             raise RuntimeError("сайт показал капчу или блокировку")
         partial = False
-
-    return await _process_snapshot(site, snap, q, settings, partial=partial)
+        return await _process_snapshot(site, snap, q, settings, partial=partial)
 
 
 async def _fallback_url(site: SiteConfig, q: Query, settings: Settings) -> str | None:
@@ -355,6 +432,7 @@ async def _run_site(
             device=stats.get("device"),
             queue_wait=stats.get("queue_wait"),
             fetch_seconds=stats.get("fetch_seconds"),
+            priority=priority,
         )
     except DroidhubError as e:
         log.warning("Ошибка droidhub на сайте %s: %s", site.name, e)
@@ -372,6 +450,7 @@ async def _run_site(
             device=stats.get("device"),
             queue_wait=stats.get("queue_wait"),
             fetch_seconds=stats.get("fetch_seconds"),
+            priority=priority,
         )
     except ParserEmptyError as e:
         log.warning("Парсер сайта %s вернул 0 вариантов: %s", site.name, e)
@@ -388,6 +467,7 @@ async def _run_site(
             device=stats.get("device"),
             queue_wait=stats.get("queue_wait"),
             fetch_seconds=stats.get("fetch_seconds"),
+            priority=priority,
         )
     except Exception as e:
         log.exception("Ошибка при поиске на сайте %s: %s", site.name, e)
@@ -406,6 +486,7 @@ async def _run_site(
             device=stats.get("device"),
             queue_wait=stats.get("queue_wait"),
             fetch_seconds=stats.get("fetch_seconds"),
+            priority=priority,
         )
 
 

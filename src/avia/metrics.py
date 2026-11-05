@@ -25,7 +25,8 @@ CREATE TABLE IF NOT EXISTS site_runs (
     elapsed       REAL NOT NULL,
     device        TEXT,
     queue_wait    REAL,
-    fetch_seconds REAL
+    fetch_seconds REAL,
+    priority      INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_site_runs_ts ON site_runs (ts);
 CREATE INDEX IF NOT EXISTS ix_site_runs_site_ts ON site_runs (site, ts);
@@ -61,6 +62,8 @@ class MetricsStore:
                 conn.execute("ALTER TABLE site_runs ADD COLUMN queue_wait REAL")
             if "fetch_seconds" not in cols:
                 conn.execute("ALTER TABLE site_runs ADD COLUMN fetch_seconds REAL")
+            if "priority" not in cols:
+                conn.execute("ALTER TABLE site_runs ADD COLUMN priority INTEGER")
         self._initialized = True
 
     def _connect(self) -> sqlite3.Connection:
@@ -83,6 +86,7 @@ class MetricsStore:
         device: str | None = None,
         queue_wait: float | None = None,
         fetch_seconds: float | None = None,
+        priority: int | None = None,
     ) -> None:
         """Записывает результат отдельного запуска сайта."""
         try:
@@ -91,14 +95,15 @@ class MetricsStore:
             dev_str = str(device).strip() if device and str(device).strip() else None
             qw_val = float(queue_wait) if queue_wait is not None else None
             fs_val = float(fetch_seconds) if fetch_seconds is not None else None
+            prio_val = int(priority) if priority is not None else None
             with self._connect() as db:
                 db.execute(
                     """
                     INSERT INTO site_runs (
                         ts, source, site, ok, partial, captcha, error, offers, elapsed,
-                        device, queue_wait, fetch_seconds
+                        device, queue_wait, fetch_seconds, priority
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record_ts,
@@ -113,6 +118,7 @@ class MetricsStore:
                         dev_str,
                         qw_val,
                         fs_val,
+                        prio_val,
                     ),
                 )
         except Exception:
@@ -123,6 +129,7 @@ class MetricsStore:
         source: str,
         results: Sequence[SiteResult],
         ts: float | None = None,
+        priority: int | None = None,
     ) -> None:
         """Записывает результаты группы сайтов из SiteResult."""
         try:
@@ -141,6 +148,15 @@ class MetricsStore:
                 qw_val = float(qw) if qw is not None else None
                 fs = getattr(r, "fetch_seconds", None)
                 fs_val = float(fs) if fs is not None else None
+                prio = getattr(r, "priority", None) if priority is None else priority
+                if prio is None:
+                    if source == "user":
+                        prio = 0
+                    elif source == "sub":
+                        prio = 1
+                    elif source == "bg":
+                        prio = 2
+                prio_val = int(prio) if prio is not None else None
                 rows.append((
                     batch_ts,
                     source,
@@ -154,6 +170,7 @@ class MetricsStore:
                     dev_str,
                     qw_val,
                     fs_val,
+                    prio_val,
                 ))
             if rows:
                 with self._connect() as db:
@@ -161,9 +178,9 @@ class MetricsStore:
                         """
                         INSERT INTO site_runs (
                             ts, source, site, ok, partial, captcha, error, offers, elapsed,
-                            device, queue_wait, fetch_seconds
+                            device, queue_wait, fetch_seconds, priority
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         rows,
                     )

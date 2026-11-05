@@ -105,6 +105,16 @@ class Settings:
     parser_watch_min_ok_pct: int = 60
     parser_watch_max_incomplete_pct: int = 60
     parser_watch_cooldown_hours: int = 6
+    speed_routing: bool = True
+    speed_window_days: int = 7
+    speed_min_samples: int = 5
+    speed_slow_ratio: float = 3.0
+    speed_bg_patience_seconds: int = 60
+    speed_quarantine_failures: int = 3
+    speed_quarantine_seconds: int = 600
+    speed_refresh_seconds: int = 300
+    phone_min_battery: int = 15
+    metrics: Any = None
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -157,6 +167,41 @@ def load_settings(path: Path | None = None) -> Settings:
     else:
         bg_horizons = [7, 14, 28, 56, 90]
 
+    speed_routing_env = os.getenv("SPEED_ROUTING", "1").strip().lower()
+    speed_routing = speed_routing_env not in ("0", "false", "False", "no", "off")
+    try:
+        speed_window_days = int(os.getenv("SPEED_WINDOW_DAYS", "7"))
+    except ValueError:
+        speed_window_days = 7
+    try:
+        speed_min_samples = int(os.getenv("SPEED_MIN_SAMPLES", "5"))
+    except ValueError:
+        speed_min_samples = 5
+    try:
+        speed_slow_ratio = float(os.getenv("SPEED_SLOW_RATIO", "3.0"))
+    except ValueError:
+        speed_slow_ratio = 3.0
+    try:
+        speed_bg_patience_seconds = int(os.getenv("SPEED_BG_PATIENCE_SECONDS", "60"))
+    except ValueError:
+        speed_bg_patience_seconds = 60
+    try:
+        speed_quarantine_failures = int(os.getenv("SPEED_QUARANTINE_FAILURES", "3"))
+    except ValueError:
+        speed_quarantine_failures = 3
+    try:
+        speed_quarantine_seconds = int(os.getenv("SPEED_QUARANTINE_SECONDS", "600"))
+    except ValueError:
+        speed_quarantine_seconds = 600
+    try:
+        speed_refresh_seconds = int(os.getenv("SPEED_REFRESH_SECONDS", "300"))
+    except ValueError:
+        speed_refresh_seconds = 300
+    try:
+        phone_min_battery = int(os.getenv("PHONE_MIN_BATTERY", "15"))
+    except ValueError:
+        phone_min_battery = 15
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -204,4 +249,13 @@ def load_settings(path: Path | None = None) -> Settings:
         parser_watch_min_ok_pct=int(os.getenv("PARSER_WATCH_MIN_OK_PCT", "60")),
         parser_watch_max_incomplete_pct=int(os.getenv("PARSER_WATCH_MAX_INCOMPLETE_PCT", "60")),
         parser_watch_cooldown_hours=int(os.getenv("PARSER_WATCH_COOLDOWN_HOURS", "6")),
+        speed_routing=speed_routing,
+        speed_window_days=speed_window_days,
+        speed_min_samples=speed_min_samples,
+        speed_slow_ratio=speed_slow_ratio,
+        speed_bg_patience_seconds=speed_bg_patience_seconds,
+        speed_quarantine_failures=speed_quarantine_failures,
+        speed_quarantine_seconds=speed_quarantine_seconds,
+        speed_refresh_seconds=speed_refresh_seconds,
+        phone_min_battery=phone_min_battery,
     )

@@ -52,6 +52,7 @@ class PhoneSnapshot:
     """Снимок состояния устройства из хаба (хранится только в памяти)."""
     online: bool = True
     battery: int | None = None
+    charging: bool = False
     last_seen: Any = None
     busy: bool = False
     temperature: Any = None
@@ -72,6 +73,7 @@ class PhoneRegistry:
         phones_new_policy: str = "active",
         phones_snapshot_ttl_seconds: float = 180.0,
         phones_hold: list[str] | set[str] | str | None = None,
+        phone_min_battery: int | None = None,
     ) -> None:
         if path is not None:
             self.path = Path(path)
@@ -95,6 +97,13 @@ class PhoneRegistry:
         )
         self.phones_snapshot_ttl_seconds = float(phones_snapshot_ttl_seconds)
         self._phones_hold = self._parse_hold(phones_hold)
+        if phone_min_battery is not None:
+            self.phone_min_battery = int(phone_min_battery)
+        else:
+            try:
+                self.phone_min_battery = int(os.getenv("PHONE_MIN_BATTERY", "15"))
+            except ValueError:
+                self.phone_min_battery = 15
 
         self._lock = threading.Lock()
         self._phones: dict[str, dict[str, Any]] = {}
@@ -184,11 +193,13 @@ class PhoneRegistry:
                 if not dev_id:
                     continue
                 name = str(dev.get("name", "")).strip() or dev_id
+                charging = bool(dev.get("charging") or dev.get("plugged"))
 
                 # Обновляем снимок состояния только в памяти
                 snap = PhoneSnapshot(
                     online=bool(dev.get("online", True)),
                     battery=dev.get("battery"),
+                    charging=charging,
                     last_seen=dev.get("last_seen"),
                     busy=bool(dev.get("busy", False)),
                     temperature=dev.get("temperature"),
@@ -233,6 +244,7 @@ class PhoneRegistry:
         id: str,
         online: bool = True,
         battery: int | None = None,
+        charging: bool = False,
         updated_at: float | None = None,
         **kwargs: Any,
     ) -> None:
@@ -242,11 +254,18 @@ class PhoneRegistry:
             self._snapshots[clean_id] = PhoneSnapshot(
                 online=online,
                 battery=battery,
+                charging=charging,
                 updated_at=updated_at if updated_at is not None else time.monotonic(),
                 **kwargs,
             )
 
-    def is_usable(self, id: str, site_name: str | None = None) -> bool:
+    def is_usable(
+        self,
+        id: str,
+        site_name: str | None = None,
+        *,
+        ignore_battery: bool = False,
+    ) -> bool:
         """True, если телефон пригоден для работы на указанном сайте.
 
         Условия:
@@ -254,6 +273,7 @@ class PhoneRegistry:
         2. Телефон есть в реестре со статусом active.
         3. site_name проходит sites_allow/sites_deny (если заданы).
         4. Свежий снимок состояния не помечен офлайн (старый снимок или его отсутствие = онлайн).
+        5. Батарея не ниже phone_min_battery (если не на зарядке).
         """
         clean_id = str(id).strip()
         if not clean_id:
@@ -283,6 +303,14 @@ class PhoneRegistry:
                 age = time.monotonic() - snap.updated_at
                 if age <= self.phones_snapshot_ttl_seconds:
                     if not snap.online:
+                        return False
+                    if (
+                        not ignore_battery
+                        and self.phone_min_battery > 0
+                        and snap.battery is not None
+                        and snap.battery < self.phone_min_battery
+                        and not snap.charging
+                    ):
                         return False
 
         return True
@@ -363,6 +391,13 @@ class PhoneRegistry:
                     item["online"] = snap.online
                     item["is_online_fresh"] = age <= self.phones_snapshot_ttl_seconds
                     item["battery"] = snap.battery
+                    item["charging"] = snap.charging
+                    item["low_battery"] = bool(
+                        self.phone_min_battery > 0
+                        and snap.battery is not None
+                        and snap.battery < self.phone_min_battery
+                        and not snap.charging
+                    )
                     item["last_seen"] = snap.last_seen
                     item["busy"] = snap.busy
                     item["temperature"] = snap.temperature
@@ -370,6 +405,8 @@ class PhoneRegistry:
                     item["online"] = None
                     item["is_online_fresh"] = False
                     item["battery"] = None
+                    item["charging"] = False
+                    item["low_battery"] = False
                     item["last_seen"] = None
                     item["busy"] = None
                     item["temperature"] = None

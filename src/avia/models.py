@@ -69,3 +69,4 @@ class SiteResult:
     device: str | None = None
     queue_wait: float | None = None
     fetch_seconds: float | None = None
+    priority: int | None = None
