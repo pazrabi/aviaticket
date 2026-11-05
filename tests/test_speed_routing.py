@@ -481,3 +481,274 @@ async def test_search_retry_on_failure_and_metric_recorded(tmp_path, monkeypatch
         assert rows[0]["device"] == "dev_fail"
         assert rows[0]["captcha"] == 1
         assert rows[0]["ok"] == 0
+
+
+@pytest.mark.asyncio
+async def test_from_browser_retries_on_parser_empty_error_and_records_metrics(tmp_path, monkeypatch):
+    """При неполной выдаче без офферов ParserEmptyError перехватывается, провал пишется в метрики и опрашивается следующий телефон."""
+    from avia.collector import Snapshot
+    from avia.models import Offer, Query
+    from avia.parsers import PARSERS
+    from avia.pipeline import _from_browser
+
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+
+    site = SiteConfig(
+        name="empty_test_site",
+        url_template="https://test.site/{origin}{destination}",
+        phone="dev1,dev2",
+        parser="empty_test_parser",
+    )
+    settings = Settings(
+        sites=[site],
+        storage_dir=tmp_path,
+        metrics=store,
+        droidhub_url="https://hub.test",
+        droidhub_token="secret",
+    )
+
+    def empty_parser(snap, q):
+        if "EMPTY" in snap.text:
+            return []
+        return [Offer(site="empty_test_site", price=4200)]
+
+    monkeypatch.setitem(PARSERS, "empty_test_parser", empty_parser)
+
+    call_log = []
+
+    async def fake_fetch_any(s, cands, url, **kwargs):
+        st = kwargs.get("stats")
+        dev = cands[0]
+        call_log.append(dev)
+        if st is not None:
+            st["device"] = dev
+            st["queue_wait"] = 0.2
+            st["fetch_seconds"] = 1.5
+            st["tried"] = [dev]
+        if dev == "dev1":
+            # Текст > 200 символов без офферов -> _process_snapshot бросит ParserEmptyError
+            long_text = "EMPTY " * 60
+            return Snapshot(url=url, text=long_text, blocked=False), True
+        return Snapshot(url=url, text="Билеты найдены", blocked=False), True
+
+    monkeypatch.setattr("avia.pipeline.fetch_page_snapshot_any", fake_fetch_any)
+
+    q = Query("MOW", "LED", date(2026, 12, 10))
+    offers, page_url, partial = await _from_browser(site, q, settings, priority=0)
+
+    # dev1 упал с ParserEmptyError -> запрос переключился на dev2
+    assert call_log == ["dev1", "dev2"]
+    assert len(offers) == 1
+    assert offers[0].price == 4200
+
+    # Провал dev1 зафиксирован в site_runs
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT device, ok, partial, error FROM site_runs WHERE device='dev1'").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["device"] == "dev1"
+        assert rows[0]["ok"] == 0
+        assert rows[0]["partial"] == 1
+        assert "неполная выдача без офферов" in rows[0]["error"]
+
+
+def test_speed_table_bg_preserves_unmeasured_eligible_candidates(tmp_path):
+    """В priority > 0 кандидат с est is None не отбрасывается и входит в slow_list перед быстрыми."""
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+    t0 = time.time() - 3600.0
+
+    # pixel: быстрый (медиана 4.0с, n=6)
+    for i in range(6):
+        store.record_run("bg", "as", ok=True, partial=False, captcha=False, error=None,
+                         offers=5, elapsed=4.0, ts=t0 + i, device="pixel", fetch_seconds=4.0, priority=2)
+
+    # redmi: медленный (медиана 12.0с, n=6)
+    for i in range(6):
+        store.record_run("bg", "as", ok=True, partial=False, captcha=False, error=None,
+                         offers=5, elapsed=12.0, ts=t0 + i, device="redmi", fetch_seconds=12.0, priority=2)
+
+    # unmeasured: 1 запуск ok, но fetch_seconds=None (st.n=1, est is None)
+    store.record_run("bg", "as", ok=True, partial=False, captcha=False, error=None,
+                     offers=5, elapsed=0.0, ts=t0 + 20, device="unmeasured", fetch_seconds=None, priority=2)
+
+    site = SiteConfig(name="as", url_template="https://test", phone="pixel,redmi,unmeasured")
+    settings = Settings(sites=[site], storage_dir=tmp_path, metrics=store)
+    table = get_speed_table(settings)
+    table.refresh(now=t0 + 50)
+
+    # Принудительно очистим медиану сайта чтобы est остался None
+    table._site_medians.clear()
+
+    ordered = table.order_candidates(site, ["pixel", "redmi", "unmeasured"], priority=2, now=t0 + 50)
+    # unmeasured НЕ должен исчезнуть!
+    assert "unmeasured" in ordered
+    assert "redmi" in ordered
+    assert "pixel" in ordered
+    # Медленный redmi и unmeasured идут перед быстрым pixel
+    assert list(ordered) == ["redmi", "unmeasured", "pixel"]
+
+
+@pytest.mark.asyncio
+async def test_from_browser_passes_site_name_to_fetch_page_snapshot_any(tmp_path, monkeypatch):
+    """_from_browser передает site_name=site.name в fetch_page_snapshot_any, и сбой пишется с правильным сайтом."""
+    from avia.collector import Snapshot
+    from avia.models import Offer, Query
+    from avia.parsers import PARSERS
+    from avia.pipeline import _from_browser
+
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+
+    site = SiteConfig(
+        name="custom_mirror_site",
+        url_template="https://mirror.unknown-domain.org/{origin}{destination}",
+        phone="dev_fail,dev_ok",
+        parser="custom_parser",
+    )
+    settings = Settings(
+        sites=[site],
+        storage_dir=tmp_path,
+        metrics=store,
+        droidhub_url="https://hub.test",
+        droidhub_token="secret",
+    )
+
+    passed_kwargs = {}
+
+    async def fake_fetch_any(s, cands, url, **kwargs):
+        passed_kwargs.update(kwargs)
+        dev = cands[0]
+        st = kwargs.get("stats")
+        if st is not None:
+            st["device"] = dev
+            st["queue_wait"] = 0.1
+            st["fetch_seconds"] = 1.0
+            st["tried"] = [dev]
+        if dev == "dev_fail":
+            # Имитируем сбой с записью через droidhub._record_failure
+            from avia.droidhub import _record_failure
+            _record_failure(
+                settings=s,
+                site=kwargs.get("site_name") or "site",
+                device=dev,
+                priority=kwargs.get("priority", 0),
+                error="502 Bad Gateway",
+            )
+            return Snapshot(url=url, text="Капча", blocked=True), True
+        return Snapshot(url=url, text="Успех", blocked=False), True
+
+    monkeypatch.setattr("avia.pipeline.fetch_page_snapshot_any", fake_fetch_any)
+    monkeypatch.setitem(PARSERS, "custom_parser", lambda snap, q: [Offer(site="custom_mirror_site", price=3000)])
+
+    q = Query("MOW", "LED", date(2026, 12, 10))
+    offers, page_url, partial = await _from_browser(site, q, settings, priority=0)
+
+    assert passed_kwargs.get("site_name") == "custom_mirror_site"
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT site, device, error FROM site_runs WHERE device='dev_fail'").fetchall()
+        assert len(rows) >= 1
+        assert rows[0]["site"] == "custom_mirror_site"
+        assert rows[0]["site"] != "site"
+
+
+@pytest.mark.asyncio
+async def test_from_browser_removes_all_tried_devices(tmp_path, monkeypatch):
+    """Все опробованные устройства (tried) удаляются из remaining_cands, предотвращая повторный опрос упавшего телефона."""
+    from avia.collector import Snapshot
+    from avia.models import Offer, Query
+    from avia.parsers import PARSERS
+    from avia.pipeline import _from_browser
+
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+
+    site = SiteConfig(
+        name="test_site",
+        url_template="https://test.site/{origin}{destination}",
+        phone="dev1,dev2,dev3",
+        parser="test_p",
+    )
+    settings = Settings(
+        sites=[site],
+        storage_dir=tmp_path,
+        metrics=store,
+        droidhub_url="https://hub.test",
+        droidhub_token="secret",
+    )
+
+    received_cands_history = []
+
+    async def fake_fetch_any(s, cands, url, **kwargs):
+        received_cands_history.append(list(cands))
+        st = kwargs.get("stats")
+        # При первом вызове fake_fetch_any пробует dev1 (упал внутри) и dev2 (вернул капчу)
+        if "dev1" in cands:
+            if st is not None:
+                st["device"] = "dev2"
+                st["tried"] = ["dev1", "dev2"]
+                st["queue_wait"] = 0.5
+                st["fetch_seconds"] = 1.0
+            return Snapshot(url=url, text="Капча", blocked=True), True
+        else:
+            # Второй вызов должен содержать ТОЛЬКО dev3!
+            if st is not None:
+                st["device"] = "dev3"
+                st["tried"] = ["dev3"]
+                st["queue_wait"] = 0.1
+                st["fetch_seconds"] = 1.0
+            return Snapshot(url=url, text="Успех", blocked=False), True
+
+    monkeypatch.setattr("avia.pipeline.fetch_page_snapshot_any", fake_fetch_any)
+    monkeypatch.setitem(PARSERS, "test_p", lambda snap, q: [Offer(site="test_site", price=2500)])
+
+    q = Query("MOW", "LED", date(2026, 12, 10))
+    offers, page_url, partial = await _from_browser(site, q, settings, priority=0)
+
+    # 1-й вызов: dev1, dev2, dev3.
+    # dev1 и dev2 были опробованы.
+    # 2-й вызов должен получить ТОЛЬКО dev3 (dev1 не должен повторяться!)
+    assert len(received_cands_history) == 2
+    assert received_cands_history[0] == ["dev1", "dev2", "dev3"]
+    assert received_cands_history[1] == ["dev3"]
+
+
+def test_phone_auto_speed_routing_preference_list(tmp_path):
+    """Сайт с phone='auto' при наличии замеров возвращает PreferenceList с правильной сортировкой."""
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+    t0 = time.time() - 3600.0
+
+    # auto_fast: 3.0с
+    for i in range(6):
+        store.record_run("user", "site_auto", ok=True, partial=False, captcha=False, error=None,
+                         offers=5, elapsed=3.0, ts=t0 + i, device="auto_fast", fetch_seconds=3.0, priority=0)
+
+    # auto_slow: 9.0с
+    for i in range(6):
+        store.record_run("user", "site_auto", ok=True, partial=False, captcha=False, error=None,
+                         offers=5, elapsed=9.0, ts=t0 + i, device="auto_slow", fetch_seconds=9.0, priority=0)
+
+    site = SiteConfig("site_auto", "https://auto.test", phone="auto")
+    settings = Settings(
+        sites=[site],
+        storage_dir=tmp_path,
+        metrics=store,
+        droidhub_url="https://hub.test",
+        droidhub_token="secret",
+        droidhub_devices=["auto_slow", "auto_fast"],
+    )
+
+    # Для людей быстрый телефон идет первым и возвращается PreferenceList
+    cands_live = candidates(settings, site, priority=0)
+    assert isinstance(cands_live, PreferenceList)
+    assert list(cands_live) == ["auto_fast", "auto_slow"]
+    assert cands_live.prefer_order is True
+
+    # Для фона медленный телефон идет первым
+    cands_bg = candidates(settings, site, priority=2)
+    assert isinstance(cands_bg, PreferenceList)
+    assert list(cands_bg) == ["auto_slow", "auto_fast"]
+    assert cands_bg.prefer_order is True

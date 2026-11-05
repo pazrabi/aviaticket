@@ -284,7 +284,7 @@ def candidates(
             from .speed import get_speed_table
             table = get_speed_table(settings)
             res = table.order_candidates(site, clean, priority=priority)
-            return list(res)
+            return res
         except Exception as e:
             logger.warning("Ошибка speed_routing для auto (%s): %s", site_name, e)
             return clean
@@ -788,6 +788,7 @@ async def fetch_page_snapshot_any(
             stats["device"] = dev
             stats["queue_wait"] = total_queue_wait
             stats["attempts"] = attempts
+            stats["tried"] = list(tried)
 
         t_fetch_start = time.monotonic()
         try:
@@ -803,11 +804,13 @@ async def fetch_page_snapshot_any(
             fetch_sec = time.monotonic() - t_fetch_start
             if stats is not None:
                 stats["fetch_seconds"] = fetch_sec
+                stats["tried"] = list(tried)
             return snap, finished
         except Exception as exc:
             fetch_sec = time.monotonic() - t_fetch_start
             if stats is not None:
                 stats["fetch_seconds"] = fetch_sec
+                stats["tried"] = list(tried)
             last_exc = exc
             eff_site = site_name or _infer_site_name(url)
             _record_failure(

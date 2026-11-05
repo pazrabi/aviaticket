@@ -239,8 +239,13 @@ async def _from_browser(
 
     if phone_enabled(settings, site):
         cand_list = candidates(settings, site, priority=priority)
-        patience = getattr(cand_list, "patience", patience)
-        preferred_count = getattr(cand_list, "preferred_count", None)
+        orig_patience = getattr(cand_list, "patience", patience)
+        orig_preferred_count = getattr(cand_list, "preferred_count", None)
+        pref_base_set = (
+            set(cand_list[:orig_preferred_count])
+            if (isinstance(cand_list, PreferenceList) and orig_preferred_count is not None)
+            else None
+        )
 
         remaining_cands = list(cand_list)
         last_snap = None
@@ -249,11 +254,19 @@ async def _from_browser(
 
         while remaining_cands:
             cur_stats: dict[str, Any] = {}
-            pref_arg = (
-                PreferenceList(remaining_cands, patience=patience, preferred_count=preferred_count)
-                if isinstance(cand_list, PreferenceList)
-                else remaining_cands
-            )
+            if isinstance(cand_list, PreferenceList):
+                if pref_base_set is not None:
+                    rem_pref = sum(1 for c in remaining_cands if c in pref_base_set)
+                    cur_patience = orig_patience if rem_pref > 0 else 0.0
+                    cur_pref_count = max(1, rem_pref) if rem_pref > 0 else len(remaining_cands)
+                else:
+                    cur_patience = orig_patience
+                    cur_pref_count = orig_preferred_count
+                pref_arg = PreferenceList(remaining_cands, patience=cur_patience, preferred_count=cur_pref_count)
+            else:
+                cur_patience = orig_patience
+                pref_arg = remaining_cands
+
             try:
                 snap, finished = await fetch_page_snapshot_any(
                     settings,
@@ -265,7 +278,8 @@ async def _from_browser(
                     priority=priority,
                     weight=effective_weight,
                     stats=cur_stats,
-                    patience=patience,
+                    patience=cur_patience,
+                    site_name=site.name,
                 )
             except Exception as exc:
                 last_exc = exc
@@ -276,10 +290,14 @@ async def _from_browser(
             if stats is not None:
                 stats.update(cur_stats)
 
+            tried_devs = cur_stats.get("tried") or ([cur_stats["device"]] if cur_stats.get("device") else [])
+            for td in tried_devs:
+                if td in remaining_cands:
+                    remaining_cands.remove(td)
             used_dev = cur_stats.get("device")
             if used_dev and used_dev in remaining_cands:
                 remaining_cands.remove(used_dev)
-            elif remaining_cands:
+            if not tried_devs and not used_dev and remaining_cands:
                 remaining_cands.pop(0)
 
             if snap.blocked:
@@ -303,10 +321,9 @@ async def _from_browser(
                 raise RuntimeError("сайт показал капчу на телефоне")
 
             partial = not finished
-            offers, page_url, partial = await _process_snapshot(site, snap, q, settings, partial=partial)
-
-            # Проверка: неполная выдача без офферов
-            if partial and not offers and remaining_cands:
+            try:
+                offers, page_url, partial = await _process_snapshot(site, snap, q, settings, partial=partial)
+            except ParserEmptyError as exc:
                 try:
                     from .droidhub import _record_failure
                     _record_failure(
@@ -322,8 +339,42 @@ async def _from_browser(
                     )
                 except Exception:
                     pass
-                log.warning("Сайт %s: неполная выдача без офферов на телефоне %s, пробуем следующий телефон", site.name, used_dev)
-                continue
+                if remaining_cands:
+                    if exc.snapshot_path and exc.snapshot_path.exists():
+                        try:
+                            exc.snapshot_path.unlink()
+                        except OSError:
+                            pass
+                    log.warning(
+                        "Сайт %s: неполная/пустая выдача без офферов на телефоне %s (%s), пробуем следующий телефон",
+                        site.name,
+                        used_dev,
+                        exc,
+                    )
+                    continue
+                raise
+
+            # Проверка: неполная выдача без офферов
+            if partial and not offers:
+                try:
+                    from .droidhub import _record_failure
+                    _record_failure(
+                        settings=settings,
+                        site=site.name,
+                        device=used_dev or "unknown",
+                        priority=priority,
+                        error="неполная выдача без офферов",
+                        partial=True,
+                        offers=0,
+                        fetch_seconds=cur_stats.get("fetch_seconds"),
+                        queue_wait=cur_stats.get("queue_wait"),
+                    )
+                except Exception:
+                    pass
+                if remaining_cands:
+                    log.warning("Сайт %s: неполная выдача без офферов на телефоне %s, пробуем следующий телефон", site.name, used_dev)
+                    continue
+                return offers, page_url, partial
 
             return offers, page_url, partial
 

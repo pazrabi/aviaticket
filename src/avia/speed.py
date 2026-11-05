@@ -404,7 +404,9 @@ class SpeedTable:
             # Если у всех телефонов нет данных (n == 0), сохраняем исходный порядок (Req 2a)
             if not eligible and not bad_candidates:
                 orig_patience = float(getattr(site, "phone_patience_seconds", 0) or 0)
-                return PreferenceList(cands, patience=orig_patience)
+                if isinstance(cands, PreferenceList):
+                    return PreferenceList(cands, patience=orig_patience)
+                return list(cands)
 
             if eligible:
                 # Находим лучший (наименьший) медианный замер среди телефонов с достаточным n
@@ -503,8 +505,8 @@ class SpeedTable:
                 fastest_est = min(measured_ests)
                 slowest_est = max(measured_ests)
                 if slowest_est > fastest_est:
-                    # Медленные: est > fastest_est; быстрые: est <= fastest_est
-                    slow_list = [x for x in eligible if x[1] is not None and x[1] > fastest_est]
+                    # Медленные: est > fastest_est или est is None; быстрые: est <= fastest_est
+                    slow_list = [x for x in eligible if x[1] is None or x[1] > fastest_est]
                     fast_list = [x for x in eligible if x[1] is not None and x[1] <= fastest_est]
                 else:
                     slow_list = list(eligible)
