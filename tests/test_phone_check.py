@@ -156,14 +156,14 @@ def test_admin_panel_buttons_for_new_and_existing():
     act_row = rows[1]
     assert len(act_row) == 2
     assert act_row[1] == {"text": "🔄", "callback_data": "adm:ph:re:p_act"}
-    assert "❄️ Заморозить Redmi Act" in act_row[0]["text"]
+    assert "❄️ Redmi Act" in act_row[0]["text"]
     assert act_row[0]["callback_data"] == "adm:ph:hold:p_act"
 
     # Для p_hld: кнопка включения + «🔄»
     hld_row = rows[2]
     assert len(hld_row) == 2
     assert hld_row[1]["callback_data"] == "adm:ph:re:p_hld"
-    assert "▶️ В работу Honor Hold" in hld_row[0]["text"]
+    assert "▶️ Honor Hold" in hld_row[0]["text"]
     assert hld_row[0]["callback_data"] == "adm:ph:on:p_hld"
 
 

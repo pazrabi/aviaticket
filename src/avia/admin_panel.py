@@ -855,6 +855,7 @@ def make_phones_keyboard(phones: list[dict[str, Any]]) -> dict[str, Any]:
     for p in phones:
         p_id = str(p.get("id", "")).strip()
         p_name = str(p.get("name", p_id)).strip() or p_id
+        p_name = p_name.replace(" (m)", "")
         is_hold_env = bool(p.get("is_hold_env", False))
         status = str(p.get("status", "active"))
         if is_hold_env:
@@ -869,12 +870,12 @@ def make_phones_keyboard(phones: list[dict[str, Any]]) -> dict[str, Any]:
         else:
             if status == "active":
                 btn_toggle = {
-                    "text": f"❄️ Заморозить {p_name}",
+                    "text": f"❄️ {p_name}",
                     "callback_data": f"adm:ph:hold:{p_id}",
                 }
             else:
                 btn_toggle = {
-                    "text": f"▶️ В работу {p_name}",
+                    "text": f"▶️ {p_name}",
                     "callback_data": f"adm:ph:on:{p_id}",
                 }
             btn_recheck = {
