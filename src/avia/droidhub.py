@@ -768,7 +768,8 @@ async def fetch_page_snapshot_any(
             break
 
         rem_pref = sum(1 for c in remaining if c in pref_set)
-        acq_pref = max(1, rem_pref) if rem_pref > 0 else 1
+        acq_patience = patience_val if rem_pref > 0 else 0.0
+        acq_pref = max(1, rem_pref) if rem_pref > 0 else len(remaining)
 
         t_acq_start = time.monotonic()
         dev = await acquire(
@@ -776,7 +777,7 @@ async def fetch_page_snapshot_any(
             priority=priority,
             weight=weight,
             prefer_order=prefer_order,
-            patience=patience_val,
+            patience=acq_patience,
             preferred_count=acq_pref,
         )
         t_acq = time.monotonic() - t_acq_start
@@ -813,16 +814,17 @@ async def fetch_page_snapshot_any(
                 stats["tried"] = list(tried)
             last_exc = exc
             eff_site = site_name or _infer_site_name(url)
-            _record_failure(
-                settings=settings,
-                site=eff_site,
-                device=dev,
-                priority=priority,
-                error=str(exc),
-                captcha=False,
-                fetch_seconds=fetch_sec,
-                queue_wait=t_acq,
-            )
+            if any(c for c in clean_candidates if c not in tried) and _is_retryable_error(exc):
+                _record_failure(
+                    settings=settings,
+                    site=eff_site,
+                    device=dev,
+                    priority=priority,
+                    error=str(exc),
+                    captcha=False,
+                    fetch_seconds=fetch_sec,
+                    queue_wait=t_acq,
+                )
             if not _is_retryable_error(exc):
                 raise
             if not any(c for c in clean_candidates if c not in tried):

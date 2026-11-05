@@ -88,6 +88,7 @@ class SpeedTable:
                 self._last_refresh = time.monotonic()
             return
 
+        conn = None
         try:
             conn = sqlite3.connect(self.metrics_path, timeout=5)
             conn.row_factory = sqlite3.Row
@@ -135,6 +136,9 @@ class SpeedTable:
         except Exception as e:
             logger.warning("Ошибка чтения метрик для таблицы скоростей (%s): %s", self.metrics_path, e)
             return
+        finally:
+            if conn is not None:
+                conn.close()
 
         # 1. Расчёт последовательных неудач и карантина для каждой пары (сайт, телефон)
         pair_runs_map: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -191,6 +195,12 @@ class SpeedTable:
             grouped.setdefault(key, []).append(r)
             pair = (s_name, dev)
             pair_total_counts[pair] = pair_total_counts.get(pair, 0) + 1
+
+        for pair, cnt in pair_total_counts.items():
+            if pair in new_pairs:
+                new_pairs[pair].total_runs = max(new_pairs[pair].total_runs, cnt)
+            else:
+                new_pairs[pair] = PairStatus(total_runs=cnt)
 
         new_stats: dict[tuple[str, str, str], SpeedStats] = {}
         site_class_fetches: dict[tuple[str, str], list[float]] = {}
@@ -390,7 +400,7 @@ class SpeedTable:
                 elif is_bad_rate:
                     # Непригоден по доле успеха
                     bad_candidates.append(dev)
-                elif st.n == 0 and pair_st.total_runs == 0:
+                elif (st.n + bg_st.n == 0) and pair_st.total_runs == 0:
                     # Новая пара без замеров
                     new_candidates.append(dev)
                 else:
@@ -482,7 +492,7 @@ class SpeedTable:
                 elif pair_st.awaiting_trial:
                     # После карантина пара получает одну пробную попытку ТОЛЬКО от фона (Req 3)
                     trial_candidates.append(dev)
-                elif pair_st.total_runs == 0:
+                elif (st.n + live_st.n == 0) and pair_st.total_runs == 0:
                     # Новая пара без замеров (n == 0): фон исследует первыми (Req 4)
                     exploratory_candidates.append(dev)
                 else:

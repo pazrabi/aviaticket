@@ -752,3 +752,201 @@ def test_phone_auto_speed_routing_preference_list(tmp_path):
     assert isinstance(cands_bg, PreferenceList)
     assert list(cands_bg) == ["auto_slow", "auto_fast"]
     assert cands_bg.prefer_order is True
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_snapshot_any_resets_patience_on_fallbacks(monkeypatch, tmp_path):
+    """Когда предпочтительные телефоны исчерпаны, терпение сбрасывается в 0, а preferred_count равен числу оставшихся."""
+    from avia.droidhub import fetch_page_snapshot_any, PreferenceList, DroidhubError
+    from avia.collector import Snapshot
+
+    acquired_calls = []
+
+    async def fake_acquire(cands, **kwargs):
+        acquired_calls.append((list(cands), kwargs))
+        return cands[0]
+
+    async def fake_release(dev):
+        pass
+
+    attempt = 0
+    async def fake_fetch_device(settings, dev, url, **kwargs):
+        nonlocal attempt
+        attempt += 1
+        if attempt == 1:
+            raise DroidhubError("502 Bad Gateway")
+        return Snapshot(url=url, text="OK", blocked=False), True
+
+    monkeypatch.setattr("avia.droidhub.acquire", fake_acquire)
+    monkeypatch.setattr("avia.droidhub.release", fake_release)
+    monkeypatch.setattr("avia.droidhub._fetch_device_snapshot", fake_fetch_device)
+
+    settings = Settings(sites=[], storage_dir=tmp_path, droidhub_url="https://hub.test", droidhub_token="t")
+    cand_pref = PreferenceList(["p1", "s1", "s2"], patience=30.0, preferred_count=1)
+
+    snap, fin = await fetch_page_snapshot_any(settings, cand_pref, "https://test.site")
+    assert snap.text == "OK"
+    assert len(acquired_calls) == 2
+    # 1-й вызов: предпочтительный p1, patience=30.0, preferred_count=1
+    assert acquired_calls[0][0] == ["p1", "s1", "s2"]
+    assert acquired_calls[0][1]["patience"] == 30.0
+    assert acquired_calls[0][1]["preferred_count"] == 1
+    # 2-й вызов: предпочтительных не осталось, patience=0.0, preferred_count=2
+    assert acquired_calls[1][0] == ["s1", "s2"]
+    assert acquired_calls[1][1]["patience"] == 0.0
+    assert acquired_calls[1][1]["preferred_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_no_duplicate_failure_record_on_last_candidate(tmp_path, monkeypatch):
+    """При сбое последнего/единственного кандидата запись в site_runs добавляется ровно один раз через SiteResult."""
+    from avia.pipeline import _run_site
+    from avia.models import Query
+    from avia.droidhub import DroidhubError
+    from avia.parsers import PARSERS
+
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+
+    site = SiteConfig(name="single_fail", url_template="https://test", phone="only_one", parser="p_test")
+    settings = Settings(
+        sites=[site],
+        storage_dir=tmp_path,
+        metrics=store,
+        droidhub_url="https://hub.test",
+        droidhub_token="t",
+    )
+
+    monkeypatch.setitem(PARSERS, "p_test", lambda snap, q: [])
+
+    async def fake_fetch_device(settings, dev, url, **kwargs):
+        raise DroidhubError("502 Bad Gateway")
+
+    monkeypatch.setattr("avia.droidhub._fetch_device_snapshot", fake_fetch_device)
+
+    q = Query("MOW", "LED", date(2026, 12, 10))
+    res = await _run_site(site, q, settings, priority=0)
+    assert not res.ok
+
+    store.record_results("user", [res])
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT site, device, ok, error FROM site_runs WHERE device='only_one'").fetchall()
+        assert len(rows) == 1
+        assert rows[0]["ok"] == 0
+
+
+def test_admin_panel_shows_hold_and_low_battery_badges(tmp_path):
+    """В блоке 'Порядок телефонов' отображаются бейджи [заморозка] и [пониженная батарея] для отсеянных телефонов."""
+    from avia.admin_panel import build_parse
+    from avia.phones import PhoneRegistry
+
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+    t0 = time.time() - 3600.0
+    store.record_run("user", "test_site", ok=True, partial=False, captcha=False, error=None,
+                     offers=5, elapsed=3.0, ts=t0, device="p_ok", fetch_seconds=3.0, priority=0)
+
+    reg = PhoneRegistry(tmp_path / "phones.json", phone_min_battery=20)
+    reg.register("p_ok", name="Pixel OK", status="active")
+    reg.register("p_hold", name="Pixel Hold", status="hold")
+    reg.register("p_low_bat", name="Pixel Low Bat", status="active")
+
+    reg.update_snapshot("p_ok", online=True, battery=80, charging=False)
+    reg.update_snapshot("p_hold", online=True, battery=90, charging=False)
+    reg.update_snapshot("p_low_bat", online=True, battery=10, charging=False)
+
+    site = SiteConfig(name="test_site", url_template="https://test", phone="p_ok,p_hold,p_low_bat")
+    settings = Settings(sites=[site], storage_dir=tmp_path, metrics=store, phones=reg, phone_min_battery=20)
+
+    ctx = {
+        "settings": settings,
+        "summary": store.summary(0.0),
+        "devices_summary": store.summary_by_device(0.0),
+        "site_devices_summary": store.summary_by_site_device(0.0),
+        "counts_by_source": {},
+        "recent_errors": [],
+    }
+
+    text = build_parse(ctx, period="24h")
+    assert "Порядок телефонов:" in text
+    assert "test_site:" in text
+    assert "p_hold" in text
+    assert "[заморозка]" in text
+    assert "p_low_bat" in text
+    assert "[пониженная батарея]" in text
+
+
+def test_speed_table_pair_total_counts_and_exploratory_fallback(tmp_path):
+    """Телефон с замерами не определяется как exploratory в фоне, даже если не попал в последние 2000 записей."""
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+    now = time.time()
+    t_old = now - (3 * 86400)
+
+    store.record_run("bg", "site1", ok=True, partial=False, captcha=False, error=None,
+                     offers=3, elapsed=5.0, ts=t_old, device="p_known", fetch_seconds=5.0, priority=2)
+
+    with sqlite3.connect(db_path) as conn:
+        dummy_rows = [
+            (t_old + 10 + i, "user", "other_site", 1, 0, 0, None, 1, 2.0, "other_dev", 0.1, 2.0, 0)
+            for i in range(2050)
+        ]
+        conn.executemany(
+            """INSERT INTO site_runs (ts, source, site, ok, partial, captcha, error, offers, elapsed, device, queue_wait, fetch_seconds, priority)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            dummy_rows
+        )
+
+    site = SiteConfig(name="site1", url_template="https://test", phone="p_known,p_brand_new")
+    settings = Settings(sites=[site], storage_dir=tmp_path, metrics=store)
+    table = get_speed_table(settings)
+    table.refresh(now=now)
+
+    pst = table.get_pair_status("site1", "p_known")
+    assert pst.total_runs >= 1
+
+    cands_bg = table.order_candidates(site, ["p_known", "p_brand_new"], priority=2, now=now)
+    assert list(cands_bg) == ["p_brand_new", "p_known"]
+
+
+def test_speed_table_closes_sqlite_connection(tmp_path, monkeypatch):
+    """SpeedTable.refresh гарантированно закрывает соединение с SQLite."""
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+    store.record_run("user", "s", ok=True, partial=False, captcha=False, error=None,
+                     offers=1, elapsed=1.0, ts=time.time(), device="d", fetch_seconds=1.0, priority=0)
+
+    closed = False
+    orig_connect = sqlite3.connect
+
+    class ConnWrapper:
+        def __init__(self, real_conn):
+            self._real = real_conn
+        def __getattr__(self, item):
+            return getattr(self._real, item)
+        def __setattr__(self, name, value):
+            if name == "_real":
+                super().__setattr__(name, value)
+            else:
+                setattr(self._real, name, value)
+        def __enter__(self):
+            return self._real.__enter__()
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return self._real.__exit__(exc_type, exc_val, exc_tb)
+        def close(self):
+            nonlocal closed
+            closed = True
+            return self._real.close()
+
+    def fake_connect(*args, **kwargs):
+        return ConnWrapper(orig_connect(*args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+
+    settings = Settings(sites=[], storage_dir=tmp_path, metrics=store)
+    table = get_speed_table(settings)
+    table.refresh()
+
+    assert closed is True

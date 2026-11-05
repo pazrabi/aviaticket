@@ -301,21 +301,21 @@ async def _from_browser(
                 remaining_cands.pop(0)
 
             if snap.blocked:
-                try:
-                    from .droidhub import _record_failure
-                    _record_failure(
-                        settings=settings,
-                        site=site.name,
-                        device=used_dev or "unknown",
-                        priority=priority,
-                        error="сайт показал капчу на телефоне",
-                        captcha=True,
-                        fetch_seconds=cur_stats.get("fetch_seconds"),
-                        queue_wait=cur_stats.get("queue_wait"),
-                    )
-                except Exception:
-                    pass
                 if remaining_cands:
+                    try:
+                        from .droidhub import _record_failure
+                        _record_failure(
+                            settings=settings,
+                            site=site.name,
+                            device=used_dev or "unknown",
+                            priority=priority,
+                            error="сайт показал капчу на телефоне",
+                            captcha=True,
+                            fetch_seconds=cur_stats.get("fetch_seconds"),
+                            queue_wait=cur_stats.get("queue_wait"),
+                        )
+                    except Exception:
+                        pass
                     log.warning("Сайт %s: капча на телефоне %s, пробуем следующий телефон", site.name, used_dev)
                     continue
                 raise RuntimeError("сайт показал капчу на телефоне")
@@ -324,22 +324,22 @@ async def _from_browser(
             try:
                 offers, page_url, partial = await _process_snapshot(site, snap, q, settings, partial=partial)
             except ParserEmptyError as exc:
-                try:
-                    from .droidhub import _record_failure
-                    _record_failure(
-                        settings=settings,
-                        site=site.name,
-                        device=used_dev or "unknown",
-                        priority=priority,
-                        error="неполная выдача без офферов",
-                        partial=True,
-                        offers=0,
-                        fetch_seconds=cur_stats.get("fetch_seconds"),
-                        queue_wait=cur_stats.get("queue_wait"),
-                    )
-                except Exception:
-                    pass
                 if remaining_cands:
+                    try:
+                        from .droidhub import _record_failure
+                        _record_failure(
+                            settings=settings,
+                            site=site.name,
+                            device=used_dev or "unknown",
+                            priority=priority,
+                            error="неполная выдача без офферов",
+                            partial=True,
+                            offers=0,
+                            fetch_seconds=cur_stats.get("fetch_seconds"),
+                            queue_wait=cur_stats.get("queue_wait"),
+                        )
+                    except Exception:
+                        pass
                     if exc.snapshot_path and exc.snapshot_path.exists():
                         try:
                             exc.snapshot_path.unlink()
@@ -356,22 +356,22 @@ async def _from_browser(
 
             # Проверка: неполная выдача без офферов
             if partial and not offers:
-                try:
-                    from .droidhub import _record_failure
-                    _record_failure(
-                        settings=settings,
-                        site=site.name,
-                        device=used_dev or "unknown",
-                        priority=priority,
-                        error="неполная выдача без офферов",
-                        partial=True,
-                        offers=0,
-                        fetch_seconds=cur_stats.get("fetch_seconds"),
-                        queue_wait=cur_stats.get("queue_wait"),
-                    )
-                except Exception:
-                    pass
                 if remaining_cands:
+                    try:
+                        from .droidhub import _record_failure
+                        _record_failure(
+                            settings=settings,
+                            site=site.name,
+                            device=used_dev or "unknown",
+                            priority=priority,
+                            error="неполная выдача без офферов",
+                            partial=True,
+                            offers=0,
+                            fetch_seconds=cur_stats.get("fetch_seconds"),
+                            queue_wait=cur_stats.get("queue_wait"),
+                        )
+                    except Exception:
+                        pass
                     log.warning("Сайт %s: неполная выдача без офферов на телефоне %s, пробуем следующий телефон", site.name, used_dev)
                     continue
                 return offers, page_url, partial

@@ -365,9 +365,54 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
             if phone_sites:
                 order_lines = ["", "<b>Порядок телефонов:</b>"]
                 for s in phone_sites:
-                    live_cands = candidates(settings, s, priority=0)
-                    bg_cands = candidates(settings, s, priority=1)
-                    if not live_cands and not bg_cands:
+                    live_cands = list(candidates(settings, s, priority=0))
+                    bg_cands = list(candidates(settings, s, priority=1))
+
+                    raw_phone = (getattr(s, "phone", None) or "").strip()
+                    site_pool: list[str] = []
+                    if raw_phone == "auto":
+                        base_devs = [d.strip() for d in (getattr(settings, "droidhub_devices", None) or []) if d and d.strip()]
+                        for d in base_devs:
+                            if d not in site_pool:
+                                site_pool.append(d)
+                    elif "," in raw_phone:
+                        for p in raw_phone.split(","):
+                            clean_p = p.strip()
+                            if clean_p and clean_p not in site_pool:
+                                site_pool.append(clean_p)
+                    elif raw_phone:
+                        site_pool.append(raw_phone)
+
+                    phone_extend = getattr(s, "phone_extend", True)
+                    if phone_extend is None:
+                        phone_extend = True
+                    if phone_extend and (raw_phone == "auto" or "," in raw_phone):
+                        def _fs_key(item: tuple[str, dict[str, Any]]) -> tuple:
+                            fs = item[1].get("first_seen")
+                            if isinstance(fs, (int, float)):
+                                return (0, float(fs))
+                            if isinstance(fs, str):
+                                try:
+                                    return (0, float(fs))
+                                except ValueError:
+                                    return (1, fs)
+                            return (2, str(fs or ""))
+
+                        for dev_id, entry in sorted(reg_all.items(), key=_fs_key):
+                            clean_id = dev_id.strip()
+                            if not clean_id or clean_id in site_pool:
+                                continue
+                            allow = entry.get("sites_allow")
+                            if allow is not None and s.name not in allow:
+                                continue
+                            deny = entry.get("sites_deny") or []
+                            if s.name in deny:
+                                continue
+                            site_pool.append(clean_id)
+
+                    all_live = live_cands + [d for d in site_pool if d not in live_cands]
+                    all_bg = bg_cands + [d for d in site_pool if d not in bg_cands]
+                    if not all_live and not all_bg:
                         continue
 
                     def _fmt_cand(dev: str, c_name: str) -> str:
@@ -388,8 +433,8 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
                         badge_str = f" [{', '.join(badges)}]" if badges else ""
                         return f"{escape(dev)} ({med_str} · {pct_str} · n={st.n}){badge_str}"
 
-                    live_str = ", ".join(_fmt_cand(d, "live") for d in live_cands) if live_cands else "нет"
-                    bg_str = ", ".join(_fmt_cand(d, "bg") for d in bg_cands) if bg_cands else "нет"
+                    live_str = ", ".join(_fmt_cand(d, "live") for d in all_live) if all_live else "нет"
+                    bg_str = ", ".join(_fmt_cand(d, "bg") for d in all_bg) if all_bg else "нет"
 
                     order_lines.append(f"<b>{escape(s.name)}:</b>")
                     order_lines.append(f"• люди: {live_str}")
