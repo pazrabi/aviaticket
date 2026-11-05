@@ -536,14 +536,178 @@ def _parse_transfers_text(text: str) -> tuple[int | None, list[str] | None]:
     return None, None
 
 
+_DATE_LINE_RE = re.compile(r"^\d{1,2}\s+[а-яё]{3,}\.?$", re.IGNORECASE)
+
+
+def _is_price_line(line: str) -> bool:
+    return bool(_PRICE_RE.fullmatch(re.sub(r"\s+", "", line)))
+
+
+def _read_text_leg(lines: list[str], i: int) -> tuple[dict[str, Any], int] | None:
+    """Читает одну ногу перелёта: время вылета, длительность, время прилёта и хвост с аэропортами.
+
+    Возвращает (данные ноги, индекс строки, на которой хвост закончился: следующее время или цена).
+    """
+    n = len(lines)
+    if i + 3 > n - 1 or not _TIME_RE.match(lines[i]):
+        return None
+    dur_str, dur_minutes = _parse_text_duration(lines[i + 1])
+    if not dur_str:
+        return None
+    m_arr = re.match(r"^(\d{1,2}:\d{2})(?:\s*\+(\d+))?$", lines[i + 2])
+    if not m_arr:
+        return None
+    j = i + 3
+    tail: list[str] = []
+    while j < n and not _TIME_RE.match(lines[j]) and not _is_price_line(lines[j]):
+        tail.append(lines[j])
+        j += 1
+        if len(tail) > 8:
+            return None
+    codes = [t for t in tail if _AIRPORT_RE.match(t)]
+    if len(codes) < 2:
+        return None
+    transfers: int | None = None
+    layovers: list[str] | None = None
+    for t in tail:
+        cnt, lay = _parse_transfers_text(t)
+        if cnt is not None:
+            transfers, layovers = cnt, lay
+            break
+    if transfers is None:
+        transfers = len(codes) - 2
+        layovers = codes[1:-1] or None
+    return (
+        {
+            "dep_time": lines[i],
+            "arr_time": m_arr.group(1),
+            "plus_days": int(m_arr.group(2)) if m_arr.group(2) else 0,
+            "dur": dur_str,
+            "dur_min": dur_minutes,
+            "transfers": transfers,
+            "layovers": layovers,
+        },
+        j,
+    )
+
+
+def _leg_iso(base: Any, info: dict[str, Any]) -> tuple[str | None, str | None]:
+    if base is None:
+        return None, None
+    days = info["plus_days"] or info["dur_min"] // (24 * 60)
+    if not info["plus_days"] and info["arr_time"] < info["dep_time"]:
+        days += 1
+    dep_at = f"{base.isoformat()}T{info['dep_time']}"
+    arr_at = f"{(base + timedelta(days=days)).isoformat()}T{info['arr_time']}"
+    return dep_at, arr_at
+
+
+def _parse_yandex_travel_text_rt(text: str, query: Query) -> list[Offer]:
+    """Карточки «туда-обратно» из текста страницы: нога туда, нога обратно, общая цена."""
+    lines = [" ".join(line.split()) for line in text.splitlines()]
+    lines = [line for line in lines if line]
+    n = len(lines)
+    offers: list[Offer] = []
+    seen: set[tuple[Any, ...]] = set()
+    currency = str(query.currency or "RUB").upper()
+
+    i = 0
+    while i < n:
+        first = _read_text_leg(lines, i)
+        if first is None:
+            i += 1
+            continue
+        leg1, j = first
+        if j >= n or not _TIME_RE.match(lines[j]):
+            i += 1
+            continue
+        second = _read_text_leg(lines, j)
+        if second is None:
+            i += 1
+            continue
+        leg2, p = second
+        if p >= n or not _is_price_line(lines[p]):
+            i += 1
+            continue
+        digits = "".join(re.findall(r"\d+", lines[p]))
+        price = int(digits) if digits else 0
+        if price <= 0:
+            i += 1
+            continue
+
+        cur = i - 1
+        carry_on = None
+        while cur >= 0 and _DATE_LINE_RE.match(lines[cur]):
+            cur -= 1
+        if cur >= 0 and _is_cabin_luggage_line(lines[cur]):
+            carry_on = "ручная кладь есть"
+            cur -= 1
+            while cur >= 0 and _DATE_LINE_RE.match(lines[cur]):
+                cur -= 1
+        airline = None
+        while cur >= max(0, i - 6):
+            val = lines[cur]
+            val_l = val.lower()
+            if val_l in _BADGE_WORDS or re.search(r"^\d+\s*вариант", val_l):
+                cur -= 1
+                continue
+            if "₽" in val or re.match(r"^от\s*\d+", val_l) or _TIME_RE.match(val) or _is_cabin_luggage_line(val):
+                break
+            airline = val
+            break
+        if not airline:
+            i += 1
+            continue
+
+        key = (airline, leg1["dep_time"], leg1["arr_time"], leg2["dep_time"], leg2["arr_time"], price)
+        if key in seen:
+            i = p + 1
+            continue
+        seen.add(key)
+
+        dep_at, arr_at = _leg_iso(query.depart, leg1)
+        bdep_at, barr_at = _leg_iso(query.return_date, leg2)
+        offer = Offer(
+            site="yandex_travel",
+            price=price,
+            currency=currency,
+            airline=airline,
+            depart_time=leg1["dep_time"],
+            arrive_time=leg1["arr_time"],
+            duration=leg1["dur"],
+            transfers=leg1["transfers"],
+            baggage="без багажа",
+            carry_on=carry_on,
+            layovers=leg1["layovers"],
+            depart_at=dep_at,
+            arrive_at=arr_at,
+            back=Leg(
+                airline=airline,
+                depart_time=leg2["dep_time"],
+                arrive_time=leg2["arr_time"],
+                duration=leg2["dur"],
+                transfers=leg2["transfers"],
+                layovers=leg2["layovers"],
+                depart_at=bdep_at,
+                arrive_at=barr_at,
+            ),
+        )
+        offer.offer_id = compute_offer_id(offer)
+        offers.append(offer)
+        i = p + 1
+
+    offers.sort(key=lambda o: o.price)
+    return offers
+
+
 def _parse_yandex_travel_text(text: str | None, query: Query | None) -> list[Offer]:
     """Разбирает карточки рейсов из текстового представления страницы Яндекс Путешествий."""
     if not text:
         return []
 
-    # Обратные билеты (RT) в текстовом представлении не подтверждены образцом
+    # Билеты «туда-обратно»: две ноги подряд и одна общая цена
     if query is not None and query.return_date is not None:
-        return []
+        return _parse_yandex_travel_text_rt(text, query)
 
     lines = [" ".join(line.split()) for line in text.splitlines()]
     lines = [line for line in lines if line]

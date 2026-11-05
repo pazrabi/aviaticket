@@ -134,7 +134,7 @@ def test_deduplication_of_ad_duplicates():
 
 
 def test_round_trip_returns_empty():
-    """Обратные билеты (Query.return_date) дают пустой список (RT в тексте не подтверждён)."""
+    """Текст с односторонними карточками для RT-запроса не даёт ложных офферов."""
     snap = Snapshot(
         url="https://travel.yandex.ru/avia/search/result/",
         text=TEXT_ONEWAY_1012,
@@ -338,3 +338,20 @@ def test_airline_bounded_search_and_block_boundaries():
     )
     offers = _parse_yandex_travel_text(invalid_card, _q_ow())
     assert len(offers) == 0
+
+
+def test_round_trip_text_parsed_from_real_page():
+    """Реальная страница Самара — Ереван туда-обратно (без JSON) разбирается по тексту."""
+    import json
+    from pathlib import Path
+
+    d = json.loads((Path(__file__).parent / "fixtures" / "yandex_rt_text_kuf_evn.json").read_text())
+    q = Query("KUF", "EVN", date(2026, 12, 16), 4, return_date=date(2026, 12, 20))
+    offers = parse_yandex_travel(Snapshot(url=d["url"], text=d["text"], json_payloads=[]), q)
+    assert len(offers) >= 8
+    first = offers[0]
+    assert first.price == 169912
+    assert first.depart_time == "10:15" and first.transfers == 0
+    assert first.back is not None and first.back.depart_time == "06:05"
+    assert first.back.depart_at == "2026-12-20T06:05"
+    assert offers == sorted(offers, key=lambda o: o.price)
