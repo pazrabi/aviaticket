@@ -402,6 +402,8 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
                             clean_id = dev_id.strip()
                             if not clean_id or clean_id in site_pool:
                                 continue
+                            if entry.get("status") == "new":
+                                continue
                             allow = entry.get("sites_allow")
                             if allow is not None and s.name not in allow:
                                 continue
@@ -430,6 +432,8 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
                             badges.append("пониженная батарея")
                         if dev in phones_hold or p_info.get("status") == "hold" or p_info.get("is_hold_env"):
                             badges.append("заморозка")
+                        elif p_info.get("status") == "new":
+                            badges.append("ожидает проверки")
                         badge_str = f" [{', '.join(badges)}]" if badges else ""
                         return f"{escape(dev)} ({med_str} · {pct_str} · n={st.n}){badge_str}"
 
@@ -785,8 +789,12 @@ def build_phones(ctx: dict[str, Any]) -> str:
             # Статус
             if p.get("is_hold_env"):
                 st_str = "заморожен (env) ❄️"
+            elif p.get("checking"):
+                st_str = "⏳ проверяется"
             elif p.get("status") == "active":
                 st_str = "в работе ✅"
+            elif p.get("status") == "new":
+                st_str = "ожидает проверки ⏳"
             else:
                 st_str = "заморожен ⏸"
             lines.append(f"• Статус: {st_str}")
@@ -832,9 +840,12 @@ def build_phones(ctx: dict[str, Any]) -> str:
             else:
                 dt_str = "—"
             lines.append(f"• Добавлен: {dt_str}")
+            note = p.get("note")
+            if note:
+                lines.append(f"• Примечание: {escape(str(note))}")
             lines.append("")
 
-    lines.append("Команды: <code>/phone &lt;id&gt; hold|on|all|allow s1,s2|deny s1</code>")
+    lines.append("Команды: <code>/phone &lt;id&gt; test|hold|on|all|allow s1,s2|deny s1</code>")
     return truncate_text("\n".join(lines))
 
 
@@ -849,17 +860,28 @@ def make_phones_keyboard(phones: list[dict[str, Any]]) -> dict[str, Any]:
         if is_hold_env:
             # Для заморозки через env кнопку возврата не показываем
             continue
-        if status == "active":
+        if status == "new":
             btn = {
-                "text": f"❄️ Заморозить {p_name}",
-                "callback_data": f"adm:ph:hold:{p_id}",
+                "text": f"🔍 Проверить {p_name}",
+                "callback_data": f"adm:ph:test:{p_id}",
             }
+            rows.append([btn])
         else:
-            btn = {
-                "text": f"▶️ В работу {p_name}",
-                "callback_data": f"adm:ph:on:{p_id}",
+            if status == "active":
+                btn_toggle = {
+                    "text": f"❄️ Заморозить {p_name}",
+                    "callback_data": f"adm:ph:hold:{p_id}",
+                }
+            else:
+                btn_toggle = {
+                    "text": f"▶️ В работу {p_name}",
+                    "callback_data": f"adm:ph:on:{p_id}",
+                }
+            btn_retest = {
+                "text": f"🔍 Перепроверить {p_name}",
+                "callback_data": f"adm:ph:test:{p_id}",
             }
-        rows.append([btn])
+            rows.append([btn_toggle, btn_retest])
 
     rows.append(
         [

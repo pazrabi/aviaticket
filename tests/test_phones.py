@@ -16,8 +16,8 @@ from avia.phones import PhoneRegistry
 
 
 def test_refresh_first_run_silent_and_subsequent_new(tmp_path):
-    """Первый запуск с пустым реестром регистрирует устройства молча, последующие выявляют новые."""
-    reg = PhoneRegistry(tmp_path / "phones.json")
+    """Первый запуск с пустым реестром регистрирует устройства молча, последующие выявляют новые (при policy=active)."""
+    reg = PhoneRegistry(tmp_path / "phones.json", phones_new_policy="active")
     assert len(reg) == 0
 
     # Первый запуск: 2 телефона
@@ -285,6 +285,7 @@ async def test_hub_autodiscovery_failure_does_not_crash(tmp_path, monkeypatch):
         tg_token="fake_tg",
         tg_allowed_ids={123},
         storage_dir=tmp_path,
+        phones_new_policy="active",
     )
     fb = FakeBot(settings)
 
@@ -309,6 +310,7 @@ async def test_hub_autodiscovery_notifies_admin_on_new_phone(tmp_path, monkeypat
         tg_token="fake_tg",
         tg_allowed_ids={123},
         storage_dir=tmp_path,
+        phones_new_policy="active",
     )
     fb = FakeBot(settings)
 

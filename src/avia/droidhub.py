@@ -169,7 +169,7 @@ def _get_registry(settings: Settings) -> Any | None:
 
                 reg = PhoneRegistry(
                     storage_dir,
-                    phones_new_policy=getattr(settings, "phones_new_policy", "active"),
+                    phones_new_policy=getattr(settings, "phones_new_policy", "check"),
                     phones_snapshot_ttl_seconds=getattr(settings, "phones_snapshot_ttl_seconds", 180),
                     phones_hold=getattr(settings, "phones_hold", None),
                     phone_min_battery=getattr(settings, "phone_min_battery", 15),

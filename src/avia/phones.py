@@ -70,7 +70,7 @@ class PhoneRegistry:
         storage_dir: Path | str | None = None,
         *,
         path: Path | str | None = None,
-        phones_new_policy: str = "active",
+        phones_new_policy: str = "check",
         phones_snapshot_ttl_seconds: float = 180.0,
         phones_hold: list[str] | set[str] | str | None = None,
         phone_min_battery: int | None = None,
@@ -90,11 +90,11 @@ class PhoneRegistry:
             self.storage_dir = Path("state")
             self.path = self.storage_dir / "phones.json"
 
-        self.phones_new_policy = (
-            phones_new_policy.strip().lower()
-            if phones_new_policy and phones_new_policy.strip().lower() in ("active", "hold")
-            else "active"
-        )
+        pol = (phones_new_policy or "check").strip().lower()
+        if pol in ("active", "hold", "check", "new"):
+            self.phones_new_policy = pol
+        else:
+            self.phones_new_policy = "check"
         self.phones_snapshot_ttl_seconds = float(phones_snapshot_ttl_seconds)
         self._phones_hold = self._parse_hold(phones_hold)
         if phone_min_battery is not None:
@@ -108,6 +108,7 @@ class PhoneRegistry:
         self._lock = threading.Lock()
         self._phones: dict[str, dict[str, Any]] = {}
         self._snapshots: dict[str, PhoneSnapshot] = {}
+        self._checking: set[str] = set()
 
         # Флаг первого обновления: если файл отсутствовал или был пуст на старте,
         # первый вызов refresh регистрирует телефоны молча.
@@ -212,10 +213,11 @@ class PhoneRegistry:
 
                 if dev_id not in self._phones:
                     # Новый телефон в реестре
+                    init_status = "new" if self.phones_new_policy in ("check", "new") else self.phones_new_policy
                     entry = {
                         "name": name,
                         "first_seen": now,
-                        "status": self.phones_new_policy,
+                        "status": init_status,
                         "sites_allow": None,
                         "sites_deny": [],
                         "note": "",
@@ -223,7 +225,7 @@ class PhoneRegistry:
                     self._phones[dev_id] = entry
                     changed = True
                     if not is_first:
-                        new_devices.append(NewDevice(dev_id, name, self.phones_new_policy))
+                        new_devices.append(NewDevice(dev_id, name, init_status))
                 else:
                     # Существующий телефон: обновляем name при изменении
                     entry = self._phones[dev_id]
@@ -282,6 +284,9 @@ class PhoneRegistry:
         if self._is_held_by_env(clean_id):
             return False
 
+        if self.is_checking(clean_id):
+            return False
+
         with self._lock:
             entry = self._phones.get(clean_id)
             if entry is None:
@@ -316,10 +321,10 @@ class PhoneRegistry:
         return True
 
     def set_status(self, id: str, status: str) -> bool:
-        """Устанавливает статус устройства ('active' или 'hold')."""
+        """Устанавливает статус устройства ('active', 'hold' или 'new')."""
         clean_id = str(id).strip()
         clean_status = str(status).strip().lower()
-        if clean_status not in ("active", "hold"):
+        if clean_status not in ("active", "hold", "new"):
             raise ValueError(f"Недопустимый статус: {status}")
         with self._lock:
             entry = self._phones.get(clean_id)
@@ -328,6 +333,32 @@ class PhoneRegistry:
             entry["status"] = clean_status
             self._save_locked()
             return True
+
+    def set_note(self, id: str, note: str) -> bool:
+        """Устанавливает примечание/причину отказа."""
+        clean_id = str(id).strip()
+        with self._lock:
+            entry = self._phones.get(clean_id)
+            if entry is None:
+                return False
+            entry["note"] = str(note)
+            self._save_locked()
+            return True
+
+    def is_checking(self, id: str) -> bool:
+        """True, если устройство сейчас проходит проверку."""
+        clean_id = str(id).strip()
+        with self._lock:
+            return clean_id in self._checking
+
+    def set_checking(self, id: str, val: bool) -> None:
+        """Устанавливает состояние прохождения проверки."""
+        clean_id = str(id).strip()
+        with self._lock:
+            if val:
+                self._checking.add(clean_id)
+            else:
+                self._checking.discard(clean_id)
 
     def set_sites(
         self,
@@ -365,10 +396,11 @@ class PhoneRegistry:
         """Регистрирует устройство напрямую в реестре (для инициализации и тестов)."""
         clean_id = str(id).strip()
         with self._lock:
+            init_status = "new" if self.phones_new_policy in ("check", "new") else self.phones_new_policy
             self._phones[clean_id] = {
                 "name": name.strip() or clean_id,
                 "first_seen": first_seen if first_seen is not None else time.time(),
-                "status": (status or self.phones_new_policy).strip().lower(),
+                "status": (status or init_status).strip().lower(),
                 "sites_allow": sites_allow,
                 "sites_deny": sites_deny or [],
                 "note": note,
@@ -386,6 +418,8 @@ class PhoneRegistry:
                 item = dict(entry)
                 item["id"] = dev_id
                 item["is_hold_env"] = self._is_held_by_env(dev_id)
+                item["note"] = entry.get("note", "")
+                item["checking"] = dev_id in self._checking
                 if snap is not None:
                     age = now_mono - snap.updated_at
                     item["online"] = snap.online

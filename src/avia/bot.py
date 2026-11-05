@@ -78,7 +78,7 @@ class Bot:
         self.users = UserStore(settings.storage_dir / "users.sqlite")
         self.phones = PhoneRegistry(
             storage_dir=settings.storage_dir,
-            phones_new_policy=getattr(settings, "phones_new_policy", "active"),
+            phones_new_policy=getattr(settings, "phones_new_policy", "check"),
             phones_snapshot_ttl_seconds=getattr(settings, "phones_snapshot_ttl_seconds", 180),
             phones_hold=getattr(settings, "phones_hold", None),
         )
@@ -588,12 +588,12 @@ class Bot:
             await self.send(chat_id, f"{target}: {'заблокирован' if cmd == '/block' else 'разблокирован'}")
 
     async def _phone_command(self, chat_id: int, text: str) -> None:
-        """Обрабатывает /phone <id> allow site1,site2 | deny site1 | all | hold | on."""
+        """Обрабатывает /phone <id> test | allow site1,site2 | deny site1 | all | hold | on."""
         parts = text.strip().split(maxsplit=2)
         if len(parts) < 3:
             await self.send(
                 chat_id,
-                "Формат: <code>/phone &lt;id&gt; allow s1,s2 | deny s1 | all | hold | on</code>",
+                "Формат: <code>/phone &lt;id&gt; test | allow s1,s2 | deny s1 | all | hold | on</code>",
             )
             return
 
@@ -609,6 +609,15 @@ class Bot:
             return
 
         valid_sites = {s.name for s in self.s.sites}
+
+        if subcmd == "test":
+            from .phone_check import is_checking, run_phone_check
+            if is_checking(phone_id):
+                await self.send(chat_id, f"⏳ Телефон <code>{escape(phone_id)}</code> уже проверяется.")
+            else:
+                await self.send(chat_id, f"🔍 Запуск проверки телефона <code>{escape(phone_id)}</code>…")
+                asyncio.create_task(run_phone_check(self.s, phone_id, bot=self, initiated_by_chat_id=chat_id))
+            return
 
         if subcmd == "hold":
             self.phones.set_status(phone_id, "hold")
@@ -667,7 +676,7 @@ class Bot:
 
         await self.send(
             chat_id,
-            "Неизвестное действие. Формат: <code>/phone &lt;id&gt; allow s1,s2 | deny s1 | all | hold | on</code>",
+            "Неизвестное действие. Формат: <code>/phone &lt;id&gt; test | allow s1,s2 | deny s1 | all | hold | on</code>",
         )
 
     async def _handle_admin_callback(self, cq: dict, data: str) -> None:
@@ -723,7 +732,7 @@ class Bot:
             return
 
         if section == "ph":
-            # Callback-запросы раздела Телефоны: adm:ph или adm:ph:hold:<id> или adm:ph:on:<id>
+            # Callback-запросы раздела Телефоны: adm:ph или adm:ph:hold:<id> или adm:ph:on:<id> или adm:ph:test:<id>
             if len(parts) >= 4:
                 action = parts[2]
                 phone_id = ":".join(parts[3:])
@@ -735,6 +744,15 @@ class Bot:
                     await asyncio.to_thread(self.phones.set_status, phone_id, "active")
                     if cq_id:
                         await self.call("answerCallbackQuery", callback_query_id=cq_id, text=f"В работе: {phone_id}")
+                elif action == "test":
+                    from .phone_check import is_checking, run_phone_check
+                    if is_checking(phone_id):
+                        if cq_id:
+                            await self.call("answerCallbackQuery", callback_query_id=cq_id, text=f"⏳ Уже проверяется: {phone_id}")
+                    else:
+                        if cq_id:
+                            await self.call("answerCallbackQuery", callback_query_id=cq_id, text=f"🔍 Запуск проверки: {phone_id}")
+                        asyncio.create_task(run_phone_check(self.s, phone_id, bot=self, initiated_by_chat_id=chat_id))
             elif cq_id:
                 try:
                     await self.call("answerCallbackQuery", callback_query_id=cq_id)
@@ -1297,20 +1315,39 @@ class Bot:
 
         safe_name = escape(str(name))
         safe_id = escape(str(dev_id))
-        status_text = "взят в работу" if status == "active" else "заморожен (ожидает одобрения)"
 
-        msg = (
-            f"📱 Новый телефон в хабе: {safe_name} ({safe_id}). "
-            f"Статус: {status_text}…\n\n"
-            f"Управление: /admin → «Телефоны» (кнопки в панели) или команда <code>/phone {safe_id} hold|on|all|allow|deny</code>"
-        )
-        reply_markup = {
-            "inline_keyboard": [
-                [
-                    {"text": "📱 Телефоны в панели", "callback_data": "adm:ph"},
+        if status == "new":
+            p_info = self.phones.get(dev_id) or {} if hasattr(self, "phones") and self.phones else {}
+            batt = p_info.get("battery")
+            charging = p_info.get("charging", False)
+            ch_str = " ⚡" if charging else ""
+            batt_str = f"{batt}%{ch_str}" if batt is not None else "—"
+            msg = (
+                f"📱 Обнаружен телефон {safe_name} ({safe_id}, батарея {batt_str}); "
+                f"откройте /admin → 📱 Телефоны и нажмите «🔍 Проверить»"
+            )
+            reply_markup = {
+                "inline_keyboard": [
+                    [
+                        {"text": f"🔍 Проверить {safe_name}", "callback_data": f"adm:ph:test:{safe_id}"},
+                        {"text": "📱 Телефоны", "callback_data": "adm:ph"},
+                    ]
                 ]
-            ]
-        }
+            }
+        else:
+            status_text = "взят в работу" if status == "active" else "заморожен (ожидает одобрения)"
+            msg = (
+                f"📱 Новый телефон в хабе: {safe_name} ({safe_id}). "
+                f"Статус: {status_text}…\n\n"
+                f"Управление: /admin → «Телефоны» (кнопки в панели) или команда <code>/phone {safe_id} hold|on|all|allow|deny</code>"
+            )
+            reply_markup = {
+                "inline_keyboard": [
+                    [
+                        {"text": "📱 Телефоны в панели", "callback_data": "adm:ph"},
+                    ]
+                ]
+            }
         await self._notify_admins(msg, reply_markup=reply_markup)
 
     async def _maintenance_loop(self, tick_seconds: float = 300.0) -> None:

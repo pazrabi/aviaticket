@@ -56,7 +56,7 @@ class Settings:
     droidhub_url: str = ""        # адрес сервиса droidhub (HTTP API)
     droidhub_token: str = ""      # токен авторизации droidhub
     droidhub_devices: list[str] = field(default_factory=list)  # пул телефонов droidhub
-    phones_new_policy: str = "active"  # "active" (автоматически брать в работу) или "hold"
+    phones_new_policy: str = "check"  # "check" (ожидает проверки), "active" (сразу в работу) или "hold"
     phones_hold: list[str] = field(default_factory=list)      # телефоны на жёсткой заморозке
     phones_refresh_seconds: int = 60   # интервал опроса хаба (сек)
     phones_snapshot_ttl_seconds: int = 180  # TTL актуальности снимка состояния (сек)
@@ -143,7 +143,7 @@ def load_settings(path: Path | None = None) -> Settings:
     droidhub_devices = [
         x.strip() for x in os.getenv("DROIDHUB_DEVICES", "").split(",") if x.strip()
     ]
-    phones_new_policy = os.getenv("PHONES_NEW_POLICY", "active").strip() or "active"
+    phones_new_policy = os.getenv("PHONES_NEW_POLICY", "check").strip() or "check"
     phones_hold = [
         x.strip() for x in os.getenv("PHONES_HOLD", "").split(",") if x.strip()
     ]

@@ -64,6 +64,8 @@ class MetricsStore:
                 conn.execute("ALTER TABLE site_runs ADD COLUMN fetch_seconds REAL")
             if "priority" not in cols:
                 conn.execute("ALTER TABLE site_runs ADD COLUMN priority INTEGER")
+            if "min_price" not in cols:
+                conn.execute("ALTER TABLE site_runs ADD COLUMN min_price REAL")
         self._initialized = True
 
     def _connect(self) -> sqlite3.Connection:
@@ -87,6 +89,7 @@ class MetricsStore:
         queue_wait: float | None = None,
         fetch_seconds: float | None = None,
         priority: int | None = None,
+        min_price: float | int | None = None,
     ) -> None:
         """Записывает результат отдельного запуска сайта."""
         try:
@@ -96,14 +99,15 @@ class MetricsStore:
             qw_val = float(queue_wait) if queue_wait is not None else None
             fs_val = float(fetch_seconds) if fetch_seconds is not None else None
             prio_val = int(priority) if priority is not None else None
+            mp_val = float(min_price) if min_price is not None else None
             with self._connect() as db:
                 db.execute(
                     """
                     INSERT INTO site_runs (
                         ts, source, site, ok, partial, captcha, error, offers, elapsed,
-                        device, queue_wait, fetch_seconds, priority
+                        device, queue_wait, fetch_seconds, priority, min_price
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record_ts,
@@ -119,6 +123,7 @@ class MetricsStore:
                         qw_val,
                         fs_val,
                         prio_val,
+                        mp_val,
                     ),
                 )
         except Exception:
