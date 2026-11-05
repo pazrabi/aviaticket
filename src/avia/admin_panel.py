@@ -877,11 +877,7 @@ def make_phones_keyboard(phones: list[dict[str, Any]]) -> dict[str, Any]:
                     "text": f"▶️ В работу {p_name}",
                     "callback_data": f"adm:ph:on:{p_id}",
                 }
-            btn_retest = {
-                "text": f"🔍 Перепроверить {p_name}",
-                "callback_data": f"adm:ph:test:{p_id}",
-            }
-            rows.append([btn_toggle, btn_retest])
+            rows.append([btn_toggle])
 
     rows.append(
         [

@@ -152,21 +152,17 @@ def test_admin_panel_buttons_for_new_and_existing():
     assert "🔍 Проверить Redmi New" in new_row[0]["text"]
     assert new_row[0]["callback_data"] == "adm:ph:test:p_new"
 
-    # Для p_act: кнопка заморозки + вторая кнопка перепроверки
+    # Для p_act: только кнопка заморозки (перепроверки нет, чтобы влезало имя)
     act_row = rows[1]
-    assert len(act_row) == 2
+    assert len(act_row) == 1
     assert "❄️ Заморозить Redmi Act" in act_row[0]["text"]
     assert act_row[0]["callback_data"] == "adm:ph:hold:p_act"
-    assert "🔍 Перепроверить Redmi Act" in act_row[1]["text"]
-    assert act_row[1]["callback_data"] == "adm:ph:test:p_act"
 
-    # Для p_hld: кнопка включения + вторая кнопка перепроверки
+    # Для p_hld: только кнопка включения
     hld_row = rows[2]
-    assert len(hld_row) == 2
+    assert len(hld_row) == 1
     assert "▶️ В работу Honor Hold" in hld_row[0]["text"]
     assert hld_row[0]["callback_data"] == "adm:ph:on:p_hld"
-    assert "🔍 Перепроверить Honor Hold" in hld_row[1]["text"]
-    assert hld_row[1]["callback_data"] == "adm:ph:test:p_hld"
 
 
 # 4. Неадмин не может запустить проверку ни по кнопке, ни по команде
