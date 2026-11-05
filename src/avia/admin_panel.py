@@ -117,10 +117,22 @@ def make_section_keyboard(section: str, period: str = "24h") -> dict[str, Any]:
                     {"text": p24, "callback_data": "adm:parse:24h"},
                     {"text": p7, "callback_data": "adm:parse:7d"},
                 ],
-                [{"text": "🧭 Порядок телефонов", "callback_data": "adm:ord"}],
+                [
+                    {"text": "🩺 Здоровье", "callback_data": "adm:health"},
+                    {"text": "🧭 Порядок телефонов", "callback_data": "adm:ord"},
+                ],
                 [
                     {"text": "◀ Назад", "callback_data": "adm:home"},
                     {"text": "🔄 Обновить", "callback_data": f"adm:parse:{period}"},
+                ],
+            ]
+        }
+    if section == "health":
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "◀ К парсингу", "callback_data": "adm:parse:24h"},
+                    {"text": "🔄 Обновить", "callback_data": "adm:health"},
                 ],
             ]
         }

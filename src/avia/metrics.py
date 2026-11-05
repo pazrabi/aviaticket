@@ -510,3 +510,36 @@ class MetricsStore:
                 """,
                 (site, last_status, float(last_alert_ts), last_alert_status),
             )
+
+
+def _recent_by_pair(self, since_ts: float, per_pair: int = 5) -> dict[tuple[str, str], list[dict[str, Any]]]:
+    """Последние запуски по каждой паре (сайт, телефон): новые первыми, не больше per_pair."""
+    out: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    with self._connect() as db:
+        cur = db.execute(
+            """
+            SELECT ts, site, device, ok, partial, captcha, error, offers
+            FROM site_runs
+            WHERE ts >= ? AND device IS NOT NULL AND device != '' AND device != 'unknown'
+            ORDER BY ts DESC
+            """,
+            (float(since_ts),),
+        )
+        for row in cur.fetchall():
+            key = (str(row["site"]), str(row["device"]))
+            lst = out.setdefault(key, [])
+            if len(lst) < per_pair:
+                lst.append(
+                    {
+                        "ts": float(row["ts"]),
+                        "ok": int(row["ok"]),
+                        "partial": int(row["partial"]),
+                        "captcha": int(row["captcha"]),
+                        "error": str(row["error"] or ""),
+                        "offers": int(row["offers"] or 0),
+                    }
+                )
+    return out
+
+
+MetricsStore.recent_by_pair = _recent_by_pair  # type: ignore[attr-defined]

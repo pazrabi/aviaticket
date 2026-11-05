@@ -819,6 +819,14 @@ class Bot:
             elif section == "parse":
                 ctx = await asyncio.to_thread(self._collect_parse_data, period)
                 text = admin_panel.build_parse(ctx, period=period)
+            elif section == "health":
+                from .health import build_health_text, collect_health
+                if self.metrics is None:
+                    text = "🩺 <b>Здоровье сайтов</b>\n\nМетрики не включены"
+                else:
+                    health = await asyncio.to_thread(collect_health, self.metrics, time.time() - 86400)
+                    names = [x.name for x in self.s.sites if x.enabled and x.source == "browser"]
+                    text = build_health_text(health, names)
             elif section == "ord":
                 text = admin_panel.build_phone_order({"settings": self.s})
             elif section == "users":
@@ -852,6 +860,7 @@ class Bot:
                 "over": "📊 <b>Обзор</b>",
                 "parse": "🌐 <b>Парсинг</b>",
                 "ord": "🧭 <b>Порядок телефонов</b>",
+                "health": "🩺 <b>Здоровье сайтов</b>",
                 "users": "👥 <b>Пользователи</b>",
                 "db": "🗄 <b>База</b>",
                 "tickets": "🎫 <b>Билеты</b>",
@@ -1390,6 +1399,16 @@ class Bot:
                             log.exception("ошибка обучения модели прогноза")
 
                 if self.s.parser_watch_enabled and self.metrics is not None:
+                    if time.time() - getattr(self, "_last_health_check", 0.0) >= 300:
+                        self._last_health_check = time.time()
+                        try:
+                            from .health import check_health_alerts
+                            for alert_text in await asyncio.to_thread(
+                                check_health_alerts, self.metrics, None, float(self.s.parser_watch_cooldown_hours)
+                            ):
+                                await self._notify_admins(alert_text)
+                        except Exception:
+                            log.exception("ошибка проверки здоровья сайтов")
                     if time.time() - self._last_parser_watch >= 1800:
                         try:
                             from .parser_watch import check_parser_watch
