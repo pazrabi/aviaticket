@@ -431,6 +431,7 @@ async def _do_run_phone_check(
     bot: Any = None,
     initiated_by_chat_id: int | None = None,
     metrics: MetricsStore | None = None,
+    per_site: int = PASSES_PER_SITE,
 ) -> PhoneCheckReport:
     reg = getattr(settings, "phones", None)
     if reg is None:
@@ -468,7 +469,7 @@ async def _do_run_phone_check(
 
     for s_idx, site in enumerate(phone_sites):
         passes: list[PassResult] = []
-        for p_num in range(1, PASSES_PER_SITE + 1):
+        for p_num in range(1, max(1, per_site) + 1):
             p_res = await run_site_pass(
                 settings=settings,
                 site=site,
@@ -492,7 +493,7 @@ async def _do_run_phone_check(
             full_site.phone_wait_seconds = site.phone_full_wait_seconds
             full_site.phone_wait_for = getattr(site, "phone_full_wait_for", "") or ""
             bg_metrics = _BgMetrics(metrics_store) if metrics_store is not None else None
-            for p_num in range(1, PASSES_PER_SITE + 1):
+            for p_num in range(1, max(1, per_site) + 1):
                 bg_passes.append(
                     await run_site_pass(
                         settings=settings,
@@ -573,6 +574,7 @@ async def run_phone_check(
     bot: Any = None,
     initiated_by_chat_id: int | None = None,
     metrics: MetricsStore | None = None,
+    per_site: int = PASSES_PER_SITE,
 ) -> PhoneCheckReport:
     """Запускает проверку телефона в фоне с контролем повторного запуска."""
     clean_id = str(phone_id).strip()
@@ -607,6 +609,7 @@ async def run_phone_check(
                 bot=bot,
                 initiated_by_chat_id=initiated_by_chat_id,
                 metrics=metrics,
+                per_site=per_site,
             ),
             timeout=MAX_OVERALL_CHECK_SECONDS,
         )

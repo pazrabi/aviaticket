@@ -877,7 +877,12 @@ def make_phones_keyboard(phones: list[dict[str, Any]]) -> dict[str, Any]:
                     "text": f"▶️ В работу {p_name}",
                     "callback_data": f"adm:ph:on:{p_id}",
                 }
-            rows.append([btn_toggle])
+            btn_recheck = {
+                "text": "🔄",
+                "callback_data": f"adm:ph:re:{p_id}",
+            }
+            # Кнопка статуса с именем длиннее, поэтому Telegram делает её шире
+            rows.append([btn_toggle, btn_recheck])
 
     rows.append(
         [

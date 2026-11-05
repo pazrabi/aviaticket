@@ -152,15 +152,17 @@ def test_admin_panel_buttons_for_new_and_existing():
     assert "🔍 Проверить Redmi New" in new_row[0]["text"]
     assert new_row[0]["callback_data"] == "adm:ph:test:p_new"
 
-    # Для p_act: только кнопка заморозки (перепроверки нет, чтобы влезало имя)
+    # Для p_act: заморозка с именем + узкая кнопка «🔄» перепроверки
     act_row = rows[1]
-    assert len(act_row) == 1
+    assert len(act_row) == 2
+    assert act_row[1] == {"text": "🔄", "callback_data": "adm:ph:re:p_act"}
     assert "❄️ Заморозить Redmi Act" in act_row[0]["text"]
     assert act_row[0]["callback_data"] == "adm:ph:hold:p_act"
 
-    # Для p_hld: только кнопка включения
+    # Для p_hld: кнопка включения + «🔄»
     hld_row = rows[2]
-    assert len(hld_row) == 1
+    assert len(hld_row) == 2
+    assert hld_row[1]["callback_data"] == "adm:ph:re:p_hld"
     assert "▶️ В работу Honor Hold" in hld_row[0]["text"]
     assert hld_row[0]["callback_data"] == "adm:ph:on:p_hld"
 
@@ -724,3 +726,28 @@ def test_verdict_by_share_of_good_passes():
     bad = PassResult(pass_num=2, ok=False, error="502")
     assert evaluate_site("s", [good, good, bad, bad, bad]).verdict == "ок"      # 2/5 = 0.4
     assert evaluate_site("s", [good, bad, bad, bad, bad]).verdict == "не ок"    # 1/5
+
+
+# 9. Перепроверка: passes=1 делает один проход на сайт
+@pytest.mark.asyncio
+async def test_recheck_single_pass(tmp_path, monkeypatch):
+    site1 = SiteConfig(name="s1", url_template="https://s1", phone="auto", parser="p_one")
+    calls = []
+
+    def parser_one(snap, q):
+        calls.append(1)
+        return [Offer(site="s1", price=5000)]
+
+    parser_one.results_complete = lambda snap: True
+    PARSERS["p_one"] = parser_one
+    settings = Settings(sites=[site1], storage_dir=tmp_path, tg_allowed_ids={100}, phones_new_policy="check")
+    fb = FakeBot(settings)
+    fb.bot.phones.register("dev_re", name="Dev Re", status="active")
+
+    async def mock_snapshot(s, device_id, url, **kwargs):
+        return Snapshot(url=url, text="OK", blocked=False), True
+
+    monkeypatch.setattr("avia.phone_check.fetch_page_snapshot", mock_snapshot)
+    await run_phone_check(settings, "dev_re", bot=fb.bot, per_site=1)
+    assert len(calls) == 1
+    assert fb.bot.phones.get("dev_re")["sites_allow"] == ["s1"]

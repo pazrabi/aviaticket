@@ -744,15 +744,20 @@ class Bot:
                     await asyncio.to_thread(self.phones.set_status, phone_id, "active")
                     if cq_id:
                         await self.call("answerCallbackQuery", callback_query_id=cq_id, text=f"В работе: {phone_id}")
-                elif action == "test":
-                    from .phone_check import is_checking, run_phone_check
+                elif action in ("test", "re"):
+                    from .phone_check import PASSES_PER_SITE, is_checking, run_phone_check
                     if is_checking(phone_id):
                         if cq_id:
                             await self.call("answerCallbackQuery", callback_query_id=cq_id, text=f"⏳ Уже проверяется: {phone_id}")
                     else:
                         if cq_id:
                             await self.call("answerCallbackQuery", callback_query_id=cq_id, text=f"🔍 Запуск проверки: {phone_id}")
-                        asyncio.create_task(run_phone_check(self.s, phone_id, bot=self, initiated_by_chat_id=chat_id))
+                        asyncio.create_task(
+                            run_phone_check(
+                                self.s, phone_id, bot=self, initiated_by_chat_id=chat_id,
+                                per_site=1 if action == "re" else PASSES_PER_SITE,
+                            )
+                        )
             elif cq_id:
                 try:
                     await self.call("answerCallbackQuery", callback_query_id=cq_id)
