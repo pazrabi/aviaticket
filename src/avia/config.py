@@ -76,6 +76,12 @@ class Settings:
     storage_dir: Path = field(default_factory=lambda: ROOT / "state")
     debug_dir: Path = field(default_factory=lambda: ROOT / "debug")
     top_n: int = 5
+    balance_max_premium_pct: float = 30.0
+    balance_min_saving_minutes: int = 120
+    balance_min_saving_share: float = 0.25
+    site_top_cheap: int = 2
+    site_top_balance: int = 2
+    site_top_fast: int = 1
     tg_token: str = ""
     tg_allowed_ids: set[int] = field(default_factory=set)   # администраторы; без лимитов поисков
     tg_open: bool = False          # True: бот отвечает всем, пользователи регистрируются в users.sqlite
@@ -247,6 +253,30 @@ def load_settings(path: Path | None = None) -> Settings:
         site_fuse_probe_seconds = int(os.getenv("SITE_FUSE_PROBE_SECONDS", "600"))
     except ValueError:
         site_fuse_probe_seconds = 600
+    try:
+        balance_max_premium_pct = float(os.getenv("BALANCE_MAX_PREMIUM_PCT", "30"))
+    except ValueError:
+        balance_max_premium_pct = 30.0
+    try:
+        balance_min_saving_minutes = int(os.getenv("BALANCE_MIN_SAVING_MINUTES", "120"))
+    except ValueError:
+        balance_min_saving_minutes = 120
+    try:
+        balance_min_saving_share = float(os.getenv("BALANCE_MIN_SAVING_SHARE", "0.25"))
+    except ValueError:
+        balance_min_saving_share = 0.25
+    try:
+        site_top_cheap = int(os.getenv("SITE_TOP_CHEAP", "2"))
+    except ValueError:
+        site_top_cheap = 2
+    try:
+        site_top_balance = int(os.getenv("SITE_TOP_BALANCE", "2"))
+    except ValueError:
+        site_top_balance = 2
+    try:
+        site_top_fast = int(os.getenv("SITE_TOP_FAST", "1"))
+    except ValueError:
+        site_top_fast = 1
 
     soft_allow_env = os.getenv("SOFT_ALLOW", "1").strip().lower()
     soft_allow_enabled = soft_allow_env not in ("0", "false", "False", "no", "off")
@@ -281,6 +311,12 @@ def load_settings(path: Path | None = None) -> Settings:
         agy_wrapper=os.getenv("AGY_WRAPPER", "/opt/gemini-pool/bin/avia-llm"),
         headless=os.getenv("HEADLESS", "1") != "0",
         top_n=int(os.getenv("TOP_N", "5")),
+        balance_max_premium_pct=balance_max_premium_pct,
+        balance_min_saving_minutes=balance_min_saving_minutes,
+        balance_min_saving_share=balance_min_saving_share,
+        site_top_cheap=site_top_cheap,
+        site_top_balance=site_top_balance,
+        site_top_fast=site_top_fast,
         tg_token=os.getenv("TG_BOT_TOKEN", ""),
         tg_allowed_ids=allowed,
         tg_open=os.getenv("TG_OPEN", "0") == "1",
