@@ -22,8 +22,12 @@ class RecordingBot(Bot):
         super().__init__(settings, **kwargs)
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.next_msg_id = 100
+        self.delays: dict[str, float] = {}
 
     async def call(self, method: str, **params):
+        delay = self.delays.get(method, 0.0)
+        if delay > 0:
+            await asyncio.sleep(delay)
         self.calls.append((method, params))
         if method == "sendMessage":
             self.next_msg_id += 1
@@ -387,3 +391,169 @@ async def test_user_can_start_new_search_while_late_search_running(tmp_path, mon
 
     # Дожидаемся завершения фоновых задач
     await asyncio.sleep(0.35)
+
+
+@pytest.mark.asyncio
+async def test_live_deadline_slow_site_finishes_during_card_sending_race(tmp_path, monkeypatch):
+    """Опоздавший сайт завершается в процессе сетевой задержки отправки карточки.
+
+    Проверяет отсутствие гонки: сайт, завершившийся во время отправки карточки,
+    не отбрасывается как «уже ответивший», и досылка гарантированно уходит.
+    """
+    sites = [
+        SiteConfig(name="fast_site", url_template="http://fast"),
+        SiteConfig(name="slow<site>&co", url_template="http://slow"),
+    ]
+    bot = make_bot(tmp_path, sites=sites, deadline=0.15)
+    # Эмулируем сетевую задержку отправки сообщений через Telegram API
+    bot.delays["sendMessage"] = 0.1
+
+    async def race_search(q, s, priority=0, on_site_done=None, **kwargs):
+        res_fast = SiteResult("fast_site", True, [Offer("fast_site", 8000, airline="FastAir")])
+        if on_site_done:
+            await on_site_done(res_fast)
+        # slow<site>&co завершается на 0.20 с (дедлайн 0.15 с, карточка отправляется 0.15..0.25 с)
+        await asyncio.sleep(0.20)
+        res_slow = SiteResult(
+            "slow<site>&co",
+            True,
+            [Offer("slow<site>&co", 6200, airline="SlowAir")],
+            page_url="https://slow.test/search?a=1&b=2",
+        )
+        if on_site_done:
+            await on_site_done(res_slow)
+        return [res_fast, res_slow]
+
+    monkeypatch.setattr("avia.bot.search", race_search)
+
+    msg = {
+        "chat": {"id": 123},
+        "from": {"id": 123},
+        "text": "/price MOW LED 10.12",
+    }
+    await bot.handle(msg)
+
+    # Ждём завершения фоновой задачи и отправки досылки
+    await asyncio.sleep(0.3)
+
+    send_texts = [p["text"] for m, p in bot.calls if m == "sendMessage"]
+    # В карточке сайт был помечен как не успевший к дедлайну
+    assert any("не успел к дедлайну, результат придёт отдельным сообщением" in t for t in send_texts)
+    # Досылка с экранированным именем сайта и ссылкой гарантированно отправлена
+    late_msgs = [t for t in send_texts if "➕ Опоздал сайт slow&lt;site&gt;&amp;co" in t]
+    assert len(late_msgs) == 1
+    assert "нашёл дешевле — 6 200 ₽ (в карточке было 8 000 ₽)" in late_msgs[0]
+    assert "https://slow.test/search?a=1&amp;b=2" in late_msgs[0]
+
+
+def test_format_late_site_notification_escapes_html():
+    """format_late_site_notification экранирует спецсимволы в названии сайта и ссылке."""
+    from avia.formatting import format_late_site_notification
+
+    text = format_late_site_notification(
+        site="<bad>&site",
+        price=5000,
+        currency="RUB",
+        card_min_price=7000,
+        card_min_currency="RUB",
+        page_url="https://example.com/search?from=MOW&to=LED",
+    )
+    assert "➕ Опоздал сайт &lt;bad&gt;&amp;site:" in text
+    assert "<bad>" not in text
+    assert 'href="https://example.com/search?from=MOW&amp;to=LED"' in text
+
+
+@pytest.mark.asyncio
+async def test_live_search_records_queue_seconds_in_metrics(tmp_path, monkeypatch):
+    """Проверяет, что время ожидания в очереди (queue_seconds) не обнуляется и пишется в метрики."""
+    from avia.metrics import MetricsStore
+
+    metrics_file = tmp_path / "test_metrics.sqlite"
+    metrics_store = MetricsStore(metrics_file)
+    monkeypatch.setattr("avia.bot.MetricsStore", lambda _p: metrics_store)
+
+    settings = Settings(
+        sites=[SiteConfig(name="fast", url_template="http://fast")],
+        tg_token="dummy",
+        tg_allowed_ids={123},
+        storage_dir=tmp_path,
+        live_deadline_seconds=2.0,
+        max_parallel_searches=1,
+    )
+    bot = RecordingBot(settings)
+    bot.metrics = metrics_store
+
+    async def fast_search(q, s, priority=0, on_site_done=None, **kwargs):
+        res = SiteResult("fast", True, [Offer("fast", 5000)])
+        if on_site_done:
+            await on_site_done(res)
+        return [res]
+
+    monkeypatch.setattr("avia.bot.search", fast_search)
+
+    # Занимаем единственный слот в priority gate, чтобы создать искусственную очередь
+    async with bot._gate.slot(0):
+        handle_task = asyncio.create_task(
+            bot.handle({"chat": {"id": 123}, "from": {"id": 123}, "text": "/price MOW LED 10.12"})
+        )
+        await asyncio.sleep(0.05)
+
+    await handle_task
+
+    with metrics_store._connect() as db:
+        row = db.execute("select total_seconds, queue_seconds from searches").fetchone()
+    assert row is not None
+    total_seconds, queue_seconds = row
+    assert queue_seconds is not None
+    assert queue_seconds >= 0.04
+    assert total_seconds >= queue_seconds
+
+
+@pytest.mark.asyncio
+async def test_late_search_records_queue_seconds_in_metrics(tmp_path, monkeypatch):
+    """Проверяет, что при дедлайне фоновый догон также корректно записывает queue_seconds."""
+    from avia.metrics import MetricsStore
+
+    metrics_file = tmp_path / "late_metrics.sqlite"
+    metrics_store = MetricsStore(metrics_file)
+    monkeypatch.setattr("avia.bot.MetricsStore", lambda _p: metrics_store)
+
+    settings = Settings(
+        sites=[SiteConfig(name="slow", url_template="http://slow")],
+        tg_token="dummy",
+        tg_allowed_ids={123},
+        storage_dir=tmp_path,
+        live_deadline_seconds=0.05,
+        max_parallel_searches=1,
+    )
+    bot = RecordingBot(settings)
+    bot.metrics = metrics_store
+
+    async def slow_search(q, s, priority=0, on_site_done=None, **kwargs):
+        await asyncio.sleep(0.1)
+        res = SiteResult("slow", True, [Offer("slow", 5000)])
+        if on_site_done:
+            await on_site_done(res)
+        return [res]
+
+    monkeypatch.setattr("avia.bot.search", slow_search)
+
+    # Искусственно задерживаем получение слота
+    async with bot._gate.slot(0):
+        handle_task = asyncio.create_task(
+            bot.handle({"chat": {"id": 123}, "from": {"id": 123}, "text": "/price MOW LED 10.12"})
+        )
+        await asyncio.sleep(0.05)
+
+    await handle_task
+    # Дожидаемся фонового догона
+    await asyncio.sleep(0.15)
+
+    with metrics_store._connect() as db:
+        row = db.execute("select total_seconds, queue_seconds from searches").fetchone()
+    assert row is not None
+    total_seconds, queue_seconds = row
+    assert queue_seconds is not None
+    assert queue_seconds >= 0.04
+    assert total_seconds >= queue_seconds
+

@@ -482,7 +482,6 @@ class Bot:
             try:
                 async with self._gate.slot(0):
                     t_gate = time.monotonic()
-                    t_search0 = t_gate
                     search_task = asyncio.create_task(
                         _search_call(
                             search,
@@ -510,6 +509,7 @@ class Bot:
             except Exception:
                 pass
 
+            answered_site_names: set[str] = set()
             if not timed_out:
                 assert search_task is not None
                 results = search_task.result()
@@ -521,6 +521,7 @@ class Bot:
             else:
                 assert search_task is not None
                 answered_sites = dict(updater.results_by_site)
+                answered_site_names = set(answered_sites.keys())
                 results = []
                 for s in enabled_sites:
                     if s.name in answered_sites:
@@ -604,7 +605,6 @@ class Bot:
                     card_min_price = min_card_offer.price
                     card_min_currency = min_card_offer.currency
 
-                answered_site_names = set(updater.results_by_site.keys())
                 bg_coro = self._finish_late_search(
                     chat_id=chat_id,
                     q=q,

@@ -727,5 +727,5 @@ def format_late_site_notification(
     price_str = money(price, currency)
     card_str = money(card_min_price, card_min_currency) if card_min_price is not None else "—"
     link = f' — <a href="{escape(page_url, quote=True)}">открыть выдачу</a>' if page_url else ""
-    return f"➕ Опоздал сайт {site}: нашёл дешевле — {price_str} (в карточке было {card_str}){link}"
+    return f"➕ Опоздал сайт {escape(site)}: нашёл дешевле — {price_str} (в карточке было {card_str}){link}"
 
