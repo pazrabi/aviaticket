@@ -188,10 +188,12 @@ def test_quarantine_after_3_failures_and_bg_trial(tmp_path):
     store = MetricsStore(db_path)
     t_fail = 1000.0
 
-    # 3 неудачи подряд на dev_flaky
+    # 3 неудачи подряд на dev_flaky (502 / таймаут / неполная выдача)
+    # Шаг 4: для проверки кулдауна 10 мин (speed_quarantine_seconds) используем не-капча ошибки,
+    # так как капча дает кулдаун 1 ч / 3 ч / 6 ч / 12 ч.
     store.record_run("user", "as", ok=False, partial=False, captcha=False, error="502",
                      offers=0, elapsed=1.0, ts=t_fail, device="dev_flaky", priority=0)
-    store.record_run("user", "as", ok=False, partial=False, captcha=True, error="капча",
+    store.record_run("user", "as", ok=False, partial=False, captcha=False, error="timeout",
                      offers=0, elapsed=1.0, ts=t_fail + 10, device="dev_flaky", priority=0)
     store.record_run("user", "as", ok=True, partial=True, captcha=False, error="неполная выдача",
                      offers=0, elapsed=1.0, ts=t_fail + 20, device="dev_flaky", priority=0)

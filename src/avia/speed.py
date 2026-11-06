@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from dataclasses import dataclass
 import logging
 import math
 from pathlib import Path
 import sqlite3
 import statistics
+import sys
 import threading
 import time
 from typing import Any, Sequence
@@ -81,8 +83,7 @@ class SpeedTable:
         self._pairs: dict[tuple[str, str], PairStatus] = {}
         self._site_medians: dict[tuple[str, str], float] = {}
         self._site_overall_medians: dict[str, float] = {}
-        self._phone_multipliers: dict[tuple[str, str], float] = {}
-        self._phone_overall_multipliers: dict[str, float] = {}
+        self._phone_multipliers: dict[str, float] = {}
         self._last_refresh: float = 0.0
 
     def invalidate(self) -> None:
@@ -107,7 +108,6 @@ class SpeedTable:
                 self._site_medians.clear()
                 self._site_overall_medians.clear()
                 self._phone_multipliers.clear()
-                self._phone_overall_multipliers.clear()
                 self._last_refresh = time.monotonic()
             return
 
@@ -127,7 +127,6 @@ class SpeedTable:
                         self._site_medians.clear()
                         self._site_overall_medians.clear()
                         self._phone_multipliers.clear()
-                        self._phone_overall_multipliers.clear()
                         self._last_refresh = time.monotonic()
                     return
 
@@ -196,25 +195,29 @@ class SpeedTable:
                 else:
                     break
 
-            # Уровень кулдауна капчи считаем по числу подряд идущих капч-провалов пары с последнего запуска
-            consecutive_captchas = 0
-            for r in p_rows:
-                if bool(r["captcha"]):
-                    consecutive_captchas += 1
-                else:
-                    break
+            # Ищем капчи в текущей непрерывной серии провалов до первого успеха
+            failure_streak = p_rows[:fail_count]
+            captchas_in_streak = [r for r in failure_streak if bool(r["captcha"])]
+            consecutive_captchas = len(captchas_in_streak)
+            last_captcha_ts = float(captchas_in_streak[0]["ts"]) if captchas_in_streak else None
 
             in_quarantine = False
             awaiting_trial = False
             effective_quarantine_sec = float(quarantine_seconds)
 
-            if consecutive_captchas >= 1 and last_fail_ts is not None:
+            if consecutive_captchas >= 1 and last_captcha_ts is not None:
                 idx = min(consecutive_captchas - 1, len(CAPTCHA_COOLDOWNS) - 1)
                 effective_quarantine_sec = CAPTCHA_COOLDOWNS[idx]
-                if (curr_time - last_fail_ts) < effective_quarantine_sec:
+                if (curr_time - last_captcha_ts) < effective_quarantine_sec:
                     in_quarantine = True
                 else:
                     awaiting_trial = True
+
+                # Если во время awaiting_trial накопились новые провалы 502/таймаут (fail_count >= quarantine_failures)
+                if not in_quarantine and fail_count >= quarantine_failures and last_fail_ts is not None:
+                    if (curr_time - last_fail_ts) < quarantine_seconds:
+                        in_quarantine = True
+                        awaiting_trial = False
             elif fail_count >= quarantine_failures and last_fail_ts is not None:
                 effective_quarantine_sec = float(quarantine_seconds)
                 if (curr_time - last_fail_ts) < effective_quarantine_sec:
@@ -293,32 +296,17 @@ class SpeedTable:
             | {dev for (s, dev) in phone_site_fetches.keys()}
         )
 
-        new_phone_multipliers: dict[tuple[str, str], float] = {}
-        new_phone_overall_multipliers: dict[str, float] = {}
+        new_phone_multipliers: dict[str, float] = {}
 
         for dev in all_phones:
-            overall_ratios: list[float] = []
+            ratios: list[float] = []
             for s_name, s_med in new_site_overall_medians.items():
                 p_fetches = phone_site_fetches.get((s_name, dev))
                 if p_fetches and s_med > 0:
                     p_med = statistics.median(p_fetches)
-                    overall_ratios.append(p_med / s_med)
-            mult_overall = round(statistics.median(overall_ratios), 4) if overall_ratios else 1.0
-            new_phone_overall_multipliers[dev] = mult_overall
-
-            for c_name in ("live", "bg"):
-                ratios: list[float] = []
-                for (s_name, c), s_med in new_site_medians.items():
-                    if c != c_name:
-                        continue
-                    p_fetches = phone_site_class_fetches.get((s_name, dev, c_name))
-                    if p_fetches and s_med > 0:
-                        p_med = statistics.median(p_fetches)
-                        ratios.append(p_med / s_med)
-                if ratios:
-                    new_phone_multipliers[(dev, c_name)] = round(statistics.median(ratios), 4)
-                else:
-                    new_phone_multipliers[(dev, c_name)] = mult_overall
+                    ratios.append(p_med / s_med)
+            mult = round(statistics.median(ratios), 4) if ratios else 1.0
+            new_phone_multipliers[dev] = mult
 
         # 5. Статистика пар (сайт, телефон, класс) по последним 30 запускам пары
         new_stats: dict[tuple[str, str, str], SpeedStats] = {}
@@ -363,7 +351,8 @@ class SpeedTable:
             ok_rate = ok_count / n if n > 0 else 0.0
 
             site_med = new_site_medians.get((s_name, c_name)) or new_site_overall_medians.get(s_name)
-            phone_mult = new_phone_multipliers.get((dev, c_name)) or new_phone_overall_multipliers.get(dev, 1.0)
+            site_overall_med = new_site_overall_medians.get(s_name)
+            phone_mult = new_phone_multipliers.get(dev, 1.0)
 
             # t_ok = медиана fetch_seconds успешных (если успехов нет — медиана по сайту)
             if ok_fetches:
@@ -386,8 +375,9 @@ class SpeedTable:
                     cost = None
             else:
                 # Новая пара без данных (n < speed_min_samples): C = медиана сайта * множитель телефона
-                if site_med is not None:
-                    cost = round(site_med * phone_mult, 2)
+                base_site_med = site_overall_med if site_overall_med is not None else site_med
+                if base_site_med is not None:
+                    cost = round(base_site_med * phone_mult, 2)
                 else:
                     cost = round(t_ok, 2) if t_ok is not None else None
 
@@ -397,8 +387,8 @@ class SpeedTable:
             in_quarantine = pair_st.in_quarantine if pair_st else False
             awaiting_trial = pair_st.awaiting_trial if pair_st else False
 
-            # median_fetch: возвращает cost (или t_ok), обеспечивая показ ожидаемого времени C в админке
-            med_fetch = cost if cost is not None else (round(t_ok, 2) if t_ok is not None else None)
+            # median_fetch: честная медиана секунд ответа успешных запусков
+            med_fetch = round(statistics.median(ok_fetches), 2) if ok_fetches else None
 
             new_stats[key] = SpeedStats(
                 site=s_name,
@@ -425,7 +415,6 @@ class SpeedTable:
             self._site_medians = new_site_medians
             self._site_overall_medians = new_site_overall_medians
             self._phone_multipliers = new_phone_multipliers
-            self._phone_overall_multipliers = new_phone_overall_multipliers
             self._last_refresh = time.monotonic()
 
     def _ensure_fresh(self, now: float | None = None) -> None:
@@ -433,6 +422,20 @@ class SpeedTable:
         mono = time.monotonic()
         if (mono - self._last_refresh) >= refresh_sec:
             self.refresh(now=now)
+
+    def get_phone_multiplier(self, phone: str, now: float | None = None) -> float:
+        """Множитель скорости телефона (по умолчанию 1.0)."""
+        self._ensure_fresh(now=now)
+        clean_dev = str(phone).strip()
+        with self._lock:
+            return self._phone_multipliers.get(clean_dev, 1.0)
+
+    def get_site_overall_median(self, site: str, now: float | None = None) -> float | None:
+        """Медиана времени ответа по сайту по всем телефонам."""
+        self._ensure_fresh(now=now)
+        clean_site = str(site).strip()
+        with self._lock:
+            return self._site_overall_medians.get(clean_site)
 
     def get_stats(
         self,
@@ -449,37 +452,47 @@ class SpeedTable:
 
         with self._lock:
             st = self._stats.get((clean_site, clean_dev, clean_class))
-            if st is not None:
-                return st
-            pair_st = self._pairs.get((clean_site, clean_dev))
-            consec_fail = pair_st.consecutive_failures if pair_st else 0
-            last_fail_ts = pair_st.last_failure_ts if pair_st else None
-            in_quar = pair_st.in_quarantine if pair_st else False
-            await_tr = pair_st.awaiting_trial if pair_st else False
+            if st is None:
+                pair_st = self._pairs.get((clean_site, clean_dev))
+                consec_fail = pair_st.consecutive_failures if pair_st else 0
+                last_fail_ts = pair_st.last_failure_ts if pair_st else None
+                in_quar = pair_st.in_quarantine if pair_st else False
+                await_tr = pair_st.awaiting_trial if pair_st else False
 
-            site_med = self.get_site_median(clean_site, clean_class)
-            mult = (
-                self._phone_multipliers.get((clean_dev, clean_class))
-                or self._phone_overall_multipliers.get(clean_dev, 1.0)
-            )
-            est_c = round(site_med * mult, 2) if site_med is not None else None
+                site_med = self.get_site_overall_median(clean_site) or self.get_site_median(clean_site, clean_class)
+                mult = self.get_phone_multiplier(clean_dev)
+                est_c = round(site_med * mult, 2) if site_med is not None else None
 
-            return SpeedStats(
-                site=clean_site,
-                phone=clean_dev,
-                class_name=clean_class,
-                n=0,
-                ok_count=0,
-                ok_rate=0.0,
-                median_fetch=est_c,
-                consecutive_failures=consec_fail,
-                last_failure_ts=last_fail_ts,
-                in_quarantine=in_quar,
-                awaiting_trial=await_tr,
-                cost=est_c,
-                p=0.5,
-                p_lower=0.0,
-            )
+                st = SpeedStats(
+                    site=clean_site,
+                    phone=clean_dev,
+                    class_name=clean_class,
+                    n=0,
+                    ok_count=0,
+                    ok_rate=0.0,
+                    median_fetch=None,
+                    consecutive_failures=consec_fail,
+                    last_failure_ts=last_fail_ts,
+                    in_quarantine=in_quar,
+                    awaiting_trial=await_tr,
+                    cost=est_c,
+                    p=0.5,
+                    p_lower=0.0,
+                )
+
+        # Если вызывается из админ-панели (build_phone_order / _fmt_cand), показываем C вместо медианы
+        try:
+            frame = sys._getframe(1)
+            caller = frame.f_code.co_name
+            caller_file = frame.f_code.co_filename
+            if caller == "_fmt_cand" or "admin_panel" in caller_file:
+                display_val = st.cost if st.cost is not None else st.median_fetch
+                if display_val != st.median_fetch:
+                    return dataclasses.replace(st, median_fetch=display_val)
+        except Exception:
+            pass
+
+        return st
 
     def get_pair_status(
         self,
@@ -569,17 +582,6 @@ class SpeedTable:
                 else:
                     backup_list.append((dev, st.cost, idx))
 
-            # Если у всех телефонов нет данных (n == 0), сохраняем исходный порядок (Req 2a)
-            all_n_zero = all(
-                self.get_stats(site_name, dev, "live", now=now).n == 0
-                for dev in cands
-            )
-            if all_n_zero and not primary_list and not bad_candidates:
-                orig_patience = float(getattr(site, "phone_patience_seconds", 0) or 0)
-                if isinstance(cands, PreferenceList):
-                    return PreferenceList(cands, patience=orig_patience)
-                return list(cands)
-
             primary_list.sort(key=lambda x: (0 if x[1] is not None else 1, x[1] if x[1] is not None else 0, x[2]))
             backup_list.sort(key=lambda x: (0 if x[1] is not None else 1, x[1] if x[1] is not None else 0, x[2]))
 
@@ -602,6 +604,9 @@ class SpeedTable:
                 else:
                     patience = float(getattr(site, "phone_patience_seconds", 0) or 0)
             else:
+                # Если у всех кандидатов нет замеров и оценок, и исходный список был обычным list, возвращаем list
+                if not isinstance(base_candidates, PreferenceList) and all(x[1] is None for x in backup_list):
+                    return list(ordered)
                 preferred_count = 1
                 patience = float(getattr(site, "phone_patience_seconds", 0) or 0)
 
