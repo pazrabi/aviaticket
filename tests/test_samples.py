@@ -123,7 +123,7 @@ def test_save_sample_redacts_tokens(tmp_path):
     )
     q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 1))
 
-    p = save_sample("onetwotrip", snap, q, samples_dir)
+    p = save_sample("aviasales", snap, q, samples_dir)
     assert p is not None
 
     decompressed = gzip.decompress(p.read_bytes()).decode("utf-8")
@@ -179,15 +179,6 @@ def test_parser_check_on_fixtures(tmp_path, capsys):
     )
     save_sample("kupibilet", kupi_snap, Query("MOW", "ALA", date(2026, 12, 10)), samples_dir)
 
-    # 3. OneTwoTrip
-    ott_json = (FIXTURES_DIR / "onetwotrip" / "search_ow_kuf_evn_0212.json").read_text(encoding="utf-8")
-    ott_snap = Snapshot(
-        url="https://www.onetwotrip.com/ru/f/search/0212KUFEVN?sc=E&p=1_0_0",
-        text="Выдача OneTwoTrip",
-        json_payloads=[("https://www.onetwotrip.com/_avia-search-proxy/search/v3", ott_json)],
-    )
-    save_sample("onetwotrip", ott_snap, Query("KUF", "EVN", date(2026, 12, 2)), samples_dir)
-
     # 4. Tutu
     tutu_json = (FIXTURES_DIR / "tutu" / "offers_first_mow_ala.json").read_text(encoding="utf-8")
     tutu_snap = Snapshot(
@@ -215,7 +206,6 @@ def test_parser_check_on_fixtures(tmp_path, capsys):
     assert "kupibilet" in results and results["kupibilet"]["ok"] is True
     assert results["kupibilet"]["offers_count"] > 0
 
-    assert "onetwotrip" in results and results["onetwotrip"]["ok"] is True
     assert "tutu" in results and results["tutu"]["ok"] is True
     assert "yandex_travel" in results and results["yandex_travel"]["ok"] is True
 

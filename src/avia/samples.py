@@ -158,10 +158,6 @@ def _make_fixture_snapshot_and_query(site: str, path: Path, content: str) -> tup
     elif site == "kupibilet":
         url = "https://www.kupibilet.ru/search"
         payloads = [("https://api-rs-lb.kupibilet.ru/frontend_search", content)]
-    elif site == "onetwotrip":
-        url = "https://www.onetwotrip.com/ru/f/search/0212KUFEVN?sc=E&p=1_0_0"
-        q = Query(origin="KUF", destination="EVN", depart=date(2026, 12, 2), adults=1)
-        payloads = [("https://www.onetwotrip.com/_avia-search-proxy/search/v3", content)]
     elif site == "tutu":
         url = "https://avia.tutu.ru/offers/?class=Y&travelers=1&route[0]=491-12122026-117"
         q = Query(origin="MOW", destination="ALA", depart=date(2026, 12, 12), adults=1)

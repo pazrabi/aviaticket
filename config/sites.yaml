@@ -24,7 +24,7 @@ sites:
     source: browser
     parser: aviasales
     enabled: true
-    phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu, Яндекса и OneTwoTrip
+    phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu и Яндекса
     phone_patience_seconds: 10
     phone_capture_json: ["/search/v3.2/results"]
     phone_wait_seconds: 45
@@ -40,7 +40,7 @@ sites:
     source: browser
     parser: kupibilet
     enabled: true
-    phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu, Яндекса и OneTwoTrip
+    phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu и Яндекса
     phone_patience_seconds: 15
     phone_wait_seconds: 30
     phone_capture_json: ["/frontend_search"]
@@ -87,28 +87,13 @@ sites:
     settle_ms: 30000
     scrolls: 1
 
-  # OneTwoTrip: шаблоны сняты с ссылки пользователя (дата туда ddmm, города, дата обратно ddmm; пассажиры в p=взр_дети_младенцы).
-  # Выключен, пока нет парсера (сначала recon).
-  - name: onetwotrip
-    source: browser
-    parser: onetwotrip
-    enabled: true
-    phone: "realme,redmi"   # realme первым; redmi подхватывает, когда realme занят (замеры 2026-11-04)
-    phone_patience_seconds: 5
-    phone_wait_seconds: 30
-    phone_capture_json: ["/search/v3"]
-    url_template: "https://www.onetwotrip.com/ru/f/search/{ddmm}{origin}{destination}?sc=E&p={adults}_0_0"
-    url_template_rt: "https://www.onetwotrip.com/ru/f/search/{ddmm}{origin}{destination}{ddmm_ret}?sc=E&p={adults}_0_0"
-    settle_ms: 25000
-    scrolls: 2
-
   # Озон Тревел: шаблоны сняты со ссылки пользователя (route = туда+обратно кодами в нижнем регистре).
   # Выключен: антибот Озона отдаёт заглушку автоматическому браузеру (сначала recon в видимом окне).
   - name: ozon_travel
     source: browser
     parser: ozon_travel
     enabled: true
-    phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu, Яндекса и OneTwoTrip
+    phone: "redmi,realme"   # сначала redmi, чтобы realme оставался для tutu и Яндекса
     phone_patience_seconds: 10
     phone_wait_seconds: 30
     phone_capture_json: ["aviaSearchResult"]

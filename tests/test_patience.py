@@ -60,7 +60,7 @@ def test_yaml_config_loading():
     assert by_name["aviasales"].phone_patience_seconds == 10
     assert by_name["ozon_travel"].phone_patience_seconds == 10
     assert by_name["tutu"].phone_patience_seconds == 5
-    assert by_name["onetwotrip"].phone_patience_seconds == 5
+    assert "onetwotrip" not in by_name
 
     ya = by_name["yandex_travel"]
     assert ya.phone == "realme,redmi"

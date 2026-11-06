@@ -652,7 +652,7 @@ async def _fetch_device_snapshot(
 
 def _infer_site_name(url: str) -> str:
     url_l = str(url).lower()
-    for s in ("aviasales", "yandex", "tutu", "kupibilet", "onetwotrip", "ozon"):
+    for s in ("aviasales", "yandex", "tutu", "kupibilet", "ozon"):
         if s in url_l:
             return s
     return "site"
