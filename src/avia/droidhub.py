@@ -4,12 +4,13 @@ from __future__ import annotations
 import asyncio
 import bisect
 from dataclasses import dataclass
+import inspect
 import json
 import logging
 import os
 from pathlib import Path
 import time
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 import httpx
 
@@ -100,6 +101,21 @@ class DroidhubError(Exception):
         self.status_code = status_code
 
 
+class JobsUnsupported(DroidhubError):
+    """Хаб не поддерживает задания fetch_jobs (404/405)."""
+
+
+_jobs_unsupported: bool = False
+POLL_MIN_INTERVAL: float = 0.3
+DELETE_TIMEOUT: float = 3.0
+
+
+def reset_jobs_supported() -> None:
+    """Сброс флага поддержки fetch_jobs (для изоляции тестов)."""
+    global _jobs_unsupported
+    _jobs_unsupported = False
+
+
 def _sync_loop_state() -> asyncio.AbstractEventLoop | None:
     """Синхронизирует блокировки и состояние пула с текущим циклом событий."""
     global _pool_condition, _pool_loop, _busy_devices, _device_locks, _seq_counter, _waiters
@@ -139,7 +155,7 @@ def _get_pool_condition() -> asyncio.Condition:
 
 def _reset_pool() -> None:
     """Сброс состояния пула (для изоляции тестов)."""
-    global _pool_condition, _pool_loop, _rr_counter, _seq_counter, _waiters, _clock
+    global _pool_condition, _pool_loop, _rr_counter, _seq_counter, _waiters, _clock, _jobs_unsupported
     _busy_devices.clear()
     _device_locks.clear()
     _pool_condition = None
@@ -147,6 +163,7 @@ def _reset_pool() -> None:
     _rr_counter = 0
     _seq_counter = 0
     _clock = None
+    _jobs_unsupported = False
     for w in _waiters:
         if w.timer_handle is not None:
             w.timer_handle.cancel()
@@ -674,6 +691,263 @@ async def _fetch_device_snapshot(
         return snap, finished
 
 
+async def _delete_job(
+    delete_url: str,
+    headers: dict[str, str],
+    client: httpx.AsyncClient | None = None,
+) -> None:
+    """Удаляет/отменяет задание в droidhub."""
+    try:
+        if client is not None:
+            await client.delete(delete_url, headers=headers, timeout=DELETE_TIMEOUT)
+        else:
+            async with httpx.AsyncClient(timeout=DELETE_TIMEOUT) as cl:
+                await cl.delete(delete_url, headers=headers)
+    except Exception as e:
+        logger.warning("Ошибка при вызове DELETE %s: %s", delete_url, e)
+
+
+async def _fetch_device_job(
+    settings: Settings,
+    device_id: str,
+    url: str,
+    *,
+    wait_seconds: int = 40,
+    capture_json: list[str] | None = None,
+    wait_for: str = "",
+    evaluate: Callable[[Snapshot, dict[str, Any]], Awaitable[str | None]] | None = None,
+    client: httpx.AsyncClient | None = None,
+    max_seconds: float | None = None,
+) -> tuple[Snapshot, bool, dict[str, Any]]:
+    """Выполняет запрос через механизм заданий fetch_jobs в droidhub."""
+    device_id = device_id.strip()
+    lock = _get_device_lock(device_id)
+    async with lock:
+        wait_val = max(1, min(int(wait_seconds), 60))
+        max_sec = 45.0 if max_seconds is None else float(max_seconds)
+        max_sec = max(1.0, min(max_sec, 90.0))
+        base_url = settings.droidhub_url.strip().rstrip("/")
+        token = settings.droidhub_token.strip()
+        headers = {"Authorization": f"Bearer {token}"}
+        endpoint = f"{base_url}/api/devices/{device_id}/fetch_jobs"
+        payload: dict[str, Any] = {
+            "url": url,
+            "wait_seconds": wait_val,
+            "max_seconds": max_sec,
+            "capture_json": list(capture_json) if capture_json is not None else [],
+            "max_chars": 200000,
+        }
+        if wait_for:
+            payload["wait_for"] = wait_for
+
+        timeout = float(wait_seconds + 60)
+        job_id: str | None = None
+        job_url: str = ""
+
+        try:
+            try:
+                if client is not None:
+                    resp = await client.post(endpoint, json=payload, headers=headers)
+                else:
+                    async with httpx.AsyncClient(timeout=timeout) as cl:
+                        resp = await cl.post(endpoint, json=payload, headers=headers)
+            except (httpx.TimeoutException, asyncio.TimeoutError):
+                raise DroidhubError("таймаут при обращении к droidhub")
+            except (httpx.RequestError, ConnectionError, OSError):
+                raise DroidhubError("сетевая ошибка при обращении к droidhub")
+
+            if resp.status_code in (401, 403):
+                raise DroidhubError(
+                    f"ошибка авторизации droidhub ({resp.status_code}): неверный токен",
+                    status_code=resp.status_code,
+                )
+            if resp.status_code in (404, 405):
+                raise JobsUnsupported(
+                    f"хаб не поддерживает fetch_jobs ({resp.status_code})",
+                    status_code=resp.status_code,
+                )
+            if resp.status_code == 429:
+                raise DroidhubError("очередь droidhub занята (429)", status_code=429)
+            if resp.status_code == 502:
+                raise DroidhubError("телефон недоступен или страница не открылась (502)", status_code=502)
+            if resp.status_code != 200:
+                raise DroidhubError(f"ошибка droidhub (код {resp.status_code})", status_code=resp.status_code)
+
+            try:
+                init_data = resp.json()
+            except Exception:
+                raise DroidhubError("некорректный JSON в ответе droidhub")
+            if not isinstance(init_data, dict) or "job_id" not in init_data:
+                raise DroidhubError("некорректная структура ответа droidhub: отсутствует job_id")
+
+            job_id = str(init_data["job_id"]).strip()
+            job_url = f"{base_url}/api/fetch_jobs/{job_id}"
+            finish_url = f"{job_url}/finish"
+
+            accumulated_payloads: list[tuple[str, str]] = []
+            accumulated_times: list[float | None] = []
+            next_since = 0
+            stop_reason: str | None = None
+            hub_data: dict[str, Any] = {}
+            t_start = time.monotonic()
+
+            while True:
+                t_poll_start = time.monotonic()
+                poll_url = f"{job_url}?since={next_since}"
+                try:
+                    if client is not None:
+                        poll_resp = await client.get(poll_url, headers=headers)
+                    else:
+                        async with httpx.AsyncClient(timeout=10.0) as cl:
+                            poll_resp = await cl.get(poll_url, headers=headers)
+                except (httpx.TimeoutException, asyncio.TimeoutError):
+                    raise DroidhubError("таймаут при обращении к droidhub")
+                except (httpx.RequestError, ConnectionError, OSError):
+                    raise DroidhubError("сетевая ошибка при обращении к droidhub")
+
+                if poll_resp.status_code in (401, 403):
+                    raise DroidhubError(
+                        f"ошибка авторизации droidhub ({poll_resp.status_code}): неверный токен",
+                        status_code=poll_resp.status_code,
+                    )
+                if poll_resp.status_code == 502:
+                    raise DroidhubError("телефон недоступен или страница не открылась (502)", status_code=502)
+                if poll_resp.status_code != 200:
+                    raise DroidhubError(f"ошибка droidhub (код {poll_resp.status_code})", status_code=poll_resp.status_code)
+
+                try:
+                    hub_data = poll_resp.json()
+                except Exception:
+                    raise DroidhubError("некорректный JSON в ответе droidhub")
+                if not isinstance(hub_data, dict):
+                    raise DroidhubError("некорректная структура ответа droidhub")
+
+                raw_responses = hub_data.get("responses") or []
+                next_since = hub_data.get("next", next_since)
+                for item in raw_responses:
+                    if isinstance(item, dict):
+                        item_url = str(item.get("url", ""))
+                        raw_body = item.get("body", "")
+                        if isinstance(raw_body, str):
+                            body_str = raw_body
+                        elif isinstance(raw_body, (dict, list)):
+                            body_str = json.dumps(raw_body, ensure_ascii=False)
+                        elif raw_body is None:
+                            body_str = ""
+                        else:
+                            body_str = str(raw_body)
+                        accumulated_payloads.append((item_url, body_str))
+                        t_val = item.get("t")
+                        if isinstance(t_val, (int, float)) and not isinstance(t_val, bool):
+                            accumulated_times.append(float(t_val))
+                        else:
+                            accumulated_times.append(None)
+
+                snap_so_far = Snapshot(
+                    url=url,
+                    text="",
+                    json_payloads=list(accumulated_payloads),
+                    payload_times=list(accumulated_times),
+                    blocked=bool(hub_data.get("captcha", False)),
+                )
+
+                if evaluate is not None:
+                    res = evaluate(snap_so_far, hub_data)
+                    if inspect.isawaitable(res):
+                        stop_reason = await res
+                    else:
+                        stop_reason = res
+
+                job_st = hub_data.get("state")
+                if stop_reason is not None:
+                    break
+                if job_st in ("done", "failed"):
+                    stop_reason = "job_done"
+                    break
+
+                poll_elapsed = time.monotonic() - t_poll_start
+                if poll_elapsed < POLL_MIN_INTERVAL:
+                    await asyncio.sleep(POLL_MIN_INTERVAL - poll_elapsed)
+
+            # Вызвать finish
+            try:
+                if client is not None:
+                    finish_resp = await client.post(finish_url, headers=headers)
+                else:
+                    async with httpx.AsyncClient(timeout=10.0) as cl:
+                        finish_resp = await cl.post(finish_url, headers=headers)
+            except (httpx.TimeoutException, asyncio.TimeoutError):
+                raise DroidhubError("таймаут при обращении к droidhub (finish)")
+            except (httpx.RequestError, ConnectionError, OSError):
+                raise DroidhubError("сетевая ошибка при обращении к droidhub (finish)")
+
+            if finish_resp.status_code != 200:
+                raise DroidhubError(
+                    f"ошибка finish в droidhub (код {finish_resp.status_code})",
+                    status_code=finish_resp.status_code,
+                )
+
+            try:
+                finish_data = finish_resp.json()
+            except Exception:
+                raise DroidhubError("некорректный JSON в ответе finish droidhub")
+            if not isinstance(finish_data, dict):
+                raise DroidhubError("некорректная структура ответа finish droidhub")
+
+            resp_url = str(finish_data.get("url") or url)
+            resp_text = finish_data.get("text") or ""
+            captcha = bool(finish_data.get("captcha", False) or hub_data.get("captcha", False))
+
+            woke_val = finish_data.get("woke")
+            if isinstance(woke_val, bool):
+                woke: bool | None = woke_val
+            elif isinstance(woke_val, int):
+                woke = bool(woke_val)
+            else:
+                woke = None
+
+            tfm_val = finish_data.get("t_first_match")
+            if isinstance(tfm_val, (int, float)) and not isinstance(tfm_val, bool):
+                t_first_match: float | None = float(tfm_val)
+            else:
+                t_first_match = None
+
+            snap = Snapshot(
+                url=resp_url,
+                text=resp_text,
+                json_payloads=accumulated_payloads,
+                payload_times=accumulated_times,
+                blocked=captcha,
+                woke=woke,
+                t_first_match=t_first_match,
+            )
+
+            finished = bool(
+                stop_reason in ("done", "job_done")
+                or (stop_reason not in ("stable", "quiet", "cap") and bool(hub_data.get("wait_for_seen", False)))
+            )
+            elapsed = float(finish_data.get("seconds") or hub_data.get("elapsed") or (time.monotonic() - t_start))
+
+            t_first_offer = getattr(evaluate, "t_first_offer", None)
+            t_last_improve = getattr(evaluate, "t_last_improve", None)
+
+            info = {
+                "stop_reason": stop_reason,
+                "elapsed": elapsed,
+                "t_first_offer": t_first_offer,
+                "t_last_improve": t_last_improve,
+            }
+            return snap, finished, info
+
+        except BaseException:
+            if job_id is not None and job_url:
+                try:
+                    await asyncio.shield(_delete_job(job_url, headers, client))
+                except Exception as del_err:
+                    logger.warning("Ошибка отмены задания %s: %s", job_id, del_err)
+            raise
+
+
 def _infer_site_name(url: str) -> str:
     url_l = str(url).lower()
     for s in ("aviasales", "yandex", "tutu", "kupibilet", "ozon"):
@@ -749,6 +1023,8 @@ async def fetch_page_snapshot_any(
     phone_patience_seconds: float | None = None,
     site_name: str | None = None,
     preferred_count: int | None = None,
+    evaluate: Callable[[Snapshot, dict[str, Any]], Awaitable[str | None]] | None = None,
+    max_seconds: float | None = None,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на любом свободном телефоне из candidates.
 
@@ -786,6 +1062,8 @@ async def fetch_page_snapshot_any(
     pref_base = preferred_count or 1
     pref_set = set(clean_candidates[:pref_base])
 
+    global _jobs_unsupported
+
     while len(tried) < len(clean_candidates):
         remaining = [c for c in clean_candidates if c not in tried]
         if not remaining:
@@ -817,20 +1095,65 @@ async def fetch_page_snapshot_any(
 
         t_fetch_start = time.monotonic()
         try:
-            snap, finished = await _fetch_device_snapshot(
-                settings,
-                dev,
-                url,
-                wait_seconds=wait_seconds,
-                capture_json=capture_json,
-                wait_for=wait_for,
-                client=client,
+            use_jobs = bool(
+                evaluate is not None
+                and getattr(settings, "fast_stop", True)
+                and not _jobs_unsupported
+                and priority == 0
             )
-            fetch_sec = time.monotonic() - t_fetch_start
-            if stats is not None:
-                stats["fetch_seconds"] = fetch_sec
-                stats["tried"] = list(tried)
-            return snap, finished
+            if use_jobs:
+                try:
+                    snap, finished, info = await _fetch_device_job(
+                        settings,
+                        dev,
+                        url,
+                        wait_seconds=wait_seconds,
+                        capture_json=capture_json,
+                        wait_for=wait_for,
+                        evaluate=evaluate,
+                        client=client,
+                        max_seconds=max_seconds,
+                    )
+                    fetch_sec = time.monotonic() - t_fetch_start
+                    if stats is not None:
+                        stats["fetch_seconds"] = fetch_sec
+                        stats["tried"] = list(tried)
+                        stats["stop_reason"] = info.get("stop_reason")
+                        stats["t_first_offer"] = info.get("t_first_offer")
+                        stats["t_last_improve"] = info.get("t_last_improve")
+                        stats["job_elapsed"] = info.get("elapsed")
+                    return snap, finished
+                except JobsUnsupported:
+                    _jobs_unsupported = True
+                    snap, finished = await _fetch_device_snapshot(
+                        settings,
+                        dev,
+                        url,
+                        wait_seconds=wait_seconds,
+                        capture_json=capture_json,
+                        wait_for=wait_for,
+                        client=client,
+                    )
+                    fetch_sec = time.monotonic() - t_fetch_start
+                    if stats is not None:
+                        stats["fetch_seconds"] = fetch_sec
+                        stats["tried"] = list(tried)
+                    return snap, finished
+            else:
+                snap, finished = await _fetch_device_snapshot(
+                    settings,
+                    dev,
+                    url,
+                    wait_seconds=wait_seconds,
+                    capture_json=capture_json,
+                    wait_for=wait_for,
+                    client=client,
+                )
+                fetch_sec = time.monotonic() - t_fetch_start
+                if stats is not None:
+                    stats["fetch_seconds"] = fetch_sec
+                    stats["tried"] = list(tried)
+                return snap, finished
         except Exception as exc:
             fetch_sec = time.monotonic() - t_fetch_start
             if stats is not None:
@@ -884,6 +1207,8 @@ async def fetch_page_snapshot(
     phone_patience_seconds: float | None = None,
     site_name: str | None = None,
     preferred_count: int | None = None,
+    evaluate: Callable[[Snapshot, dict[str, Any]], Awaitable[str | None]] | None = None,
+    max_seconds: float | None = None,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на телефоне через droidhub и возвращает (Snapshot, finished).
 
@@ -921,6 +1246,8 @@ async def fetch_page_snapshot(
             patience=patience,
             site_name=site_name,
             preferred_count=preferred_count,
+            evaluate=evaluate,
+            max_seconds=max_seconds,
         )
     return await fetch_page_snapshot_any(
         settings,
@@ -937,4 +1264,6 @@ async def fetch_page_snapshot(
         patience=patience,
         site_name=site_name,
         preferred_count=preferred_count,
+        evaluate=evaluate,
+        max_seconds=max_seconds,
     )
