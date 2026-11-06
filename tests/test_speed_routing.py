@@ -302,12 +302,14 @@ def test_slow_ratio_and_patience_calculation(tmp_path):
     settings = Settings(sites=[site], storage_dir=tmp_path, metrics=store, speed_slow_ratio=3.0)
 
     cands = candidates(settings, site, priority=0)
-    # honor ушёл в конец как запасной
+    # Порядок строится по возрастанию C: pixel (4.0) -> redmi (6.0) -> honor (16.0)
     assert list(cands) == ["pixel", "redmi", "honor"]
     assert isinstance(cands, PreferenceList)
-    # patience = разница наименьшей медленной (16.0) и лучшей быстрой (4.0) = 12.0с
-    assert cands.patience == 12.0
-    assert cands.preferred_count == 2  # pixel и redmi
+    # Шаг 4: правило «медленнее в 3 раза» заменено на фильтр p_lower >= speed_live_min_p_lower.
+    # Так как у honor 6 из 6 успешных запусков (p_lower >= 0.6), он допущен в основные,
+    # все 3 телефона являются основными (preferred_count=3), а patience=0.0 (запасных нет).
+    assert cands.preferred_count == 3
+    assert cands.patience == 0.0
 
 
 # ---------------------------------------------------------------------------

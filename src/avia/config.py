@@ -115,6 +115,7 @@ class Settings:
     speed_quarantine_failures: int = 3
     speed_quarantine_seconds: int = 600
     speed_refresh_seconds: int = 300
+    speed_live_min_p_lower: float = 0.6
     phone_min_battery: int = 15
     metrics: Any = None
 
@@ -200,6 +201,10 @@ def load_settings(path: Path | None = None) -> Settings:
     except ValueError:
         speed_refresh_seconds = 300
     try:
+        speed_live_min_p_lower = float(os.getenv("SPEED_LIVE_MIN_P_LOWER", "0.6"))
+    except ValueError:
+        speed_live_min_p_lower = 0.6
+    try:
         phone_min_battery = int(os.getenv("PHONE_MIN_BATTERY", "15"))
     except ValueError:
         phone_min_battery = 15
@@ -261,5 +266,6 @@ def load_settings(path: Path | None = None) -> Settings:
         speed_quarantine_failures=speed_quarantine_failures,
         speed_quarantine_seconds=speed_quarantine_seconds,
         speed_refresh_seconds=speed_refresh_seconds,
+        speed_live_min_p_lower=speed_live_min_p_lower,
         phone_min_battery=phone_min_battery,
     )
