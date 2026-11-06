@@ -141,6 +141,11 @@ class Settings:
     fast_stop: bool = True
     stop_stable_seconds: float = 8.0
     preempt: bool = True
+    hedge: bool = True
+    hedge_fail_share: float = 0.15
+    hedge_min_attempts: int = 5
+    hedge_max_per_search: int = 2
+    hedge_delay_seconds: float = 0.0
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -316,6 +321,25 @@ def load_settings(path: Path | None = None) -> Settings:
     preempt_env = os.getenv("PREEMPT", "1").strip().lower()
     preempt = preempt_env not in ("0", "false", "False", "no", "off")
 
+    hedge_env = os.getenv("HEDGE", "1").strip().lower()
+    hedge = hedge_env not in ("0", "false", "False", "no", "off")
+    try:
+        hedge_fail_share = float(os.getenv("HEDGE_FAIL_SHARE", "0.15"))
+    except ValueError:
+        hedge_fail_share = 0.15
+    try:
+        hedge_min_attempts = int(os.getenv("HEDGE_MIN_ATTEMPTS", "5"))
+    except ValueError:
+        hedge_min_attempts = 5
+    try:
+        hedge_max_per_search = int(os.getenv("HEDGE_MAX_PER_SEARCH", "2"))
+    except ValueError:
+        hedge_max_per_search = 2
+    try:
+        hedge_delay_seconds = float(os.getenv("HEDGE_DELAY_SECONDS", "0.0"))
+    except ValueError:
+        hedge_delay_seconds = 0.0
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -398,6 +422,11 @@ def load_settings(path: Path | None = None) -> Settings:
         fast_stop=fast_stop,
         stop_stable_seconds=stop_stable_seconds,
         preempt=preempt,
+        hedge=hedge,
+        hedge_fail_share=hedge_fail_share,
+        hedge_min_attempts=hedge_min_attempts,
+        hedge_max_per_search=hedge_max_per_search,
+        hedge_delay_seconds=hedge_delay_seconds,
     )
 
 

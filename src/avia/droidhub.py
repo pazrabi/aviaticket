@@ -419,6 +419,34 @@ def _try_acquire(clean: list[str], prefer_order: bool) -> str | None:
         return None
 
 
+def try_acquire_free(
+    candidates: Iterable[str],
+    exclude: str | Iterable[str] | None = None,
+    settings: Settings | None = None,
+) -> str | None:
+    """Неблокирующая попытка занять свободное устройство из списка кандидатов.
+
+    Проверяет устройства, исключая переданные в exclude.
+    Если найдено свободное устройство (не в _busy_devices и не заблокировано lock),
+    помечает его занятым в _busy_devices и возвращает его идентификатор.
+    Иначе возвращает None.
+    """
+    _sync_loop_state()
+    clean = _clean_candidates(list(candidates))
+    if isinstance(exclude, str):
+        exclude_set = {exclude.strip()}
+    elif exclude:
+        exclude_set = {e.strip() for e in exclude}
+    else:
+        exclude_set = set()
+
+    for dev in clean:
+        if dev not in exclude_set and _is_device_available(dev):
+            _busy_devices.add(dev)
+            return dev
+    return None
+
+
 def _on_patience_timeout(waiter: _Waiter) -> None:
     """Коллбэк таймера терпения: будит диспетчер, когда терпение истекло."""
     waiter.timer_handle = None
@@ -1109,6 +1137,7 @@ async def fetch_page_snapshot_any(
     preferred_count: int | None = None,
     evaluate: Callable[[Snapshot, dict[str, Any]], Awaitable[str | None]] | None = None,
     max_seconds: float | None = None,
+    already_acquired: bool = False,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на любом свободном телефоне из candidates.
 
@@ -1158,16 +1187,20 @@ async def fetch_page_snapshot_any(
         acq_pref = max(1, rem_pref) if rem_pref > 0 else len(remaining)
 
         t_acq_start = time.monotonic()
-        dev = await acquire(
-            remaining,
-            priority=priority,
-            weight=weight,
-            prefer_order=prefer_order,
-            patience=acq_patience,
-            preferred_count=acq_pref,
-            settings=settings,
-        )
-        t_acq = time.monotonic() - t_acq_start
+        if already_acquired:
+            dev = remaining[0]
+            t_acq = 0.0
+        else:
+            dev = await acquire(
+                remaining,
+                priority=priority,
+                weight=weight,
+                prefer_order=prefer_order,
+                patience=acq_patience,
+                preferred_count=acq_pref,
+                settings=settings,
+            )
+            t_acq = time.monotonic() - t_acq_start
         total_queue_wait += t_acq
         attempts += 1
         tried.add(dev)
@@ -1333,6 +1366,7 @@ async def fetch_page_snapshot(
     preferred_count: int | None = None,
     evaluate: Callable[[Snapshot, dict[str, Any]], Awaitable[str | None]] | None = None,
     max_seconds: float | None = None,
+    already_acquired: bool = False,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на телефоне через droidhub и возвращает (Snapshot, finished).
 
@@ -1372,6 +1406,7 @@ async def fetch_page_snapshot(
             preferred_count=preferred_count,
             evaluate=evaluate,
             max_seconds=max_seconds,
+            already_acquired=already_acquired,
         )
     return await fetch_page_snapshot_any(
         settings,
@@ -1390,4 +1425,5 @@ async def fetch_page_snapshot(
         preferred_count=preferred_count,
         evaluate=evaluate,
         max_seconds=max_seconds,
+        already_acquired=already_acquired,
     )

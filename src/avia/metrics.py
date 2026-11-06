@@ -145,6 +145,8 @@ class MetricsStore:
                 conn.execute("ALTER TABLE site_runs ADD COLUMN min_price REAL")
 
             cols_att = {row[1] for row in conn.execute("PRAGMA table_info(attempts)").fetchall()}
+            if "role" not in cols_att:
+                conn.execute("ALTER TABLE attempts ADD COLUMN role TEXT DEFAULT 'primary'")
             if "stop_reason" not in cols_att:
                 conn.execute("ALTER TABLE attempts ADD COLUMN stop_reason TEXT")
             if "t_first_offer" not in cols_att:
