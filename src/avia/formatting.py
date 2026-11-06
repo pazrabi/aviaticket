@@ -7,7 +7,7 @@ from typing import Sequence
 from .criteria import SearchCriteria
 from .filters import pareto_front, pick_cards
 from .models import Leg, Offer, Query, SiteResult
-from .offers import baggage_state, compute_offer_id
+from .offers import baggage_state, compute_offer_id, merge_same_flights
 from .parsing import city_name
 
 SYMBOLS = {"RUB": "₽", "KZT": "₸", "UZS": "сум", "USD": "$", "EUR": "€"}
@@ -322,6 +322,15 @@ def offer_card(
     link = offer_link_html(o)
     src = f"<i>{escape(site_label(o.site))}</i>"
     lines.append(f"🔗 {link}  ·  {src}" if link else src)
+    if o.alts:
+        alt_items: list[str] = []
+        for alt in o.alts[:3]:
+            label = escape(site_label(alt.site))
+            if alt.url:
+                label = f'<a href="{escape(alt.url, quote=True)}">{label}</a>'
+            alt_items.append(f"{label} {money(alt.price, alt.currency)}")
+        if alt_items:
+            lines.append(f"💰 также: {' · '.join(alt_items)}")
     return lines
 
 
@@ -573,6 +582,8 @@ def build_compact_report(
                 continue
             seen_ids.add(o.offer_id)
             unique_offers.append(o)
+
+    unique_offers = merge_same_flights(unique_offers)
 
     pareto = pareto_front(unique_offers)
     pareto_set = {id(o) for o in pareto}

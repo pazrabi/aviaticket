@@ -29,6 +29,15 @@ class Leg:
 
 
 @dataclass
+class OfferAlt:
+    site: str
+    price: int
+    currency: str = "RUB"
+    url: str | None = None
+    url_is_direct: bool = False
+
+
+@dataclass
 class Offer:
     site: str
     price: int
@@ -53,6 +62,7 @@ class Offer:
     prev_price: int | None = None   # цена этого билета при прошлом наблюдении
     prev_at: float | None = None    # когда она была снята (epoch)
     min_price: int | None = None    # минимальная цена этого билета за прошлые наблюдения
+    alts: list[OfferAlt] | None = None
 
 
 @dataclass
