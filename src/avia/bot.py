@@ -49,7 +49,6 @@ from .offers import assign_ids, filter_by_baggage
 from .parsing import city_name
 from .phones import PhoneRegistry
 from .pipeline import search
-from .prio_gate import PriorityGate
 from .scheduler import Scheduler
 from .store import ResultStore
 from .subscriptions import SubscriptionStore
@@ -204,7 +203,7 @@ class Bot:
             self.metrics = None
         self.last_backup_at: float | None = self._find_last_backup_time()
         self._last_forecast_train: float = 0.0
-        self._gate = PriorityGate(settings.max_parallel_searches)
+        self._bg_sem = asyncio.Semaphore(settings.max_parallel_searches)
         self._active_searches: int = 0
         self.history = PriceHistory(settings.storage_dir / "history.sqlite")
         self.bg_collector: BackgroundCollector | None = None
@@ -489,40 +488,36 @@ class Bot:
 
             self._active_searches += 1
             t_search0 = time.monotonic()
-            t_gate = t_search0
             timed_out = False
             search_task: asyncio.Task | None = None
             try:
-                async with self._gate.slot(0):
-                    t_gate = time.monotonic()
-                    t_search0 = t_gate
-                    search_task = asyncio.create_task(
-                        _search_call(
-                            search,
-                            q,
-                            self.s,
-                            priority=0,
-                            samples_dir=self.s.storage_dir / "samples",
-                            on_site_done=updater.on_site_done,
-                        )
+                search_task = asyncio.create_task(
+                    _search_call(
+                        search,
+                        q,
+                        self.s,
+                        priority=0,
+                        samples_dir=self.s.storage_dir / "samples",
+                        on_site_done=updater.on_site_done,
                     )
-                    if self.s.live_safety_seconds > 0:
-                        done, pending = await asyncio.wait(
-                            [search_task],
-                            timeout=self.s.live_safety_seconds,
-                        )
-                        timed_out = search_task in pending
-                    else:
-                        await search_task
-                        timed_out = False
+                )
+                if self.s.live_safety_seconds > 0:
+                    done, pending = await asyncio.wait(
+                        [search_task],
+                        timeout=self.s.live_safety_seconds,
+                    )
+                    timed_out = search_task in pending
+                else:
+                    await search_task
+                    timed_out = False
 
-                    if timed_out:
-                        search_task.cancel()
-                        await asyncio.wait([search_task], timeout=5.0)
-                        try:
-                            search_task.exception()
-                        except (asyncio.CancelledError, asyncio.InvalidStateError):
-                            pass
+                if timed_out:
+                    search_task.cancel()
+                    await asyncio.wait([search_task], timeout=5.0)
+                    try:
+                        search_task.exception()
+                    except (asyncio.CancelledError, asyncio.InvalidStateError):
+                        pass
             finally:
                 self._active_searches -= 1
 
@@ -556,7 +551,7 @@ class Bot:
             self._record_metrics("user", results)
             if self.metrics is not None and results:
                 self.metrics.record_search(  # type: ignore[attr-defined]
-                    "user", time.monotonic() - t_search0, results, queue_seconds=t_gate - t_search0
+                    "user", time.monotonic() - t_search0, results, queue_seconds=0.0
                 )
 
             results = assign_ids(results)
@@ -739,42 +734,38 @@ class Bot:
 
             self._active_searches += 1
             t_search0 = time.monotonic()
-            t_gate = t_search0
             timed_out = False
             search_task: asyncio.Task | None = None
             try:
-                async with self._gate.slot(0):
-                    t_gate = time.monotonic()
-                    t_search0 = t_gate
-                    search_task = asyncio.create_task(
-                        _search_call(
-                            search,
-                            q,
-                            self.s,
-                            priority=0,
-                            deep=True,
-                            samples_dir=self.s.storage_dir / "samples",
-                            on_site_done=updater.on_site_done,
-                        )
+                search_task = asyncio.create_task(
+                    _search_call(
+                        search,
+                        q,
+                        self.s,
+                        priority=0,
+                        deep=True,
+                        samples_dir=self.s.storage_dir / "samples",
+                        on_site_done=updater.on_site_done,
                     )
-                    deep_timeout = getattr(self.s, "deep_safety_seconds", 150.0)
-                    if deep_timeout > 0:
-                        done, pending = await asyncio.wait(
-                            [search_task],
-                            timeout=deep_timeout,
-                        )
-                        timed_out = search_task in pending
-                    else:
-                        await search_task
-                        timed_out = False
+                )
+                deep_timeout = getattr(self.s, "deep_safety_seconds", 150.0)
+                if deep_timeout > 0:
+                    done, pending = await asyncio.wait(
+                        [search_task],
+                        timeout=deep_timeout,
+                    )
+                    timed_out = search_task in pending
+                else:
+                    await search_task
+                    timed_out = False
 
-                    if timed_out:
-                        search_task.cancel()
-                        await asyncio.wait([search_task], timeout=5.0)
-                        try:
-                            search_task.exception()
-                        except (asyncio.CancelledError, asyncio.InvalidStateError):
-                            pass
+                if timed_out:
+                    search_task.cancel()
+                    await asyncio.wait([search_task], timeout=5.0)
+                    try:
+                        search_task.exception()
+                    except (asyncio.CancelledError, asyncio.InvalidStateError):
+                        pass
             finally:
                 self._active_searches -= 1
 
@@ -811,7 +802,7 @@ class Bot:
                     "user",
                     time.monotonic() - t_search0,
                     results,
-                    queue_seconds=t_gate - t_search0,
+                    queue_seconds=0.0,
                     cls="deep",
                 )
 
@@ -1369,13 +1360,11 @@ class Bot:
         busy_cnt = len(self.busy)
         last_b = self.last_backup_at
 
-        gate_info = None
-        if hasattr(self, "_gate") and self._gate is not None:
-            gate_info = {
-                "active": self._gate.active(),
-                "capacity": self._gate.capacity,
-                "waiting": self._gate.waiting_by_priority(),
-            }
+        search_queue = {
+            "active": self._active_searches,
+            "capacity": self.s.max_parallel_searches,
+            "waiting": {},
+        }
 
         state_mb = 0.0
         try:
@@ -1401,8 +1390,7 @@ class Bot:
             "last_backup_at": last_b,
             "now": now,
             "state_size_mb": state_mb,
-            "search_queue": gate_info,
-            "gate": self._gate,
+            "search_queue": search_queue,
         }
 
     def _collect_parse_data(self, period: str = "24h") -> dict[str, Any]:
@@ -1689,7 +1677,7 @@ class Bot:
         return not self.busy and self._active_searches == 0
 
     async def _bg_search(self, q: Query):
-        async with self._gate.slot(2):
+        async with self._bg_sem:
             results = await _search_call(
                 search,
                 q,
@@ -1704,7 +1692,7 @@ class Bot:
         # телефоны общие: фоновый опрос стоит в той же очереди, что и поиски людей
         self._active_searches += 1
         try:
-            async with self._gate.slot(1):
+            async with self._bg_sem:
                 results = await _search_call(
                     search,
                     q,

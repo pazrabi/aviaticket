@@ -381,7 +381,7 @@ async def test_bot_human_search_overtakes_waiting_subscription(monkeypatch):
     t_sub = asyncio.create_task(bot._scheduler_search(q_sub))
     await asyncio.sleep(0.01)
 
-    assert bot._gate.waiting_by_priority().get(1) == 1
+    assert bot._bg_sem.locked()
 
     # 3. Запускаем поиск человека (priority=0)
     q_human = Query(origin="HUMAN", destination="LED", depart=date(2026, 12, 10))
@@ -389,22 +389,19 @@ async def test_bot_human_search_overtakes_waiting_subscription(monkeypatch):
     t_human = asyncio.create_task(bot._run_search(123, req_human))
     await asyncio.sleep(0.01)
 
-    assert bot._gate.waiting_by_priority().get(0) == 1
-    assert bot._gate.waiting_by_priority().get(1) == 1
-
     # 4. Освобождаем блокер
     release_blocker.set()
 
     await asyncio.gather(t_block, t_sub, t_human)
 
-    # Человек встаёт впереди подписки!
+    # Человек выполняется сразу, не дожидаясь блокера, а подписка ждёт
     assert execution_order == [
         "blocker_start",
-        "blocker_done",
         "human_search",
+        "blocker_done",
         "sub_search",
     ]
-    assert bot._gate.active() == 0
+    assert not bot._bg_sem.locked()
     assert bot._is_idle()
 
 
