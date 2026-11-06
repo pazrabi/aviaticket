@@ -1296,7 +1296,23 @@ async def search(
     if search_id is None:
         search_id = uuid.uuid4().hex[:8]
     search_started = now if now is not None else time.monotonic()
-    sites = [s for s in settings.sites if s.enabled]
+    trial_stage_enabled = True
+    try:
+        trial_stage_enabled = bool(getattr(settings, "trial_stage", True))
+    except Exception as e:
+        log.warning("Ошибка чтения trial_stage: %s", e)
+
+    try:
+        if priority == 0 and trial_stage_enabled:
+            sites = [
+                s for s in settings.sites
+                if s.enabled and getattr(s, "stage", "live") != "trial"
+            ]
+        else:
+            sites = [s for s in settings.sites if s.enabled]
+    except Exception as e:
+        log.warning("Ошибка фильтрации trial-сайтов: %s", e)
+        sites = [s for s in settings.sites if s.enabled]
     # живой поиск идёт всеми сайтами сразу (телефоны сами делят работу через очередь хаба);
     # подписки и фон остаются осторожными: не больше 2 сайтов разом
     limit = settings.search_parallel_live if priority == 0 else settings.search_parallel_bg

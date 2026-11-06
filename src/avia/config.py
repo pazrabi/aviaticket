@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+log = logging.getLogger("avia.config")
 
 
 @dataclass
@@ -40,12 +42,20 @@ class SiteConfig:
     # для подписок и фона (priority > 0): другое время ожидания и признак конца выдачи
     phone_full_wait_seconds: int | None = None
     phone_full_wait_for: str | None = None
+    stage: str = "live"
 
     def __post_init__(self) -> None:
         if self.phone_patience_seconds < 0:
             raise ValueError("phone_patience_seconds must be >= 0")
         if not isinstance(self.phone_extend, bool):
             raise TypeError("phone_extend must be a boolean")
+        if not isinstance(self.stage, str) or self.stage not in ("live", "trial"):
+            log.warning(
+                "Неизвестное значение stage=%r для сайта %s, сброс в 'live'",
+                self.stage,
+                getattr(self, "name", "?"),
+            )
+            self.stage = "live"
 
 
 @dataclass
@@ -147,6 +157,7 @@ class Settings:
     hedge_max_per_search: int = 2
     hedge_delay_seconds: float = 0.0
     live_reserve: bool = True
+    trial_stage: bool = True
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -344,6 +355,9 @@ def load_settings(path: Path | None = None) -> Settings:
     live_reserve_env = os.getenv("LIVE_RESERVE", "1").strip().lower()
     live_reserve = live_reserve_env not in ("0", "false", "False", "no", "off")
 
+    trial_stage_env = os.getenv("TRIAL_STAGE", "1").strip().lower()
+    trial_stage = trial_stage_env not in ("0", "false", "False", "no", "off")
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -432,6 +446,7 @@ def load_settings(path: Path | None = None) -> Settings:
         hedge_max_per_search=hedge_max_per_search,
         hedge_delay_seconds=hedge_delay_seconds,
         live_reserve=live_reserve,
+        trial_stage=trial_stage,
     )
 
 

@@ -3,12 +3,15 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from html import escape
+import logging
 from pathlib import Path
 import subprocess
 import time
 from typing import Any
 
 from .parsing import city_name
+
+log = logging.getLogger("avia.admin_panel")
 
 
 def get_git_commit(cwd: Path | str | None = None) -> str:
@@ -254,16 +257,31 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
         lines.append("Данных пока нет: метрики копятся с момента включения")
         return "\n".join(lines)
 
+    settings = ctx.get("settings")
+    if settings is None:
+        try:
+            from .config import load_settings
+            settings = load_settings()
+        except Exception:
+            settings = None
+
+    trial_sites: set[str] = set()
+    try:
+        trial_stage_enabled = getattr(settings, "trial_stage", True) if settings else True
+        if ctx.get("trial_sites") is not None:
+            trial_sites = set(ctx.get("trial_sites"))
+        elif settings and trial_stage_enabled:
+            trial_sites = {
+                s.name for s in getattr(settings, "sites", [])
+                if getattr(s, "stage", "live") == "trial"
+            }
+    except Exception as e:
+        log.warning("Ошибка определения trial_sites в build_parse: %s", e)
+        trial_sites = set()
+
     statuses = ctx.get("parser_statuses")
     if statuses is None and summary:
         from .parser_watch import evaluate_status
-        settings = ctx.get("settings")
-        if settings is None:
-            try:
-                from .config import load_settings
-                settings = load_settings()
-            except Exception:
-                settings = None
         min_runs = getattr(settings, "parser_watch_min_runs", 8)
         min_ok = getattr(settings, "parser_watch_min_ok_pct", 60.0)
         max_inc = getattr(settings, "parser_watch_max_incomplete_pct", 60.0)
@@ -283,7 +301,10 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
                 )
 
     if statuses:
-        status_parts = [f"{escape(s)}: {escape(st)}" for s, st in sorted(statuses.items())]
+        status_parts = []
+        for s, st in sorted(statuses.items()):
+            label = f"{s} (пробный)" if s in trial_sites else s
+            status_parts.append(f"{escape(label)}: {escape(st)}")
         lines.append(f"Статус: {' · '.join(status_parts)}")
         lines.append("")
 
@@ -308,7 +329,8 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
 
     sites = [k for k in sorted(summary.keys()) if k != "_total"]
     for s in sites:
-        lines.append(_fmt_site(s, summary[s]))
+        label = f"{s} (пробный)" if s in trial_sites else s
+        lines.append(_fmt_site(label, summary[s]))
 
     counts = ctx.get("counts_by_source", {})
     u_c = counts.get("user", 0)

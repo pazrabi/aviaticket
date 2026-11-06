@@ -89,6 +89,7 @@ class Scheduler:
         clock: Callable[[], float] = time.time,
         today: Callable[[], date] = date.today,
         max_groups_per_run: int = 5,
+        trial_sites: set[str] = frozenset(),
     ) -> None:
         self.store = store
         self.search_fn = search_fn
@@ -98,6 +99,11 @@ class Scheduler:
         self.clock = clock
         self.today = today
         self.max_groups_per_run = max_groups_per_run
+        try:
+            self.trial_sites = set(trial_sites) if trial_sites else frozenset()
+        except Exception as e:
+            log.warning("Ошибка инициализации trial_sites в Scheduler: %s", e)
+            self.trial_sites = frozenset()
 
     async def run_once(self) -> int:
         """Один проход планировщика; возвращает число отправленных уведомлений."""
@@ -191,10 +197,16 @@ class Scheduler:
                         filtered, _ = apply_criteria(results, sub.criteria)
                         baggage, _ = filter_by_baggage(filtered, sub.baggage_mode)
 
+                        try:
+                            t_sites = getattr(self, "trial_sites", frozenset()) or frozenset()
+                        except Exception as e:
+                            log.warning("Ошибка чтения trial_sites: %s", e)
+                            t_sites = frozenset()
+
                         candidates = [
                             o
                             for r in baggage
-                            if r.ok
+                            if r.ok and r.site not in t_sites
                             for o in r.offers
                             if o.currency == sub_query.currency
                         ]
