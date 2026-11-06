@@ -106,6 +106,9 @@ class JobsUnsupported(DroidhubError):
 
 
 _jobs_unsupported: bool = False
+# Сайты, где задание хаба не отдало ни одного ответа (а старый fetch_page отдаёт): {сайт: до какого времени без заданий}
+_jobs_bad_sites: dict[str, float] = {}
+JOBS_BAD_SITE_SECONDS: float = 1800.0
 POLL_MIN_INTERVAL: float = 0.3
 DELETE_TIMEOUT: float = 3.0
 
@@ -114,6 +117,7 @@ def reset_jobs_supported() -> None:
     """Сброс флага поддержки fetch_jobs (для изоляции тестов)."""
     global _jobs_unsupported
     _jobs_unsupported = False
+    _jobs_bad_sites.clear()
 
 
 def _sync_loop_state() -> asyncio.AbstractEventLoop | None:
@@ -1100,6 +1104,7 @@ async def fetch_page_snapshot_any(
                 and getattr(settings, "fast_stop", True)
                 and not _jobs_unsupported
                 and priority == 0
+                and _jobs_bad_sites.get(site_name or _infer_site_name(url), 0.0) <= time.monotonic()
             )
             if use_jobs:
                 try:
@@ -1114,6 +1119,31 @@ async def fetch_page_snapshot_any(
                         client=client,
                         max_seconds=max_seconds,
                     )
+                    if (
+                        info.get("stop_reason") == "job_done"
+                        and not snap.json_payloads
+                        and capture_json
+                        and not snap.blocked
+                    ):
+                        # задание закончилось без единого ответа: хаб в этом режиме не видит выдачу сайта.
+                        # Старый fetch_page её видит, поэтому берём его сразу и на время отключаем задания для сайта.
+                        bad_name = site_name or _infer_site_name(url)
+                        _jobs_bad_sites[bad_name] = time.monotonic() + JOBS_BAD_SITE_SECONDS
+                        logger.warning("Задание хаба для %s не отдало ответов, переходим на fetch_page на %d с", bad_name, int(JOBS_BAD_SITE_SECONDS))
+                        snap, finished = await _fetch_device_snapshot(
+                            settings,
+                            dev,
+                            url,
+                            wait_seconds=wait_seconds,
+                            capture_json=capture_json,
+                            wait_for=wait_for,
+                            client=client,
+                        )
+                        fetch_sec = time.monotonic() - t_fetch_start
+                        if stats is not None:
+                            stats["fetch_seconds"] = fetch_sec
+                            stats["tried"] = list(tried)
+                        return snap, finished
                     fetch_sec = time.monotonic() - t_fetch_start
                     if stats is not None:
                         stats["fetch_seconds"] = fetch_sec
