@@ -339,12 +339,12 @@ def pick_cards(
             else BALANCE_MAX_PREMIUM_PCT
         )
     )
-    max_price = cheapest.price * (1.0 + prem_pct / 100.0)
+    max_price = cheapest.price * (1.0 + prem_pct / 100.0) + 1e-6
     middle_candidates: list[Offer] = []
     for o in offers:
         if any(_is_same_offer(o, x) for x in chosen):
             continue
-        if o.price >= max_price:
+        if o.price > max_price:
             continue
         if not is_noticeably_better(
             o,
@@ -435,47 +435,51 @@ def pick_site_top(
 
     # 1. SITE_TOP_CHEAP самых дешёвых по цене
     for o in sorted_offers:
+        if len(chosen) >= n_cheap:
+            break
         if not is_chosen(o):
             chosen.append(o)
             o._site_top_role = "cheap"
-            if len(chosen) >= n_cheap:
-                break
 
     # 2. SITE_TOP_BALANCE «золотой середины» среди оставшихся (ориентир — самый дешёвый билет сайта)
-    max_price = cheapest.price * (1.0 + max_premium_pct / 100.0)
+    max_price = cheapest.price * (1.0 + max_premium_pct / 100.0) + 1e-6
     for o in sorted_offers:
         if len(balance_offers) >= n_balance:
             break
         if is_chosen(o):
             continue
-        if o.price >= max_price:
+        if o.price > max_price:
             continue
         if is_noticeably_better(o, cheapest, settings=settings, baggage_mode=baggage_mode):
             chosen.append(o)
             balance_offers.append(o)
             o._site_top_role = "balance"
 
-    # 3. SITE_TOP_FAST самый быстрый по total_duration_minutes среди оставшихся
+    # 3. SITE_TOP_FAST самых быстрых по total_duration_minutes среди оставшихся
     candidates_with_time = [
         o for o in sorted_offers if not is_chosen(o) and total_duration_minutes(o) is not None
     ]
-    if candidates_with_time and n_fast > 0:
-        fastest_rem = min(
+    if n_fast > 0 and candidates_with_time:
+        fastest_candidates = sorted(
             candidates_with_time, key=lambda o: (total_duration_minutes(o), o.price)
         )
-        chosen.append(fastest_rem)
-        fast_offers.append(fastest_rem)
-        fastest_rem._site_top_role = "fast"
+        for f in fastest_candidates:
+            if len(fast_offers) >= n_fast:
+                break
+            if not is_chosen(f):
+                chosen.append(f)
+                fast_offers.append(f)
+                f._site_top_role = "fast"
 
     # 4. Если слоты не заполнены, место добирается следующим по цене
     target_count = n_cheap + n_balance + n_fast
     if len(chosen) < target_count:
         for o in sorted_offers:
+            if len(chosen) >= target_count:
+                break
             if not is_chosen(o):
                 chosen.append(o)
                 o._site_top_role = "fallback"
-                if len(chosen) >= target_count:
-                    break
 
     # Результат отсортирован по цене
     chosen.sort(key=lambda o: o.price)

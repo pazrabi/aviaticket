@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import date
 
 from avia.config import Settings
+from avia.criteria import SearchCriteria
 from avia.filters import (
     is_noticeably_better,
+    pick_cards,
     pick_site_top,
     total_duration_minutes,
 )
@@ -179,3 +181,103 @@ def test_custom_settings():
     top = pick_site_top([cheap, cand], settings=s)
     assert len(top) == 2
     assert getattr(top[1], "_site_top_role", None) == "balance"
+
+
+def test_exact_30_percent_boundary_price():
+    """Проверка границы цены: наценка ровно 30% допустима, >30% отсекается."""
+    fast = Offer("s1", 20000, duration="2 ч", baggage="без багажа", offer_id="f")
+    cheap = Offer("s1", 10000, duration="14 ч", baggage="без багажа", offer_id="c")
+    mid_exact = Offer("s1", 13000, duration="5 ч", baggage="без багажа", offer_id="m_exact")
+    too_expensive = Offer("s1", 13001, duration="4 ч", baggage="без багажа", offer_id="too_exp")
+
+    # 1. В pick_cards билет с ровно +30% выбирается как «Золотая середина»
+    cards = pick_cards([cheap, fast, mid_exact], SearchCriteria())
+    assert any(title == "Золотая середина" and o is mid_exact for title, o in cards)
+
+    # 2. В pick_cards билет с >30% не выбирается
+    cards_too_exp = pick_cards([cheap, fast, too_expensive], SearchCriteria())
+    assert not any(title == "Золотая середина" for title, _ in cards_too_exp)
+
+    # 3. В pick_site_top билет с ровно +30% получает роль "balance"
+    top = pick_site_top([cheap, Offer("s1", 10500, duration="14 ч", offer_id="c2"), mid_exact, too_expensive])
+    m_picked = next((o for o in top if o.offer_id == "m_exact"), None)
+    assert m_picked is not None
+    assert getattr(m_picked, "_site_top_role", None) == "balance"
+
+    exp_picked = next((o for o in top if o.offer_id == "too_exp"), None)
+    if exp_picked is not None:
+        assert getattr(exp_picked, "_site_top_role", None) != "balance"
+
+
+def test_site_top_multiple_fast_and_zero_cheap():
+    """SITE_TOP_FAST > 1 отбирает несколько самых быстрых, а SITE_TOP_CHEAP = 0 не отбирает дешевые."""
+    s = Settings(
+        sites=[],
+        site_top_cheap=0,
+        site_top_balance=1,
+        site_top_fast=2,
+    )
+    cheap = Offer("s1", 10000, duration="10 ч", offer_id="c")
+    mid = Offer("s1", 12000, duration="5 ч", offer_id="m")
+    fast1 = Offer("s1", 14000, duration="2 ч", offer_id="f1")
+    fast2 = Offer("s1", 15000, duration="3 ч", offer_id="f2")
+    other = Offer("s1", 16000, duration="8 ч", offer_id="oth")
+
+    top = pick_site_top([cheap, mid, fast1, fast2, other], settings=s)
+    assert len(top) == 3  # 0 cheap + 1 balance + 2 fast
+
+    # Ни один билет не должен получить роль "cheap"
+    assert not any(getattr(o, "_site_top_role", None) == "cheap" for o in top)
+
+    # mid получил роль "balance"
+    mid_in_top = next(o for o in top if o.offer_id == "m")
+    assert getattr(mid_in_top, "_site_top_role", None) == "balance"
+
+    # fast1 и fast2 получили роль "fast"
+    f1_in_top = next(o for o in top if o.offer_id == "f1")
+    f2_in_top = next(o for o in top if o.offer_id == "f2")
+    assert getattr(f1_in_top, "_site_top_role", None) == "fast"
+    assert getattr(f2_in_top, "_site_top_role", None) == "fast"
+
+
+def test_build_report_dedup_before_site_top_no_lost_slots():
+    """Дедупликация r.offers перед pick_site_top предотвращает потерю слотов из-за одинаковых рейсов."""
+    q = Query("MOW", "LED", date(2026, 12, 10))
+    # Рейсы o1 и o1_dup полностью совпадают по телу, но имеют разные offer_id
+    o1 = Offer("s1", 10000, duration="10 ч", airline="SU", depart_time="10:00", offer_id="id_1")
+    o1_dup = Offer("s1", 10000, duration="10 ч", airline="SU", depart_time="10:00", offer_id="id_1_dup")
+    o2 = Offer("s1", 11000, duration="10 ч", airline="S7", depart_time="11:00", offer_id="id_2")
+    o3 = Offer("s1", 12000, duration="4 ч", airline="U6", depart_time="12:00", offer_id="id_3")
+    o4 = Offer("s1", 13000, duration="2 ч", airline="DP", depart_time="13:00", offer_id="id_4")
+    o5 = Offer("s1", 14000, duration="9 ч", airline="UT", depart_time="14:00", offer_id="id_5")
+
+    res = [SiteResult("s1", True, [o1, o1_dup, o2, o3, o4, o5])]
+    parts, flat = build_report(q, res)
+    # Ровно 5 уникальных билетов показано, слот не потерян
+    assert len(flat) == 5
+    assert o1 in flat
+    assert o1_dup not in flat
+    assert o2 in flat
+    assert o3 in flat
+    assert o4 in flat
+    assert o5 in flat
+
+
+def test_build_report_custom_settings_more_than_5_tickets():
+    """build_report не обрезает результат до 5, если настройки задают суммарно больше билетов."""
+    q = Query("MOW", "LED", date(2026, 12, 10))
+    s = Settings(
+        sites=[],
+        site_top_cheap=2,
+        site_top_balance=2,
+        site_top_fast=2,
+    )
+    offers = [
+        Offer("s1", 10000 + i * 500, duration=f"{12 - i} ч", airline=f"A{i}", depart_time=f"{10+i}:00", offer_id=f"o_{i}")
+        for i in range(10)
+    ]
+    res = [SiteResult("s1", True, offers)]
+    parts, flat = build_report(q, res, settings=s)
+    # Должно быть отобрано ровно 6 билетов (2+2+2)
+    assert len(flat) == 6
+
