@@ -231,6 +231,8 @@ class Bot:
         self._last_parser_watch: float = 0.0
         self._last_samples_check: float = 0.0
         self._last_soft_allow: float = 0.0
+        self._last_trial_check: float = 0.0
+        self._trial_notified: dict[str, float] = {}
         try:
             from .samples import install_sample_hook
             install_sample_hook()
@@ -1422,6 +1424,7 @@ class Bot:
             "devices_summary": devices_summary,
             "site_devices_summary": site_devices_summary,
             "parser_statuses": parser_statuses,
+            "settings": self.s,
         }
 
     def _collect_users_data(self) -> dict[str, Any]:
@@ -1880,6 +1883,48 @@ class Bot:
                         except Exception:
                             log.exception("ошибка запуска фоновой проверки мягкого sites_allow")
 
+                if getattr(self.s, "trial_stage", True) and self.metrics is not None:
+                    if time.time() - getattr(self, "_last_trial_check", 0.0) >= 86400:
+                        self._last_trial_check = time.time()
+                        try:
+                            from .stage import trial_ready, trial_stats
+
+                            async def _run_trial_check() -> None:
+                                try:
+                                    trial_sites = [
+                                        s for s in self.s.sites
+                                        if getattr(s, "stage", "live") == "trial"
+                                    ]
+                                    now_ts = time.time()
+                                    for s_cfg in trial_sites:
+                                        try:
+                                            last_notif = getattr(self, "_trial_notified", {}).get(s_cfg.name, 0.0)
+                                            if now_ts - last_notif < 86400:
+                                                continue
+                                            ready = await asyncio.to_thread(
+                                                trial_ready, s_cfg.name, self.metrics, now_ts
+                                            )
+                                            if ready:
+                                                st = await asyncio.to_thread(
+                                                    trial_stats, s_cfg.name, self.metrics, now_ts
+                                                )
+                                                runs = st.get("runs", 0)
+                                                ok_share = st.get("ok_share", 0.0)
+                                                ok_pct = round(ok_share * 100)
+                                                msg = f"сайт {s_cfg.name} готов к переводу в live ({runs} запусков, ok {ok_pct}%)"
+                                                await self._notify_admins(msg)
+                                                if not hasattr(self, "_trial_notified"):
+                                                    self._trial_notified = {}
+                                                self._trial_notified[s_cfg.name] = now_ts
+                                        except Exception:
+                                            log.exception("ошибка проверки trial-сайта %s", s_cfg.name)
+                                except Exception:
+                                    log.exception("ошибка проверки trial-сайтов")
+
+                            asyncio.create_task(_run_trial_check())
+                        except Exception:
+                            log.exception("ошибка запуска фоновой проверки trial-сайтов")
+
                 if time.time() - self._last_samples_check >= 7 * 86400:
                     try:
                         samples_dir = self.s.storage_dir / "samples"
@@ -1929,11 +1974,21 @@ class Bot:
         if self.s.droidhub_url and self.s.droidhub_token:
             self._phones_task = asyncio.create_task(self._phones_refresh_loop())
         if self.subs is not None:
+            trial_sites = set()
+            try:
+                if getattr(self.s, "trial_stage", True):
+                    trial_sites = {
+                        s.name for s in getattr(self.s, "sites", [])
+                        if getattr(s, "stage", "live") == "trial"
+                    }
+            except Exception as e:
+                log.warning("Ошибка вычисления trial_sites для Scheduler: %s", e)
             scheduler = Scheduler(
                 self.subs,
                 self._scheduler_search,
                 self._scheduler_notify,
                 history=self.history,
+                trial_sites=trial_sites,
             )
             self._scheduler_task = asyncio.create_task(scheduler.run_forever())
         if self.s.bg_collect:
