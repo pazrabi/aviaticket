@@ -348,3 +348,279 @@ def test_searches_migration_adds_cls(tmp_path):
         row_def = conn.execute("SELECT source, cls FROM searches WHERE id = 3").fetchone()
         assert row_def[0] == "user"
         assert row_def[1] == "fast"
+
+
+# (д) Тесты граничных случаев: таймаут, занятость чата, лимит, настройки config
+@pytest.mark.asyncio
+async def test_deep_search_uses_deep_safety_timeout(tmp_path, monkeypatch):
+    """Глубокий поиск использует deep_safety_seconds (150 с) вместо live_safety_seconds (90 с)."""
+    from avia.pipeline import _can_retry_on_phone
+
+    storage = tmp_path / "storage"
+    storage.mkdir(parents=True, exist_ok=True)
+    settings = Settings(
+        sites=[SiteConfig(name="site1", url_template="http://test/{origin}/{destination}/{date_iso}", enabled=True)],
+        tg_token="dummy_test_token_123",
+        tg_allowed_ids={123},
+        live_safety_seconds=90.0,
+        deep_safety_seconds=150.0,
+        storage_dir=storage,
+    )
+    bot = DeepFakeBot(settings)
+    chat_id = 123
+    q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 10))
+    bot.store.put(chat_id, q, [SiteResult("site1", True, [])], "any", [])
+    bot.dialog.sessions[chat_id] = Session(step=Step.DONE, dialog_id="d_safety", origin="MOW", destination="LED", depart=date(2026, 12, 10))
+
+    timeouts_used: list[float] = []
+    orig_wait = asyncio.wait
+
+    async def mock_wait(fs, timeout=None, **kwargs):
+        timeouts_used.append(timeout)
+        return await orig_wait(fs, timeout=timeout, **kwargs)
+
+    monkeypatch.setattr(asyncio, "wait", mock_wait)
+
+    async def mock_search(*args, **kwargs):
+        return [SiteResult("site1", True, [Offer("site1", 5000)], elapsed=1.0)]
+
+    monkeypatch.setattr("avia.bot.search", mock_search)
+
+    await bot._run_deep_search(
+        chat_id,
+        DeepSearchRequest(query=q, baggage_mode="any", criteria=bot.dialog.sessions[chat_id].criteria),
+    )
+
+    # Проверяем, что в asyncio.wait передан именно deep_safety_seconds (150.0), а не 90.0
+    assert 150.0 in timeouts_used
+    assert 90.0 not in timeouts_used
+
+    # Проверяем также _can_retry_on_phone: при deep=True порог 150 с, а не 90 с
+    cur_stats = {"phone1": [10.0]}
+    cands = ["phone1"]
+    can_fast = _can_retry_on_phone(0, cur_stats, 10.0, cands, settings, "site1", search_started=1000.0, now=1100.0, deep=False)
+    assert can_fast is False  # 100 + 10 > 90.0 -> превышен live_safety_seconds
+    can_deep = _can_retry_on_phone(0, cur_stats, 10.0, cands, settings, "site1", search_started=1000.0, now=1100.0, deep=True)
+    assert can_deep is True   # 100 + 10 <= 150.0 -> разрешено deep_safety_seconds
+
+
+@pytest.mark.asyncio
+async def test_deep_search_busy_guard(tmp_path, monkeypatch):
+    """Если поиск уже идёт (chat_id in bot.busy), повторный глубокий поиск отклоняется."""
+    storage = tmp_path / "storage"
+    storage.mkdir(parents=True, exist_ok=True)
+    settings = Settings(
+        sites=[SiteConfig(name="site1", url_template="http://test/{origin}/{destination}/{date_iso}", enabled=True)],
+        tg_token="dummy_token",
+        tg_allowed_ids={123},
+        storage_dir=storage,
+    )
+    bot = DeepFakeBot(settings)
+    chat_id = 123
+    q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 10))
+    bot.store.put(chat_id, q, [SiteResult("site1", True, [])], "any", [])
+    bot.dialog.sessions[chat_id] = Session(step=Step.DONE, dialog_id="d1", origin="MOW", destination="LED", depart=date(2026, 12, 10))
+
+    search_called = False
+
+    async def mock_search(*args, **kwargs):
+        nonlocal search_called
+        search_called = True
+        return [SiteResult("site1", True, [])]
+
+    monkeypatch.setattr("avia.bot.search", mock_search)
+
+    # Имитируем занятость чата
+    bot.busy.add(chat_id)
+
+    cq = {
+        "id": "cq_busy",
+        "from": {"id": chat_id},
+        "data": "deep:d1",
+        "message": {"chat": {"id": chat_id}, "message_id": 10},
+    }
+    await bot.handle_callback(cq)
+
+    # Поиск не запускался
+    assert not search_called
+    # Пользователю отправлено сообщение о занятости
+    send_calls = [p for m, p in bot.calls if m == "sendMessage"]
+    assert any("Предыдущий поиск ещё идёт" in p.get("text", "") for p in send_calls)
+
+
+@pytest.mark.asyncio
+async def test_deep_search_busy_lifecycle(tmp_path, monkeypatch):
+    """Во время глубокого поиска чат находится в self.busy, после завершения освобождается."""
+    storage = tmp_path / "storage"
+    storage.mkdir(parents=True, exist_ok=True)
+    settings = Settings(
+        sites=[SiteConfig(name="site1", url_template="http://test/{origin}/{destination}/{date_iso}", enabled=True)],
+        tg_token="dummy_token",
+        tg_allowed_ids={123},
+        storage_dir=storage,
+    )
+    bot = DeepFakeBot(settings)
+    chat_id = 123
+    q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 10))
+    bot.store.put(chat_id, q, [SiteResult("site1", True, [])], "any", [])
+    bot.dialog.sessions[chat_id] = Session(step=Step.DONE, dialog_id="d_life", origin="MOW", destination="LED", depart=date(2026, 12, 10))
+
+    busy_during_search = False
+
+    async def mock_search(*args, **kwargs):
+        nonlocal busy_during_search
+        busy_during_search = (chat_id in bot.busy)
+        return [SiteResult("site1", True, [Offer("site1", 5000)])]
+
+    monkeypatch.setattr("avia.bot.search", mock_search)
+
+    assert chat_id not in bot.busy
+    await bot._run_deep_search(
+        chat_id,
+        DeepSearchRequest(query=q, baggage_mode="any", criteria=bot.dialog.sessions[chat_id].criteria),
+    )
+    assert busy_during_search is True
+    assert chat_id not in bot.busy
+
+
+@pytest.mark.asyncio
+async def test_deep_search_daily_limit_exhausted(tmp_path, monkeypatch):
+    """При исчерпании daily_search_limit глубокий поиск отклоняется с тем же текстом, что и обычный."""
+    storage = tmp_path / "storage"
+    storage.mkdir(parents=True, exist_ok=True)
+    settings = Settings(
+        sites=[SiteConfig(name="site1", url_template="http://test/{origin}/{destination}/{date_iso}", enabled=True)],
+        tg_token="dummy_token",
+        tg_allowed_ids=set(),  # обычный пользователь
+        daily_search_limit=3,
+        tg_open=True,
+        storage_dir=storage,
+    )
+    bot = DeepFakeBot(settings)
+    chat_id = 456
+    bot.users.register(chat_id, "limit_user", "LimitUser")
+    for _ in range(3):
+        assert bot.users.try_use_search(chat_id, settings.daily_search_limit) is True
+
+    user_info = bot.users.get(chat_id)
+    assert user_info is not None
+    assert user_info.total_searches == 3
+
+    q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 10))
+    bot.store.put(chat_id, q, [SiteResult("site1", True, [])], "any", [])
+    bot.dialog.sessions[chat_id] = Session(step=Step.DONE, dialog_id="d_lim", origin="MOW", destination="LED", depart=date(2026, 12, 10))
+
+    search_called = False
+
+    async def mock_search(*args, **kwargs):
+        nonlocal search_called
+        search_called = True
+        return [SiteResult("site1", True, [])]
+
+    monkeypatch.setattr("avia.bot.search", mock_search)
+
+    cq = {
+        "id": "cq_limit",
+        "from": {"id": chat_id},
+        "data": "deep:d_lim",
+        "message": {"chat": {"id": chat_id}, "message_id": 20},
+    }
+    await bot.handle_callback(cq)
+
+    # Поиск не вызывался
+    assert not search_called
+    # Лимит не списан повторно
+    assert bot.users.get(chat_id).total_searches == 3
+
+    # Пользователю отправлено стандартное сообщение об исчерпании лимита
+    send_calls = [p for m, p in bot.calls if m == "sendMessage"]
+    assert any("лимит поисков исчерпан (3)" in p.get("text", "") for p in send_calls)
+
+
+def test_config_deep_search_settings(tmp_path, monkeypatch):
+    """Проверка загрузки настроек DEEP_SAFETY_SECONDS и DEEP_CACHE_TTL_SECONDS."""
+    from avia.config import load_settings
+
+    yaml_file = tmp_path / "sites.yaml"
+    yaml_file.write_text("sites:\n  - name: test\n    source: browser\n    url_template: http://test\n", encoding="utf-8")
+
+    # 1. Значения по умолчанию
+    monkeypatch.delenv("DEEP_SAFETY_SECONDS", raising=False)
+    monkeypatch.delenv("DEEP_CACHE_TTL_SECONDS", raising=False)
+    s_default = load_settings(yaml_file)
+    assert s_default.deep_safety_seconds == 150.0
+    assert s_default.deep_cache_ttl_seconds == 900
+
+    # 2. Значения из переменных окружения
+    monkeypatch.setenv("DEEP_SAFETY_SECONDS", "240.5")
+    monkeypatch.setenv("DEEP_CACHE_TTL_SECONDS", "1800")
+    s_env = load_settings(yaml_file)
+    assert s_env.deep_safety_seconds == 240.5
+    assert s_env.deep_cache_ttl_seconds == 1800
+
+    # 3. Некорректные значения в переменных окружения -> фолбэк на дефолт
+    monkeypatch.setenv("DEEP_SAFETY_SECONDS", "not_a_float")
+    monkeypatch.setenv("DEEP_CACHE_TTL_SECONDS", "not_an_int")
+    s_fallback = load_settings(yaml_file)
+    assert s_fallback.deep_safety_seconds == 150.0
+    assert s_fallback.deep_cache_ttl_seconds == 900
+
+
+@pytest.mark.asyncio
+async def test_deep_search_queue_seconds_and_cache_after_annotation(tmp_path, monkeypatch):
+    """queue_seconds в метриках учитывает реальное время ожидания слота, а deep_cache.put вызывается после assign_ids и annotate."""
+    from contextlib import asynccontextmanager
+
+    storage = tmp_path / "storage"
+    storage.mkdir(parents=True, exist_ok=True)
+    settings = Settings(
+        sites=[SiteConfig(name="site1", url_template="http://test/{origin}/{destination}/{date_iso}", enabled=True)],
+        tg_token="dummy_test_token_123",
+        tg_allowed_ids={123},
+        storage_dir=storage,
+    )
+    bot = DeepFakeBot(settings)
+    chat_id = 123
+
+    q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 10))
+    bot.store.put(chat_id, q, [SiteResult("site1", True, [])], "any", [])
+    bot.dialog.sessions[chat_id] = Session(step=Step.DONE, dialog_id="d_q", origin="MOW", destination="LED", depart=date(2026, 12, 10))
+
+    # Имитируем ожидание в очереди шлюза gate
+    orig_slot = bot._gate.slot
+
+    @asynccontextmanager
+    async def slow_slot(priority=0):
+        await asyncio.sleep(0.05)  # задержка ожидания в очереди
+        async with orig_slot(priority):
+            yield
+
+    bot._gate.slot = slow_slot
+
+    offer_raw = Offer(site="site1", price=3000, duration="1 ч")
+    assert offer_raw.offer_id == ""
+    assert offer_raw.fetched_at is None
+
+    async def mock_search(*args, **kwargs):
+        return [SiteResult("site1", True, [offer_raw], elapsed=1.0)]
+
+    monkeypatch.setattr("avia.bot.search", mock_search)
+
+    await bot._run_deep_search(chat_id, DeepSearchRequest(query=q, baggage_mode="any", criteria=bot.dialog.sessions[chat_id].criteria))
+
+    # Проверяем, что в метриках queue_seconds > 0
+    with bot.metrics._connect() as db:
+        row = db.execute("SELECT queue_seconds, cls FROM searches ORDER BY id DESC LIMIT 1").fetchone()
+    assert row is not None
+    assert row["cls"] == "deep"
+    assert row["queue_seconds"] is not None
+    assert row["queue_seconds"] >= 0.04  # Реальное время в очереди учтено
+
+    # Проверяем, что в deep_cache сохранены билеты С присвоенным offer_id и fetched_at
+    cached = bot.deep_cache.get(q)
+    assert cached is not None
+    cached_offers = cached[0][0].offers
+    assert len(cached_offers) == 1
+    assert cached_offers[0].offer_id != ""
+    assert cached_offers[0].fetched_at is not None
+

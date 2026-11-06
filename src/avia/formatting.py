@@ -755,13 +755,6 @@ def build_compact_report(
     pool = pareto + others
 
     cards = pick_cards(pool, criteria, settings=settings, baggage_mode=baggage_mode)
-    if (
-        criteria.hour_cost is None
-        and len(pool) == 3
-        and [o.price for o in pool] == [10000, 13000, 25000]
-        and [getattr(o, "duration", None) for o in pool] == ["10 ч", "3 ч", "2 ч"]
-    ):
-        cards = [c for c in cards if c[0] != "Золотая середина"]
     flat = [o for _, o in cards]
 
     header_lines = _trip_head(q)

@@ -316,7 +316,7 @@ class Bot:
     async def _process_actions(
         self,
         chat_id: int,
-        actions: list[Reply | SearchRequest | HistoryRequest],
+        actions: list[Reply | SearchRequest | HistoryRequest | DeepSearchRequest],
         message_id: int | None = None,
     ):
         for item in actions:
@@ -745,7 +745,6 @@ class Bot:
             try:
                 async with self._gate.slot(0):
                     t_gate = time.monotonic()
-                    t_search0 = t_gate
                     search_task = asyncio.create_task(
                         _search_call(
                             search,
@@ -815,14 +814,14 @@ class Bot:
                     cls="deep",
                 )
 
-            # Сохраняем в DeepCache
-            self.deep_cache.put(q, results)
-
             results = assign_ids(results)
             try:
                 await asyncio.to_thread(self.history.annotate, q, results)
             except Exception:
                 log.exception("история цен недоступна")
+
+            # Сохраняем в DeepCache (после присвоения offer_id и аннотации истории цен)
+            self.deep_cache.put(q, results)
 
             filtered_crit, dropped_criteria = apply_criteria(results, criteria)
             filtered, dropped_baggage = filter_by_baggage(filtered_crit, baggage_mode)
