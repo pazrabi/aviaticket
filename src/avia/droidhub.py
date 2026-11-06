@@ -626,6 +626,7 @@ async def _fetch_device_snapshot(
             raise DroidhubError("некорректный формат json_responses в ответе droidhub")
 
         json_payloads: list[tuple[str, str]] = []
+        payload_times: list[float | None] = []
         for item in raw_responses:
             if not isinstance(item, dict):
                 raise DroidhubError("некорректный элемент в json_responses")
@@ -641,11 +642,34 @@ async def _fetch_device_snapshot(
                 body_str = str(raw_body)
             json_payloads.append((item_url, body_str))
 
+            t_val = item.get("t")
+            if isinstance(t_val, (int, float)) and not isinstance(t_val, bool):
+                payload_times.append(float(t_val))
+            else:
+                payload_times.append(None)
+
+        woke_val = data.get("woke")
+        if isinstance(woke_val, bool):
+            woke: bool | None = woke_val
+        elif isinstance(woke_val, int):
+            woke = bool(woke_val)
+        else:
+            woke = None
+
+        tfm_val = data.get("t_first_match")
+        if isinstance(tfm_val, (int, float)) and not isinstance(tfm_val, bool):
+            t_first_match: float | None = float(tfm_val)
+        else:
+            t_first_match = None
+
         snap = Snapshot(
             url=resp_url,
             text=resp_text,
             json_payloads=json_payloads,
             blocked=captcha,
+            payload_times=payload_times,
+            woke=woke,
+            t_first_match=t_first_match,
         )
         return snap, finished
 

@@ -281,6 +281,38 @@ async def _process_snapshot(
     return sorted(offers, key=lambda o: o.price), snap.url, partial
 
 
+_timeline_tasks: set[asyncio.Task] = set()
+
+
+async def _record_timeline_bg(
+    settings: Settings,
+    site: SiteConfig,
+    snap: Snapshot,
+    q: Query,
+    search_id: str | None,
+    device: str | None,
+) -> None:
+    try:
+        from .price_timeline import build_timeline
+        timeline = await build_timeline(site, snap, q, settings)
+        if timeline:
+            metrics = getattr(settings, "metrics", None)
+            if metrics is None:
+                storage_dir = getattr(settings, "storage_dir", None)
+                if storage_dir is not None:
+                    from .metrics import MetricsStore
+                    metrics = MetricsStore(Path(storage_dir) / "metrics.sqlite")
+            if metrics is not None:
+                metrics.record_timeline(
+                    search_id=search_id,
+                    site=site.name,
+                    device=device,
+                    **timeline,
+                )
+    except Exception as exc:
+        log.warning("Ошибка при сохранении price_timeline для %s: %s", site.name, exc)
+
+
 async def _from_browser(
     site: SiteConfig,
     q: Query,
@@ -589,6 +621,15 @@ async def _from_browser(
                     _FUSE_STATE[site.name]["degraded"] = False
             except Exception:
                 pass
+            if getattr(settings, "price_timeline", True) and offers:
+                try:
+                    t = asyncio.create_task(
+                        _record_timeline_bg(settings, site, snap, q, search_id, used_dev)
+                    )
+                    _timeline_tasks.add(t)
+                    t.add_done_callback(_timeline_tasks.discard)
+                except Exception as exc:
+                    log.warning("Не удалось запустить фоновую задачу price_timeline: %s", exc)
             return offers, page_url, partial
 
         if last_exc:
@@ -605,7 +646,17 @@ async def _from_browser(
         if snap.blocked:
             raise RuntimeError("сайт показал капчу или блокировку")
         partial = False
-        return await _process_snapshot(site, snap, q, settings, partial=partial)
+        offers, page_url, partial = await _process_snapshot(site, snap, q, settings, partial=partial)
+        if getattr(settings, "price_timeline", True) and offers:
+            try:
+                t = asyncio.create_task(
+                    _record_timeline_bg(settings, site, snap, q, search_id, None)
+                )
+                _timeline_tasks.add(t)
+                t.add_done_callback(_timeline_tasks.discard)
+            except Exception as exc:
+                log.warning("Не удалось запустить фоновую задачу price_timeline: %s", exc)
+        return offers, page_url, partial
 
 
 async def _fallback_url(site: SiteConfig, q: Query, settings: Settings) -> str | None:

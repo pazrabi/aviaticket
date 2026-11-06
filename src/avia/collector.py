@@ -72,6 +72,9 @@ class Snapshot:
     text: str
     json_payloads: list[tuple[str, str]] = field(default_factory=list)
     blocked: bool = False
+    payload_times: list[float | None] = field(default_factory=list)
+    woke: bool | None = None
+    t_first_match: float | None = None
 
 
 def is_blocked(text: str) -> bool:

@@ -1,6 +1,7 @@
 """Хранилище метрик парсинга авиабилетов в SQLite."""
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 import sqlite3
@@ -67,6 +68,21 @@ CREATE TABLE IF NOT EXISTS parser_watch_state (
     last_alert_ts     REAL NOT NULL,
     last_alert_status TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS price_timeline (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            REAL NOT NULL,
+    search_id     TEXT,
+    site          TEXT NOT NULL,
+    device        TEXT,
+    woke          INTEGER,
+    t_first_match REAL,
+    t_last        REAL,
+    final_min     REAL,
+    points        TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_price_timeline_ts ON price_timeline (ts);
+CREATE INDEX IF NOT EXISTS ix_price_timeline_site_ts ON price_timeline (site, ts);
 """
 
 
@@ -580,7 +596,102 @@ class MetricsStore:
         cutoff = now_ts - keep_days * 86400.0
         with self._connect() as db:
             cur = db.execute("DELETE FROM site_runs WHERE ts < ?", (cutoff,))
+            db.execute("DELETE FROM price_timeline WHERE ts < ?", (cutoff,))
             return cur.rowcount
+
+    def record_timeline(
+        self,
+        search_id: str | None = None,
+        site: str = "",
+        device: str | None = None,
+        woke: bool | int | None = None,
+        t_first_match: float | None = None,
+        t_last: float | None = None,
+        final_min: float | int | None = None,
+        points: list[dict] | str | None = None,
+        ts: float | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Записывает хронологию цен по ходу загрузки страницы."""
+        try:
+            now_ts = time.time() if ts is None else float(ts)
+            woke_val: int | None = None
+            if woke is not None:
+                woke_val = 1 if woke else 0
+
+            tfm_val = float(t_first_match) if t_first_match is not None else None
+            t_last_val = float(t_last) if t_last is not None else None
+            final_min_val = float(final_min) if final_min is not None else None
+
+            if isinstance(points, (list, dict)):
+                points_json = json.dumps(points, ensure_ascii=False)
+            elif points is not None:
+                points_json = str(points)
+            else:
+                points_json = "[]"
+
+            with self._connect() as db:
+                db.execute(
+                    """
+                    INSERT INTO price_timeline (
+                        ts, search_id, site, device, woke, t_first_match, t_last, final_min, points
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        now_ts,
+                        str(search_id) if search_id is not None else None,
+                        str(site),
+                        str(device) if device is not None else None,
+                        woke_val,
+                        tfm_val,
+                        t_last_val,
+                        final_min_val,
+                        points_json,
+                    ),
+                )
+        except Exception:
+            log.exception("ошибка записи price_timeline")
+
+    def timelines(self, site: str | None = None, since_ts: float = 0.0) -> list[dict[str, Any]]:
+        """Возвращает хронологии цен за период >= since_ts, опционально фильтруя по сайту."""
+        self._ensure_schema()
+        query = (
+            "SELECT id, ts, search_id, site, device, woke, t_first_match, t_last, final_min, points "
+            "FROM price_timeline WHERE ts >= ?"
+        )
+        params: list[Any] = [float(since_ts)]
+        if site is not None:
+            query += " AND site = ?"
+            params.append(str(site))
+        query += " ORDER BY ts ASC"
+
+        try:
+            with self._connect() as db:
+                rows = db.execute(query, params).fetchall()
+                res = []
+                for r in rows:
+                    pts = r["points"]
+                    if isinstance(pts, str):
+                        try:
+                            pts = json.loads(pts)
+                        except Exception:
+                            pass
+                    res.append({
+                        "id": r["id"],
+                        "ts": float(r["ts"]),
+                        "search_id": r["search_id"],
+                        "site": r["site"],
+                        "device": r["device"],
+                        "woke": (bool(r["woke"]) if r["woke"] is not None else None),
+                        "t_first_match": (float(r["t_first_match"]) if r["t_first_match"] is not None else None),
+                        "t_last": (float(r["t_last"]) if r["t_last"] is not None else None),
+                        "final_min": (float(r["final_min"]) if r["final_min"] is not None else None),
+                        "points": pts,
+                    })
+                return res
+        except Exception:
+            log.exception("ошибка чтения price_timeline")
+            return []
 
     def watch_stats(self, since_ts: float) -> dict[str, dict[str, Any]]:
         """Статистика запусков по сайтам для parser_watch за период since_ts."""
