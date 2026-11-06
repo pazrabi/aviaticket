@@ -734,6 +734,7 @@ async def _fetch_device_snapshot(
     capture_json: list[str] | None = None,
     wait_for: str = "",
     client: httpx.AsyncClient | None = None,
+    replay_post: dict | None = None,
 ) -> tuple[Snapshot, bool]:
     """Выполняет непосредственный запрос к сервису droidhub для конкретного устройства."""
     device_id = device_id.strip()
@@ -751,6 +752,8 @@ async def _fetch_device_snapshot(
         }
         if wait_for:
             payload["wait_for"] = wait_for
+        if replay_post is not None:
+            payload["replay_post"] = replay_post
 
         try:
             if client is not None:
@@ -762,6 +765,25 @@ async def _fetch_device_snapshot(
             raise DroidhubError("таймаут при обращении к droidhub")
         except (httpx.RequestError, ConnectionError, OSError):
             raise DroidhubError("сетевая ошибка при обращении к droidhub")
+
+        if replay_post is not None and resp.status_code in (400, 422):
+            logger.warning(
+                "Хаб вернул %d на запрос с replay_post, повторяем без него: %s",
+                resp.status_code,
+                endpoint,
+            )
+            try:
+                payload_no_replay = dict(payload)
+                payload_no_replay.pop("replay_post", None)
+                if client is not None:
+                    resp = await client.post(endpoint, json=payload_no_replay, headers=headers)
+                else:
+                    async with httpx.AsyncClient(timeout=timeout) as cl:
+                        resp = await cl.post(endpoint, json=payload_no_replay, headers=headers)
+            except (httpx.TimeoutException, asyncio.TimeoutError):
+                raise DroidhubError("таймаут при обращении к droidhub")
+            except (httpx.RequestError, ConnectionError, OSError):
+                raise DroidhubError("сетевая ошибка при обращении к droidhub")
 
         if resp.status_code in (401, 403):
             raise DroidhubError(
@@ -804,9 +826,26 @@ async def _fetch_device_snapshot(
                 raise DroidhubError("некорректный элемент в json_responses")
             item_url = str(item.get("url", ""))
             raw_body = item.get("body", "")
+            is_replayed = bool(item.get("replayed", False))
             if isinstance(raw_body, str):
                 body_str = raw_body
+                if is_replayed:
+                    try:
+                        p_data = json.loads(raw_body)
+                        if isinstance(p_data, list) and p_data and isinstance(p_data[0], dict):
+                            p_data[0]["replayed"] = True
+                            body_str = json.dumps(p_data, ensure_ascii=False)
+                        elif isinstance(p_data, dict):
+                            p_data["replayed"] = True
+                            body_str = json.dumps(p_data, ensure_ascii=False)
+                    except Exception:
+                        pass
             elif isinstance(raw_body, (dict, list)):
+                if is_replayed:
+                    if isinstance(raw_body, dict):
+                        raw_body["replayed"] = True
+                    elif isinstance(raw_body, list) and raw_body and isinstance(raw_body[0], dict):
+                        raw_body[0]["replayed"] = True
                 body_str = json.dumps(raw_body, ensure_ascii=False)
             elif raw_body is None:
                 body_str = ""
@@ -873,6 +912,7 @@ async def _fetch_device_job(
     evaluate: Callable[[Snapshot, dict[str, Any]], Awaitable[str | None]] | None = None,
     client: httpx.AsyncClient | None = None,
     max_seconds: float | None = None,
+    replay_post: dict | None = None,
 ) -> tuple[Snapshot, bool, dict[str, Any]]:
     """Выполняет запрос через механизм заданий fetch_jobs в droidhub."""
     device_id = device_id.strip()
@@ -894,6 +934,8 @@ async def _fetch_device_job(
         }
         if wait_for:
             payload["wait_for"] = wait_for
+        if replay_post is not None:
+            payload["replay_post"] = replay_post
 
         timeout = float(wait_seconds + 60)
         job_id: str | None = None
@@ -910,6 +952,25 @@ async def _fetch_device_job(
                 raise DroidhubError("таймаут при обращении к droidhub")
             except (httpx.RequestError, ConnectionError, OSError):
                 raise DroidhubError("сетевая ошибка при обращении к droidhub")
+
+            if replay_post is not None and resp.status_code in (400, 422):
+                logger.warning(
+                    "Хаб вернул %d на fetch_jobs с replay_post, повторяем без него: %s",
+                    resp.status_code,
+                    endpoint,
+                )
+                try:
+                    payload_no_replay = dict(payload)
+                    payload_no_replay.pop("replay_post", None)
+                    if client is not None:
+                        resp = await client.post(endpoint, json=payload_no_replay, headers=headers)
+                    else:
+                        async with httpx.AsyncClient(timeout=timeout) as cl:
+                            resp = await cl.post(endpoint, json=payload_no_replay, headers=headers)
+                except (httpx.TimeoutException, asyncio.TimeoutError):
+                    raise DroidhubError("таймаут при обращении к droidhub")
+                except (httpx.RequestError, ConnectionError, OSError):
+                    raise DroidhubError("сетевая ошибка при обращении к droidhub")
 
             if resp.status_code in (401, 403):
                 raise DroidhubError(
@@ -983,9 +1044,26 @@ async def _fetch_device_job(
                     if isinstance(item, dict):
                         item_url = str(item.get("url", ""))
                         raw_body = item.get("body", "")
+                        is_replayed = bool(item.get("replayed", False))
                         if isinstance(raw_body, str):
                             body_str = raw_body
+                            if is_replayed:
+                                try:
+                                    p_data = json.loads(raw_body)
+                                    if isinstance(p_data, list) and p_data and isinstance(p_data[0], dict):
+                                        p_data[0]["replayed"] = True
+                                        body_str = json.dumps(p_data, ensure_ascii=False)
+                                    elif isinstance(p_data, dict):
+                                        p_data["replayed"] = True
+                                        body_str = json.dumps(p_data, ensure_ascii=False)
+                                except Exception:
+                                    pass
                         elif isinstance(raw_body, (dict, list)):
+                            if is_replayed:
+                                if isinstance(raw_body, dict):
+                                    raw_body["replayed"] = True
+                                elif isinstance(raw_body, list) and raw_body and isinstance(raw_body[0], dict):
+                                    raw_body[0]["replayed"] = True
                             body_str = json.dumps(raw_body, ensure_ascii=False)
                         elif raw_body is None:
                             body_str = ""
@@ -1181,6 +1259,7 @@ async def fetch_page_snapshot_any(
     evaluate: Callable[[Snapshot, dict[str, Any]], Awaitable[str | None]] | None = None,
     max_seconds: float | None = None,
     already_acquired: bool = False,
+    replay_post: dict | None = None,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на любом свободном телефоне из candidates.
 
@@ -1283,6 +1362,7 @@ async def fetch_page_snapshot_any(
                         evaluate=evaluate,
                         client=client,
                         max_seconds=max_seconds,
+                        replay_post=replay_post,
                     )
                     if (
                         info.get("stop_reason") == "job_done"
@@ -1314,6 +1394,7 @@ async def fetch_page_snapshot_any(
                             capture_json=capture_json,
                             wait_for=wait_for,
                             client=client,
+                            replay_post=replay_post,
                         )
                         fetch_sec = time.monotonic() - t_fetch_start
                         if stats is not None:
@@ -1341,6 +1422,7 @@ async def fetch_page_snapshot_any(
                         capture_json=capture_json,
                         wait_for=wait_for,
                         client=client,
+                        replay_post=replay_post,
                     )
                     fetch_sec = time.monotonic() - t_fetch_start
                     if stats is not None:
@@ -1356,6 +1438,7 @@ async def fetch_page_snapshot_any(
                     capture_json=capture_json,
                     wait_for=wait_for,
                     client=client,
+                    replay_post=replay_post,
                 )
                 fetch_sec = time.monotonic() - t_fetch_start
                 if stats is not None:
@@ -1423,6 +1506,7 @@ async def fetch_page_snapshot(
     evaluate: Callable[[Snapshot, dict[str, Any]], Awaitable[str | None]] | None = None,
     max_seconds: float | None = None,
     already_acquired: bool = False,
+    replay_post: dict | None = None,
 ) -> tuple[Snapshot, bool]:
     """Открывает страницу на телефоне через droidhub и возвращает (Snapshot, finished).
 
@@ -1463,6 +1547,7 @@ async def fetch_page_snapshot(
             evaluate=evaluate,
             max_seconds=max_seconds,
             already_acquired=already_acquired,
+            replay_post=replay_post,
         )
     return await fetch_page_snapshot_any(
         settings,
@@ -1482,4 +1567,5 @@ async def fetch_page_snapshot(
         evaluate=evaluate,
         max_seconds=max_seconds,
         already_acquired=already_acquired,
+        replay_post=replay_post,
     )
