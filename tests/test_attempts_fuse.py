@@ -576,7 +576,7 @@ async def test_fuse_priority_greater_than_zero_unaffected(tmp_path, monkeypatch)
 
 def test_empty_results_do_not_trigger_fuse(tmp_path):
     """Пустая выдача (редкий маршрут без билетов) не считается поломкой сайта."""
-    from avia.pipeline import check_site_fuse, reset_fuse_state
+    from avia.dispatcher import check_site_fuse, reset_fuse_state
 
     reset_fuse_state()
     store = MetricsStore(tmp_path / "metrics.sqlite")
