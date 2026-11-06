@@ -43,6 +43,9 @@ def _hit_time_cap(priority: int, cur_stats: dict[str, Any], wait_seconds: Any) -
     """
     if priority != 0:
         return False
+    if cur_stats.get("finished") is True:
+        # страница дозагрузилась, но разбор дал 0: это про телефон/вёрстку, повтор на другом телефоне разумен
+        return False
     try:
         fetched = float(cur_stats.get("fetch_seconds") or 0.0)
         cap = float(wait_seconds or 0.0)
@@ -265,6 +268,25 @@ async def _from_browser(
         )
 
         remaining_cands = list(cand_list)
+        if priority == 0 and getattr(settings, "speed_routing", True):
+            # пары в кулдауне после капчи не трогаем: каждая попытка только плодит капчи и тратит время человека
+            try:
+                from .speed import get_speed_table
+
+                st_table = get_speed_table(settings)
+                ok_cands = [
+                    c
+                    for c in remaining_cands
+                    if not (
+                        st_table.get_pair_status(site.name, c).in_quarantine
+                        and st_table.get_pair_status(site.name, c).consecutive_captchas > 0
+                    )
+                ]
+            except Exception:
+                ok_cands = remaining_cands
+            if remaining_cands and not ok_cands:
+                raise DroidhubError("сайт показал капчу на всех телефонах, владельцу нужно пройти её руками")
+            remaining_cands = ok_cands
         if exclude_devices:
             # повтор после пустой выдачи: не возвращаемся на телефон, который её отдал
             filtered = [c for c in remaining_cands if c not in exclude_devices]
@@ -309,6 +331,7 @@ async def _from_browser(
                     stats.update(cur_stats)
                 raise
 
+            cur_stats["finished"] = bool(finished)
             if stats is not None:
                 stats.update(cur_stats)
 

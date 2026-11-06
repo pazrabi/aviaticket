@@ -760,3 +760,11 @@ def test_hit_time_cap_only_for_live_slow_attempts():
     assert _hit_time_cap(0, {"fetch_seconds": 12.0}, 45) is False
     assert _hit_time_cap(1, {"fetch_seconds": 48.0}, 45) is False
     assert _hit_time_cap(0, {}, 45) is False
+
+
+def test_hit_time_cap_ignored_when_page_finished():
+    from avia.pipeline import _hit_time_cap
+
+    # страница дозагрузилась (finished), но разбор дал 0: повтор на другом телефоне допустим
+    assert _hit_time_cap(0, {"fetch_seconds": 48.0, "finished": True}, 45) is False
+    assert _hit_time_cap(0, {"fetch_seconds": 48.0, "finished": False}, 45) is True
