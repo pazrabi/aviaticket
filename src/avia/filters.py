@@ -7,6 +7,13 @@ import re
 
 from .criteria import SearchCriteria
 from .models import Offer, SiteResult
+from .offers import baggage_state
+
+# Пороги для карточки «Золотая середина»
+MIDDLE_MAX_EXTRA_RATIO = 0.15
+MIDDLE_MIN_TIME_GAIN_RATIO = 0.20
+MIDDLE_MIN_TIME_GAIN_MINUTES = 30
+MIDDLE_DEFAULT_HOUR_COST = 300
 
 _DURATION_REGEX = re.compile(
     r"^(?:(?P<days>\d+)\s*(?:д(?:ней|ня|ень|н)?|d(?:ays?)?)\.?)?\s*"
@@ -87,6 +94,52 @@ def total_duration_minutes(offer: Offer) -> int | None:
     if dur1 is not None and dur2 is not None:
         return dur1 + dur2
     return None
+
+
+def total_transfers(offer: Offer) -> int | None:
+    """Суммарное число пересадок по обоим плечам или None, если данные о пересадках отсутствуют."""
+    if offer.transfers is None:
+        return None
+    tot = offer.transfers
+    if offer.back is not None:
+        if offer.back.transfers is None:
+            return None
+        tot += offer.back.transfers
+    return tot
+
+
+def is_noticeably_better(candidate: Offer, cheapest: Offer) -> bool:
+    """Проверяет, что кандидат заметно лучше самого дешёвого билета по удобству:
+    хотя бы одно из:
+    - суммарное время короче на ≥ 20% и на ≥ 30 минут;
+    - число пересадок меньше (с учётом обратного плеча);
+    - есть багаж/ручная кладь, а у дешёвого нет (baggage_state is True против False/None).
+    """
+    # 1. Суммарное время короче на ≥ 20% и на ≥ 30 минут
+    dur_cheap = total_duration_minutes(cheapest)
+    dur_cand = total_duration_minutes(candidate)
+    if dur_cheap is not None and dur_cand is not None:
+        time_gain = dur_cheap - dur_cand
+        if (
+            time_gain >= MIDDLE_MIN_TIME_GAIN_MINUTES
+            and time_gain >= dur_cheap * MIDDLE_MIN_TIME_GAIN_RATIO - 1e-9
+        ):
+            return True
+
+    # 2. Число пересадок меньше (с учётом обратного плеча)
+    tr_cheap = total_transfers(cheapest)
+    tr_cand = total_transfers(candidate)
+    if tr_cheap is not None and tr_cand is not None and tr_cand < tr_cheap:
+        return True
+
+    # 3. Есть багаж/ручная кладь, а у дешёвого нет
+    if baggage_state(candidate) is True and baggage_state(cheapest) is not True:
+        return True
+
+    return False
+
+
+_is_noticeably_better = is_noticeably_better
 
 
 def matches(offer: Offer, criteria: SearchCriteria) -> bool:
@@ -224,13 +277,43 @@ def pick_cards(
             cards.append(("Самый быстрый", fastest))
             chosen.append(fastest)
 
-    # 3. («Лучший баланс», min balance_score, только если criteria.hour_cost задан и билет отличается от уже выбранных)
+    # Определяем билет для «Лучший баланс», если criteria.hour_cost задан
+    best_balance: Offer | None = None
     if criteria.hour_cost is not None:
-        best_balance = min(
+        cand_balance = min(
             offers, key=lambda o: (balance_score(o, criteria.hour_cost), o.price)
         )
-        if not any(_is_same_offer(best_balance, x) for x in chosen):
-            cards.append(("Лучший баланс", best_balance))
-            chosen.append(best_balance)
+        if not any(_is_same_offer(cand_balance, x) for x in chosen):
+            best_balance = cand_balance
+
+    # 3. («Золотая середина», до 15% дороже дешёвого и заметно лучше по удобству)
+    effective_hour_cost = (
+        criteria.hour_cost if criteria.hour_cost is not None else MIDDLE_DEFAULT_HOUR_COST
+    )
+    max_price = cheapest.price * (1.0 + MIDDLE_MAX_EXTRA_RATIO) + 1e-6
+    middle_candidates: list[Offer] = []
+    for o in offers:
+        if any(_is_same_offer(o, x) for x in chosen):
+            continue
+        if o.price > max_price:
+            continue
+        if not is_noticeably_better(o, cheapest):
+            continue
+        middle_candidates.append(o)
+
+    if middle_candidates:
+        best_middle = min(
+            enumerate(middle_candidates),
+            key=lambda it: (balance_score(it[1], effective_hour_cost), it[1].price, it[0]),
+        )[1]
+        # Если ровно тот же билет уже выбран как «Лучший баланс», «Золотая середина» не добавляется (не дублировать).
+        if best_balance is None or not _is_same_offer(best_middle, best_balance):
+            cards.append(("Золотая середина", best_middle))
+            chosen.append(best_middle)
+
+    # 4. («Лучший баланс», min balance_score, только если criteria.hour_cost задан и билет отличается от уже выбранных)
+    if best_balance is not None and not any(_is_same_offer(best_balance, x) for x in chosen):
+        cards.append(("Лучший баланс", best_balance))
+        chosen.append(best_balance)
 
     return cards
