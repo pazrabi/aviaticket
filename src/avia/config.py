@@ -80,6 +80,8 @@ class Settings:
     tg_allowed_ids: set[int] = field(default_factory=set)   # администраторы; без лимитов поисков
     tg_open: bool = False          # True: бот отвечает всем, пользователи регистрируются в users.sqlite
     daily_search_limit: int = 40   # поисков в сутки на человека (0 = без лимита)
+    search_parallel_live: int = 6  # сайтов одного живого поиска одновременно
+    search_parallel_bg: int = 2  # сайтов одного фонового/подписочного поиска одновременно
     max_parallel_searches: int = 2  # одновременных поисков во всём боте (телефоны одни на всех)
     bg_collect: bool = False       # фоновый сбор цен по популярным маршрутам
     bg_collect_interval_minutes: int = 20  # интервал между фоновыми поисками (мин)
@@ -228,6 +230,8 @@ def load_settings(path: Path | None = None) -> Settings:
         tg_allowed_ids=allowed,
         tg_open=os.getenv("TG_OPEN", "0") == "1",
         daily_search_limit=int(os.getenv("DAILY_SEARCH_LIMIT", "40")),
+        search_parallel_live=max(1, int(os.getenv("SEARCH_PARALLEL_LIVE", "6"))),
+        search_parallel_bg=max(1, int(os.getenv("SEARCH_PARALLEL_BG", "2"))),
         max_parallel_searches=max(1, int(os.getenv("MAX_PARALLEL_SEARCHES", "2"))),
         bg_collect=os.getenv("BG_COLLECT", "0") == "1",
         bg_collect_interval_minutes=int(os.getenv("BG_COLLECT_INTERVAL_MIN", "20")),

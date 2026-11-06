@@ -236,6 +236,7 @@ async def _from_browser(
     priority: int = 0,
     weight: int = 0,
     stats: dict | None = None,
+    exclude_devices: set[str] | None = None,
 ) -> tuple[list[Offer], str | None, bool]:
     extra = await resolve_extra(site, q)
     url = build_url(site, q, extra=extra)
@@ -264,6 +265,11 @@ async def _from_browser(
         )
 
         remaining_cands = list(cand_list)
+        if exclude_devices:
+            # повтор после пустой выдачи: не возвращаемся на телефон, который её отдал
+            filtered = [c for c in remaining_cands if c not in exclude_devices]
+            if filtered:
+                remaining_cands = filtered
         last_snap = None
         last_finished = True
         last_exc: Exception | None = None
@@ -446,8 +452,12 @@ async def _run_site(
         actual_wait_sec = getattr(site, "phone_wait_seconds", 0) or 0
     weight = int(actual_wait_sec or 0)
 
-    async def _fetch_browser() -> tuple[list[Offer], str | None, bool]:
+    async def _fetch_browser(exclude: set[str] | None = None) -> tuple[list[Offer], str | None, bool]:
         try:
+            if exclude:
+                return await _from_browser(
+                    site, q, settings, priority=priority, weight=weight, stats=stats, exclude_devices=exclude
+                )
             return await _from_browser(
                 site,
                 q,
@@ -472,20 +482,26 @@ async def _run_site(
                         exc.snapshot_path.unlink()
                     except OSError:
                         pass
+                if _hit_time_cap(priority, stats, actual_wait_sec):
+                    # упёрлись в лимит ожидания: повтор потратит столько же времени и даст то же
+                    raise
+                bad_dev = stats.get("device")
                 log.warning(
-                    "Сайт %s вернул 0 вариантов (%s), повторная попытка через %s с",
+                    "Сайт %s вернул 0 вариантов (%s), повторная попытка через %s с (без телефона %s)",
                     site.name,
                     exc,
                     EMPTY_RETRY_DELAY,
+                    bad_dev,
                 )
                 await asyncio.sleep(EMPTY_RETRY_DELAY)
-                return await _fetch_browser()
+                return await _fetch_browser({bad_dev} if bad_dev else None)
 
     try:
         (offers, page_url, partial), from_cache = await g.run(
             key_site=site.name,
             key_query=q,
             factory=_fetch,
+            live=priority == 0,
         )
         return SiteResult(
             site=site.name,
@@ -565,8 +581,10 @@ async def search(
     guard: SearchGuard | None = None,
 ) -> list[SiteResult]:
     sites = [s for s in settings.sites if s.enabled]
-    # браузеры тяжёлые: не больше 2 одновременно (api-источники это не касается, но их мало)
-    sem = asyncio.Semaphore(2)
+    # живой поиск идёт всеми сайтами сразу (телефоны сами делят работу через очередь хаба);
+    # подписки и фон остаются осторожными: не больше 2 сайтов разом
+    limit = settings.search_parallel_live if priority == 0 else settings.search_parallel_bg
+    sem = asyncio.Semaphore(max(1, int(limit)))
     g = guard if guard is not None else globals()["guard"]
 
     async def guarded(s: SiteConfig) -> SiteResult:

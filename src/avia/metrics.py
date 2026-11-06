@@ -32,6 +32,18 @@ CREATE TABLE IF NOT EXISTS site_runs (
 CREATE INDEX IF NOT EXISTS ix_site_runs_ts ON site_runs (ts);
 CREATE INDEX IF NOT EXISTS ix_site_runs_site_ts ON site_runs (site, ts);
 
+CREATE TABLE IF NOT EXISTS searches (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts             REAL NOT NULL,
+    source         TEXT NOT NULL,
+    total_seconds  REAL NOT NULL,
+    first_seconds  REAL,
+    sites_total    INTEGER NOT NULL,
+    sites_ok       INTEGER NOT NULL,
+    queue_seconds  REAL
+);
+CREATE INDEX IF NOT EXISTS ix_searches_ts ON searches (ts);
+
 CREATE TABLE IF NOT EXISTS parser_watch_state (
     site              TEXT PRIMARY KEY,
     last_status       TEXT NOT NULL,
@@ -543,3 +555,36 @@ def _recent_by_pair(self, since_ts: float, per_pair: int = 5) -> dict[tuple[str,
 
 
 MetricsStore.recent_by_pair = _recent_by_pair  # type: ignore[attr-defined]
+
+
+def _record_search(
+    self,
+    source: str,
+    total_seconds: float,
+    results: Sequence[SiteResult],
+    queue_seconds: float | None = None,
+    ts: float | None = None,
+) -> None:
+    """Итог всего поиска: сколько ждал человек, когда пришла первая цена, сколько сайтов ответило."""
+    try:
+        oks = [float(r.elapsed) for r in results if r.ok and r.offers]
+        row = (
+            time.time() if ts is None else float(ts),
+            source,
+            float(total_seconds),
+            min(oks) if oks else None,
+            len(results),
+            len(oks),
+            float(queue_seconds) if queue_seconds is not None else None,
+        )
+        with self._connect() as db:
+            db.execute(
+                "INSERT INTO searches (ts, source, total_seconds, first_seconds, sites_total, sites_ok, queue_seconds)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                row,
+            )
+    except Exception:
+        log.exception("ошибка записи итога поиска")
+
+
+MetricsStore.record_search = _record_search  # type: ignore[attr-defined]

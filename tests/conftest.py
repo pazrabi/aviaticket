@@ -1,5 +1,7 @@
 
 
+from pathlib import Path
+
 import pytest
 
 
@@ -44,3 +46,23 @@ def _no_real_droidhub(monkeypatch):
     """Тесты не ходят на телефоны: пустые значения из окружения load_dotenv из .env не перетирает."""
     for name in ("DROIDHUB_URL", "DROIDHUB_TOKEN", "DROIDHUB_DEVICES", "PHONES_HOLD", "PHONES_NEW_POLICY"):
         monkeypatch.setenv(name, "")
+
+
+@pytest.fixture(autouse=True)
+def _cwd_in_tmp(tmp_path, monkeypatch):
+    """Относительные пути (state/...) в тестах ведут во временный каталог, а не в боевые базы."""
+    monkeypatch.chdir(tmp_path)
+    import avia.config as _cfg
+
+    from avia.metrics import MetricsStore
+
+    real_state = (_cfg.ROOT / "state").resolve()
+    orig_init = MetricsStore.__init__
+
+    def _init(self, path):
+        pp = Path(path)
+        if str(pp) != ":memory:" and real_state in pp.resolve().parents:
+            pp = tmp_path / "isolated_metrics" / pp.name
+        orig_init(self, pp)
+
+    monkeypatch.setattr(MetricsStore, "__init__", _init)

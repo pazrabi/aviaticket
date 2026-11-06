@@ -86,6 +86,7 @@ class SearchGuard:
         key_query: Hashable,
         factory: Callable[[], Awaitable[T]],
         retry_delay: float | None = None,
+        live: bool = False,
     ) -> tuple[T, bool]:
         """Выполняет поиск через factory с кэшированием, защитой сайта и повтором при сбое."""
         cache_key = (key_site, key_query)
@@ -117,6 +118,14 @@ class SearchGuard:
         delay = self.retry_delay if retry_delay is None else float(retry_delay)
 
         try:
+            if live:
+                # Живой поиск человека не ждёт ни замок сайта, ни паузу: телефоны делят работу через очередь хаба
+                result = await self._run_live(factory, delay)
+                self._cache[cache_key] = (self.clock(), result)
+                flight.result = result
+                flight.event.set()
+                return result, False
+
             # Запросы одного сайта выполняются строго по очереди
             async with self._get_lock(key_site):
                 # Перепроверяем кэш внутри очереди сайта
@@ -154,6 +163,13 @@ class SearchGuard:
             raise
         finally:
             self._inflight.pop(cache_key, None)
+
+    async def _run_live(self, factory: Callable[[], Awaitable[T]], delay: float) -> T:
+        try:
+            return await factory()
+        except RETRYABLE_EXCEPTIONS:
+            await self._do_sleep(delay)
+            return await factory()
 
     def clear(self) -> None:
         """Очистить кэш, состояние ожиданий и блокировки."""

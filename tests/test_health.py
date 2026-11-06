@@ -50,3 +50,18 @@ def test_health_page_marks_red_and_advises():
     t = build_health_text(h, ["tutu", "ozon", "onetwotrip"])
     assert "🔴 <b>tutu</b>" in t and "✅ <b>ozon</b>" in t and "<b>onetwotrip</b>: данных нет" in t
     assert "Что делать" in t
+
+
+def test_record_search_summary(tmp_path):
+    from avia.models import Offer, SiteResult
+
+    m = MetricsStore(tmp_path / "m.sqlite")
+    res = [
+        SiteResult(site="a", ok=True, offers=[Offer(site="a", price=1)], elapsed=9.0),
+        SiteResult(site="b", ok=True, offers=[Offer(site="b", price=2)], elapsed=30.0),
+        SiteResult(site="c", ok=False, offers=[], elapsed=12.0, error="x"),
+    ]
+    m.record_search("user", 31.5, res, queue_seconds=0.5, ts=100.0)
+    with m._connect() as db:
+        row = db.execute("select total_seconds, first_seconds, sites_total, sites_ok, queue_seconds from searches").fetchone()
+    assert tuple(row) == (31.5, 9.0, 3, 2, 0.5)

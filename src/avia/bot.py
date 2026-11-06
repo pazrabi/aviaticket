@@ -352,8 +352,11 @@ class Bot:
                 wait_msg_id = wait_msg.get("message_id")
 
             self._active_searches += 1
+            t_search0 = time.monotonic()
+            t_gate = t_search0
             try:
                 async with self._gate.slot(0):
+                    t_gate = time.monotonic()
                     results = await _search_call(
                         search,
                         q,
@@ -364,6 +367,10 @@ class Bot:
             finally:
                 self._active_searches -= 1
             self._record_metrics("user", results)
+            if self.metrics is not None and results:
+                self.metrics.record_search(  # type: ignore[attr-defined]
+                    "user", time.monotonic() - t_search0, results, queue_seconds=t_gate - t_search0
+                )
             results = assign_ids(results)
             try:
                 await asyncio.to_thread(self.history.annotate, q, results)
