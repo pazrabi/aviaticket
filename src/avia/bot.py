@@ -667,17 +667,21 @@ class Bot:
         except Exception:
             log.exception("история цен недоступна")
 
-        try:
-            snap = self.store.get(chat_id)
-            if snap is not None and snap.query == q:
-                res_dict = {r.site: r for r in snap.results}
-                for r in real_results_assigned:
-                    res_dict[r.site] = r
-                snap.results = list(res_dict.values())
-        except Exception:
-            pass
-
         late_results = [r for r in real_results_assigned if r.site not in answered_site_names]
+        if late_results:
+            try:
+                snap = self.store.get(chat_id)
+                if snap is not None and snap.query == q:
+                    late_crit, extra_crit = apply_criteria(late_results, snap.criteria)
+                    late_filtered, extra_bag = filter_by_baggage(late_crit, snap.baggage_mode)
+                    res_dict = {r.site: r for r in snap.results}
+                    for r in late_filtered:
+                        res_dict[r.site] = r
+                    snap.results = list(res_dict.values())
+                    snap.dropped_criteria += extra_crit
+                    snap.dropped_baggage += extra_bag
+            except Exception:
+                log.exception("Ошибка обновления сохранённых результатов чата %s", chat_id)
         for late_res in late_results:
             if not late_res.ok or not late_res.offers:
                 continue

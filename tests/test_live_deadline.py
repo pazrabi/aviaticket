@@ -11,6 +11,8 @@ import pytest
 
 from avia.bot import Bot, WaitMessageUpdater
 from avia.config import Settings, SiteConfig
+from avia.criteria import SearchCriteria
+from avia.dialog import Session, Step
 from avia.models import Offer, Query, SiteResult
 from avia.pipeline import search
 
@@ -202,6 +204,235 @@ async def test_live_deadline_slow_site_expensive_no_notification(tmp_path, monke
     send_texts = [p["text"] for m, p in bot.calls if m == "sendMessage"]
     # Никакой досылки не отправлялось
     assert not any("➕ Опоздал сайт" in t for t in send_texts)
+
+
+@pytest.mark.asyncio
+async def test_live_deadline_snapshot_integrity_with_criteria_and_buttons(tmp_path, monkeypatch):
+    """Целостность snap.results и работа кнопок («Все варианты», «Подписаться») после досылки при поиске с критериями."""
+    sites = [
+        SiteConfig(name="fast_site", url_template="http://fast"),
+        SiteConfig(name="slow_site", url_template="http://slow"),
+    ]
+    bot = make_bot(tmp_path, sites=sites, deadline=0.2)
+
+    # fast_site имеет прямой билет (12 000 ₽) и билет с пересадками (4 000 ₽, отсекается)
+    # slow_site опаздывает, имеет дешёвый билет с пересадками (5 000 ₽, отсекается) и прямой (9 000 ₽, подходит и дешевле 12 000 ₽)
+    async def search_with_criteria(q, s, priority=0, on_site_done=None, **kwargs):
+        res_fast = SiteResult(
+            "fast_site",
+            True,
+            [
+                Offer("fast_site", 12000, transfers=0, airline="FastAirDirect"),
+                Offer("fast_site", 4000, transfers=1, airline="FastAirTransfer"),
+            ],
+            page_url="https://fast.test",
+        )
+        if on_site_done:
+            await on_site_done(res_fast)
+
+        await asyncio.sleep(0.35)
+        res_slow = SiteResult(
+            "slow_site",
+            True,
+            [
+                Offer("slow_site", 5000, transfers=1, airline="SlowAirTransfer"),
+                Offer("slow_site", 9000, transfers=0, airline="SlowAirDirect"),
+            ],
+            page_url="https://slow.test/search",
+        )
+        if on_site_done:
+            await on_site_done(res_slow)
+        return [res_fast, res_slow]
+
+    monkeypatch.setattr("avia.bot.search", search_with_criteria)
+
+    # Инициируем поиск через сессию диалога со строгим критерием max_transfers=0
+    bot.dialog.sessions[123] = Session(
+        step=Step.BAGGAGE,
+        origin="MOW",
+        destination="LED",
+        depart=date(2026, 12, 10),
+        adults=1,
+        baggage_mode="any",
+        criteria=SearchCriteria(max_transfers=0),
+        dialog_id="dlg_crit",
+    )
+
+    cq_bag = {
+        "id": "cq_start",
+        "message": {"chat": {"id": 123}, "message_id": 10},
+        "from": {"id": 123},
+        "data": "bag:dlg_crit:any",
+    }
+    await bot.handle_callback(cq_bag)
+
+    # Проверяем, что в первой карточке по дедлайну был только прямой билет fast_site за 12 000 ₽
+    send_texts = [p["text"] for m, p in bot.calls if m == "sendMessage"]
+    assert any("12 000 ₽" in t for t in send_texts)
+    # Билет fast_site за 4 000 ₽ с пересадкой отсечён критерием
+    assert not any("4 000 ₽" in t for t in send_texts)
+
+    # Ждём завершения фоновой догоняющей задачи
+    await asyncio.sleep(0.25)
+
+    # Досылка должна прийти на прямой билет slow_site (9 000 ₽), а не на 5 000 ₽ с пересадкой
+    send_texts_after = [p["text"] for m, p in bot.calls if m == "sendMessage"]
+    late_msgs = [t for t in send_texts_after if "➕ Опоздал сайт slow_site" in t]
+    assert len(late_msgs) == 1
+    assert "нашёл дешевле — 9 000 ₽ (в карточке было 12 000 ₽)" in late_msgs[0]
+    assert "5 000" not in late_msgs[0]
+
+    # 1. Проверяем снимок в ResultStore
+    snap = bot.store.get(123)
+    assert snap is not None
+    assert snap.criteria.max_transfers == 0
+    all_snap_offers = [o for r in snap.results for o in r.offers]
+    # Все билеты в snap.results обязаны быть прямыми (transfers == 0)
+    assert len(all_snap_offers) == 2
+    assert all(o.transfers == 0 for o in all_snap_offers)
+    prices = {o.price for o in all_snap_offers}
+    assert prices == {12000, 9000}
+
+    d_id = bot.dialog.sessions[123].dialog_id
+
+    # 2. Проверяем нажатие «Все варианты» (action == "full")
+    bot.calls.clear()
+    cq_full = {
+        "id": "cq_full",
+        "message": {"chat": {"id": 123}, "message_id": 20},
+        "from": {"id": 123},
+        "data": f"full:{d_id}",
+    }
+    await bot.handle_callback(cq_full)
+    full_texts = [p["text"] for m, p in bot.calls if m == "sendMessage"]
+    assert len(full_texts) >= 1
+    full_report = "\n".join(full_texts)
+    # Содержит прямой билет slow_site за 9 000 ₽
+    assert "9 000 ₽" in full_report
+    assert "SlowAirDirect" in full_report
+    # НЕ содержит билетов с пересадками
+    assert "5 000 ₽" not in full_report
+    assert "4 000 ₽" not in full_report
+    assert "SlowAirTransfer" not in full_report
+    assert "FastAirTransfer" not in full_report
+    assert "пересад" not in full_report.lower()
+
+    # 3. Проверяем нажатие «Подписаться» / отслеживание (action == "track")
+    bot.calls.clear()
+    cq_track = {
+        "id": "cq_track",
+        "message": {"chat": {"id": 123}, "message_id": 21},
+        "from": {"id": 123},
+        "data": f"track:{d_id}",
+    }
+    await bot.handle_callback(cq_track)
+    track_texts = [p["text"] for m, p in bot.calls if m == "sendMessage"]
+    assert len(track_texts) == 1
+    track_msg = track_texts[0]
+    # Подписка оформилась на минимальную цену среди подходящих (9 000 ₽), а не 5 000 ₽
+    assert "Сейчас от <b>9 000 ₽</b>" in track_msg
+    assert "5 000" not in track_msg
+
+    # Проверяем, какая цена записана в базу подписок
+    active_subs = bot.subs.list_active(123)
+    assert len(active_subs) == 1
+    sub = active_subs[0]
+    assert sub.criteria.max_transfers == 0
+    assert bot.subs.first_price(sub.id) == 9000
+
+
+@pytest.mark.asyncio
+async def test_live_deadline_snapshot_integrity_with_baggage_filter(tmp_path, monkeypatch):
+    """Целостность snap.results и работа кнопок карточки при поиске с фильтром багажа."""
+    sites = [
+        SiteConfig(name="fast_site", url_template="http://fast"),
+        SiteConfig(name="slow_site", url_template="http://slow"),
+    ]
+    bot = make_bot(tmp_path, sites=sites, deadline=0.2)
+
+    async def search_with_baggage(q, s, priority=0, on_site_done=None, **kwargs):
+        res_fast = SiteResult(
+            "fast_site",
+            True,
+            [
+                Offer("fast_site", 12000, baggage="с багажом", airline="FastBaggage"),
+                Offer("fast_site", 4000, baggage="без багажа", airline="FastNoBaggage"),
+            ],
+            page_url="https://fast.test",
+        )
+        if on_site_done:
+            await on_site_done(res_fast)
+
+        await asyncio.sleep(0.35)
+        res_slow = SiteResult(
+            "slow_site",
+            True,
+            [
+                Offer("slow_site", 6000, baggage="без багажа", airline="SlowNoBaggage"),
+                Offer("slow_site", 8500, baggage="с багажом", airline="SlowBaggage"),
+            ],
+            page_url="https://slow.test/search",
+        )
+        if on_site_done:
+            await on_site_done(res_slow)
+        return [res_fast, res_slow]
+
+    monkeypatch.setattr("avia.bot.search", search_with_baggage)
+
+    # Инициируем поиск через сессию диалога со строгим режимом багажа baggage_mode="with"
+    bot.dialog.sessions[123] = Session(
+        step=Step.BAGGAGE,
+        origin="MOW",
+        destination="LED",
+        depart=date(2026, 12, 10),
+        adults=1,
+        baggage_mode="with",
+        dialog_id="dlg_bag",
+    )
+
+    cq_bag = {
+        "id": "cq_start_bag",
+        "message": {"chat": {"id": 123}, "message_id": 10},
+        "from": {"id": 123},
+        "data": "bag:dlg_bag:with",
+    }
+    await bot.handle_callback(cq_bag)
+
+    # Ждём завершения фоновой догоняющей задачи
+    await asyncio.sleep(0.25)
+
+    # Досылка должна прийти на билет с багажом slow_site (8 500 ₽), а не на 6 000 ₽ без багажа
+    send_texts_after = [p["text"] for m, p in bot.calls if m == "sendMessage"]
+    late_msgs = [t for t in send_texts_after if "➕ Опоздал сайт slow_site" in t]
+    assert len(late_msgs) == 1
+    assert "нашёл дешевле — 8 500 ₽ (в карточке было 12 000 ₽)" in late_msgs[0]
+    assert "6 000" not in late_msgs[0]
+
+    # Проверяем снимок в ResultStore: только билеты с багажом
+    snap = bot.store.get(123)
+    assert snap is not None
+    assert snap.baggage_mode == "with"
+    all_snap_offers = [o for r in snap.results for o in r.offers]
+    assert len(all_snap_offers) == 2
+    prices = {o.price for o in all_snap_offers}
+    assert prices == {12000, 8500}
+
+    d_id = bot.dialog.sessions[123].dialog_id
+
+    # Проверяем «Все варианты»
+    bot.calls.clear()
+    cq_full = {
+        "id": "cq_full_bag",
+        "message": {"chat": {"id": 123}, "message_id": 20},
+        "from": {"id": 123},
+        "data": f"full:{d_id}",
+    }
+    await bot.handle_callback(cq_full)
+    full_texts = [p["text"] for m, p in bot.calls if m == "sendMessage"]
+    full_report = "\n".join(full_texts)
+    assert "8 500 ₽" in full_report
+    assert "6 000 ₽" not in full_report
+    assert "4 000 ₽" not in full_report
 
 
 @pytest.mark.asyncio
