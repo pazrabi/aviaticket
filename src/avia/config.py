@@ -135,6 +135,7 @@ class Settings:
     soft_allow_interval_hours: float = 24.0
     soft_allow_max_pairs_per_run: int = 2
     metrics: Any = None
+    price_timeline: bool = True
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -289,6 +290,9 @@ def load_settings(path: Path | None = None) -> Settings:
     except ValueError:
         soft_allow_max_pairs = 2
 
+    price_timeline_env = os.getenv("PRICE_TIMELINE", "1").strip().lower()
+    price_timeline = price_timeline_env not in ("0", "false", "False", "no", "off")
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -365,6 +369,7 @@ def load_settings(path: Path | None = None) -> Settings:
         soft_allow_enabled=soft_allow_enabled,
         soft_allow_interval_hours=soft_allow_interval_hours,
         soft_allow_max_pairs_per_run=soft_allow_max_pairs,
+        price_timeline=price_timeline,
     )
 
 
