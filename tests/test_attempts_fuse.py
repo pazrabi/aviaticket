@@ -303,6 +303,8 @@ async def test_fuse_two_different_phones_failed_skips_live_search(tmp_path, monk
     assert res.ok is False
     assert res.error == "сайт временно недоступен"
     assert res.captcha is True
+    assert res.priority == 0
+    assert res.elapsed == 0.0
     # formatting.is_unavailable распознаёт как недоступный
     assert is_unavailable(res) is True
 
@@ -572,3 +574,163 @@ async def test_fuse_priority_greater_than_zero_unaffected(tmp_path, monkeypatch)
     assert len(results) == 1
     assert phones_called is True
     assert results[0].ok is True
+
+
+@pytest.mark.asyncio
+async def test_fuse_probe_success_empty_offers_clears_degradation(tmp_path, monkeypatch):
+    """(ж) успешная пробная попытка без офферов (offers == []) снимает режим деградации."""
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+
+    site = SiteConfig("site_empty_ok", "https://site.test", phone="dev1,dev2", parser="p_empty")
+    settings = Settings(
+        sites=[site],
+        storage_dir=tmp_path,
+        metrics=store,
+        droidhub_url="https://hub.test",
+        droidhub_token="t",
+        site_fuse_enabled=True,
+        site_fuse_window_seconds=300,
+        site_fuse_min_phones=2,
+        site_fuse_probe_seconds=600,
+    )
+    q = Query("MOW", "AER", date(2026, 12, 10))
+
+    # Парсер возвращает пустой список офферов (на эту дату билетов нет, но страница открылась штатно)
+    def p_empty(snap, q):
+        return []
+
+    monkeypatch.setitem(PARSERS, "p_empty", p_empty)
+
+    t0 = 2000.0
+    store.record_run(source="user", site="site_empty_ok", ok=False, partial=False, captcha=False,
+                     error="err1", offers=0, elapsed=2.0, device="dev1", ts=t0 - 10)
+    store.record_run(source="user", site="site_empty_ok", ok=False, partial=False, captcha=False,
+                     error="err2", offers=0, elapsed=2.0, device="dev2", ts=t0)
+
+    phones_called = 0
+
+    async def fake_fetch(settings, cands, url, **kwargs):
+        nonlocal phones_called
+        phones_called += 1
+        stats = kwargs.get("stats")
+        if stats is not None:
+            stats["device"] = "dev1"
+            stats["fetch_seconds"] = 1.0
+        return Snapshot(url=url, text='{"offers": []}'), True
+
+    monkeypatch.setattr("avia.pipeline.fetch_page_snapshot_any", fake_fetch)
+
+    # 1. Поиск через 10 секунд (t0 + 10): предохранитель активен, сайт пропускается
+    res0 = await search(q, settings, priority=0, now=t0 + 10)
+    assert res0[0].ok is False
+    assert res0[0].error == "сайт временно недоступен"
+    assert phones_called == 0
+
+    # 2. Пробная попытка через 601 секунду
+    res1 = await search(q, settings, priority=0, now=t0 + 601)
+    assert phones_called == 1
+    assert res1[0].ok is True
+    assert res1[0].offers == []
+
+    # Режим деградации снят: _FUSE_STATE["site_empty_ok"]["degraded"] == False
+    from avia.dispatcher import _FUSE_STATE
+    assert _FUSE_STATE["site_empty_ok"]["degraded"] is False
+
+    # 3. Следующий поиск работает сразу, не отсекая сайт
+    default_guard.clear()
+    res2 = await search(q, settings, priority=0, now=t0 + 605)
+    assert phones_called == 2
+    assert res2[0].ok is True
+
+
+def test_get_metrics_caches_store_on_settings(tmp_path):
+    """_get_metrics кэширует созданный экземпляр MetricsStore на объекте Settings."""
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+    # Инициализируем файл базы данных
+    store.record_run(source="user", site="test", ok=True, partial=False, captcha=False,
+                     error=None, offers=0, elapsed=1.0, device="d1")
+
+    settings = Settings(
+        sites=[],
+        storage_dir=tmp_path,
+        metrics=None,
+    )
+    from avia.dispatcher import _get_metrics
+
+    m1 = _get_metrics(settings)
+    assert m1 is not None
+    assert settings.metrics is m1
+
+    m2 = _get_metrics(settings)
+    assert m2 is m1
+
+
+def test_fuse_captcha_updated_on_probe_failure_and_horizon_bounded(tmp_path):
+    """Повторные сбои при деградации обновляют had_captcha и ограничивают выборку окном window_seconds."""
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+
+    site = SiteConfig("site_long_deg", "https://site.test", phone="dev1,dev2", parser="p_ok")
+    settings = Settings(
+        sites=[site],
+        storage_dir=tmp_path,
+        metrics=store,
+        droidhub_url="https://hub.test",
+        droidhub_token="t",
+        site_fuse_enabled=True,
+        site_fuse_window_seconds=300,
+        site_fuse_min_phones=2,
+        site_fuse_probe_seconds=600,
+    )
+
+    t0 = 10000.0
+    # Исходные сбои без капчи (502)
+    store.record_run(source="user", site="site_long_deg", ok=False, partial=False, captcha=False,
+                     error="502", offers=0, elapsed=2.0, device="dev1", ts=t0 - 50)
+    store.record_run(source="user", site="site_long_deg", ok=False, partial=False, captcha=False,
+                     error="502", offers=0, elapsed=2.0, device="dev2", ts=t0 - 20)
+
+    fused, had_captcha = check_site_fuse("site_long_deg", settings, now=t0, consume_probe=False)
+    assert fused is True
+    assert had_captcha is False
+
+    # Спустя долгое время (через 3 дня) проба падает с капчей
+    t_probe = t0 + 3 * 86400
+    fused_probe, _ = check_site_fuse("site_long_deg", settings, now=t_probe, consume_probe=True)
+    assert fused_probe is False  # Разрешена проба
+
+    # Проба записана как капча
+    store.record_run(source="user", site="site_long_deg", ok=False, partial=False, captcha=True,
+                     error="капча", offers=0, elapsed=2.0, device="dev1", ts=t_probe)
+
+    # Запоминаем запросы в site_recent_outcomes для проверки горизонта
+    queried_since: list[float] = []
+    orig_recent = store.site_recent_outcomes
+
+    def wrapped_recent(s, since_ts):
+        queried_since.append(since_ts)
+        return orig_recent(s, since_ts)
+
+    store.site_recent_outcomes = wrapped_recent
+
+    # Следующая проверка через 10 секунд после неудачной пробы
+    fused_after, had_cap_after = check_site_fuse("site_long_deg", settings, now=t_probe + 10, consume_probe=False)
+    assert fused_after is True
+    assert had_cap_after is True  # Капча обновилась
+    assert len(queried_since) >= 1
+    # since_ts ограничен окном window_seconds (300 с), а не тянется с первого сбоя t0
+    assert queried_since[-1] >= t_probe + 10 - 300
+
+
+def test_is_unavailable_recognizes_temporarily_unavailable():
+    """formatting.is_unavailable распознаёт ошибку 'сайт временно недоступен'."""
+    res = SiteResult(
+        site="test_site",
+        ok=False,
+        offers=[],
+        error="сайт временно недоступен",
+        captcha=False,
+    )
+    assert is_unavailable(res) is True

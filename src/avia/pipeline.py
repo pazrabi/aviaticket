@@ -585,7 +585,7 @@ async def _from_browser(
                 attempt_tracker=attempt_tracker,
             )
             try:
-                if site.name in _FUSE_STATE and offers:
+                if site.name in _FUSE_STATE:
                     _FUSE_STATE[site.name]["degraded"] = False
             except Exception:
                 pass
@@ -849,14 +849,15 @@ async def search(
                 offers=[],
                 error="для этого сайта обратные билеты пока не поддерживаются",
             )
-        elif priority == 0 and check_site_fuse(s.name, settings, now=now, consume_probe=False)[0]:
-            is_fused, had_captcha = check_site_fuse(s.name, settings, now=now, consume_probe=True)
+        elif priority == 0 and (fuse_st := check_site_fuse(s.name, settings, now=now, consume_probe=False))[0]:
             res = SiteResult(
                 site=s.name,
                 ok=False,
                 offers=[],
                 error="сайт временно недоступен",
-                captcha=had_captcha,
+                captcha=fuse_st[1],
+                elapsed=0.0,
+                priority=priority,
             )
         else:
             dev_order = device_assignments.get(s.name)
@@ -882,24 +883,3 @@ async def search(
         return res
 
     return await asyncio.gather(*(guarded(s) for s in sites))
-
-
-# Добавляем распознавание «временно недоступен» в formatting.is_unavailable
-try:
-    from . import formatting as _fmt
-
-    if hasattr(_fmt, "is_unavailable") and not getattr(_fmt.is_unavailable, "_fuse_patched", False):
-        _orig_is_unavail = _fmt.is_unavailable
-
-        def _fuse_is_unavailable(r: Any) -> bool:
-            if r.ok:
-                return False
-            err = (getattr(r, "error", "") or "").lower()
-            if "временно недоступен" in err:
-                return True
-            return _orig_is_unavail(r)
-
-        _fuse_is_unavailable._fuse_patched = True  # type: ignore[attr-defined]
-        _fmt.is_unavailable = _fuse_is_unavailable
-except Exception:
-    pass

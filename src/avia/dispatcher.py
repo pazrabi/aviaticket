@@ -29,6 +29,10 @@ def _get_metrics(settings: Settings) -> Any | None:
                 from .metrics import MetricsStore
 
                 metrics = MetricsStore(metrics_path)
+                try:
+                    settings.metrics = metrics
+                except Exception:
+                    pass
     return metrics
 
 
@@ -59,10 +63,18 @@ def check_site_fuse(
     state = _FUSE_STATE.get(site_name)
     if state and state.get("degraded", False):
         last_fail = state.get("last_failure_ts", cur_now - window_seconds)
-        outcomes = metrics.site_recent_outcomes(site_name, last_fail)
+        check_since = max(last_fail, cur_now - window_seconds)
+        outcomes = metrics.site_recent_outcomes(site_name, check_since)
         if any(ok for _, ok in outcomes):
             state["degraded"] = False
             return False, False
+
+        for item in outcomes:
+            if getattr(item, "captcha", False) or (len(item) > 2 and item[2]):
+                state["had_captcha"] = True
+            ts_val = getattr(item, "ts", 0.0) or (item[3] if len(item) > 3 else 0.0)
+            if ts_val > state.get("last_failure_ts", 0.0):
+                state["last_failure_ts"] = ts_val
 
         last_probe = state.get("last_probe_ts", last_fail)
         if cur_now - last_probe >= probe_seconds:
@@ -84,7 +96,7 @@ def check_site_fuse(
         return False, False
 
     had_captcha = any(
-        (item[2] if len(item) > 2 else getattr(item, "captcha", False))
+        (getattr(item, "captcha", False) or (len(item) > 2 and item[2]))
         for item in outcomes
     )
     max_fail_ts = max((getattr(o, "ts", since_ts) for o in outcomes), default=cur_now)

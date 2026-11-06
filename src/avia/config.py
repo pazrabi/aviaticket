@@ -315,22 +315,22 @@ def load_settings(path: Path | None = None) -> Settings:
     )
 
 
-# Добавляем распознавание «временно недоступен» в formatting.is_unavailable
+# Добавляем распознавание «временно недоступен» в formatting.is_unavailable (патч __code__ на месте,
+# чтобы сохранялись ссылки у модулей, импортировавших функцию напрямую).
 try:
     from . import formatting as _fmt
 
     if hasattr(_fmt, "is_unavailable") and not getattr(_fmt.is_unavailable, "_fuse_patched", False):
-        _orig_is_unavail = _fmt.is_unavailable
-
         def _fuse_is_unavailable(r: Any) -> bool:
+            """Сайт временно недоступен из-за капчи или телефонов: человеку детали не нужны."""
             if r.ok:
                 return False
             err = (getattr(r, "error", "") or "").lower()
-            if "временно недоступен" in err:
-                return True
-            return _orig_is_unavail(r)
+            return bool(getattr(r, "captcha", False)) or any(
+                w in err for w in ("капч", "блокировк", "телефон", "очередь droidhub", "временно недоступен")
+            )
 
-        _fuse_is_unavailable._fuse_patched = True  # type: ignore[attr-defined]
-        _fmt.is_unavailable = _fuse_is_unavailable
+        _fmt.is_unavailable.__code__ = _fuse_is_unavailable.__code__
+        _fmt.is_unavailable._fuse_patched = True  # type: ignore[attr-defined]
 except Exception:
     pass
