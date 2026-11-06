@@ -1098,8 +1098,10 @@ class Bot:
                 if self.metrics is None:
                     text = "🩺 <b>Здоровье сайтов</b>\n\nМетрики не включены"
                 else:
-                    health = await asyncio.to_thread(collect_health, self.metrics, time.time() - 86400)
                     names = [x.name for x in self.s.sites if x.enabled and x.source == "browser"]
+                    health = await asyncio.to_thread(
+                        collect_health, self.metrics, time.time() - 86400, 5, {x.name for x in self.s.sites}
+                    )
                     text = build_health_text(health, names)
             elif section == "ord":
                 text = admin_panel.build_phone_order({"settings": self.s})
@@ -1678,7 +1680,8 @@ class Bot:
                         try:
                             from .health import check_health_alerts
                             for alert_text in await asyncio.to_thread(
-                                check_health_alerts, self.metrics, None, float(self.s.parser_watch_cooldown_hours)
+                                check_health_alerts, self.metrics, None, float(self.s.parser_watch_cooldown_hours),
+                                {x.name for x in self.s.sites},
                             ):
                                 await self._notify_admins(alert_text)
                         except Exception:

@@ -50,11 +50,13 @@ def _main_cause(kinds: list[str]) -> str:
     return Counter(bad).most_common(1)[0][0] if bad else FAIL
 
 
-def collect_health(metrics: MetricsStore, since_ts: float, per_pair: int = 5) -> dict[str, dict[str, list[str]]]:
+def collect_health(metrics: MetricsStore, since_ts: float, per_pair: int = 5, only_sites: set[str] | None = None) -> dict[str, dict[str, list[str]]]:
     """{сайт: {телефон: [итоги последних запусков, новые первыми]}}."""
     pairs = metrics.recent_by_pair(since_ts, per_pair=per_pair)  # type: ignore[attr-defined]
     res: dict[str, dict[str, list[str]]] = {}
     for (site, dev), runs in pairs.items():
+        if only_sites is not None and site not in only_sites:
+            continue  # сайт убран из настроек: старые запуски не показываем
         res.setdefault(site, {})[dev] = [classify_run(r) for r in runs]
     return res
 
@@ -90,13 +92,15 @@ def build_health_text(health: dict[str, dict[str, list[str]]], enabled_sites: li
     return "\n".join(lines)
 
 
-def check_health_alerts(metrics: MetricsStore, now: float | None = None, cooldown_hours: float = 6.0) -> list[str]:
+def check_health_alerts(metrics: MetricsStore, now: float | None = None, cooldown_hours: float = 6.0, only_sites: set[str] | None = None) -> list[str]:
     """Быстрые оповещения: сайт не работает на всех телефонах (за последний час) и пара подряд падает."""
     now_ts = time.time() if now is None else float(now)
     cooldown = cooldown_hours * 3600.0
     pairs = metrics.recent_by_pair(now_ts - ALERT_WINDOW_SECONDS, per_pair=10)  # type: ignore[attr-defined]
     by_site: dict[str, dict[str, list[str]]] = {}
     for (site, dev), runs in pairs.items():
+        if only_sites is not None and site not in only_sites:
+            continue
         by_site.setdefault(site, {})[dev] = [classify_run(r) for r in runs]
 
     messages: list[str] = []
