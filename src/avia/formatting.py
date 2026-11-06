@@ -5,7 +5,14 @@ from html import escape
 from typing import Sequence
 
 from .criteria import SearchCriteria
-from .filters import pareto_front, pick_cards
+from .filters import (
+    MIDDLE_MIN_TIME_GAIN_MINUTES,
+    MIDDLE_MIN_TIME_GAIN_RATIO,
+    pareto_front,
+    pick_cards,
+    total_duration_minutes,
+    total_transfers,
+)
 from .models import Leg, Offer, Query, SiteResult
 from .offers import baggage_state, compute_offer_id, merge_same_flights
 from .parsing import city_name
@@ -204,7 +211,12 @@ SITE_NAMES = {
 }
 
 MONTHS_SHORT = ("янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек")
-CARD_ICONS = {"Самый дешёвый": "💰", "Самый быстрый": "⚡", "Лучший баланс": "⚖️"}
+CARD_ICONS = {
+    "Самый дешёвый": "💰",
+    "Самый быстрый": "⚡",
+    "Лучший баланс": "⚖️",
+    "Золотая середина": "⚖️",
+}
 DIVIDER = "┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈"
 
 
@@ -300,6 +312,65 @@ def _price_html(o: Offer) -> str:
     return text
 
 
+def format_middle_diff(cheapest: Offer | None, o: Offer) -> str:
+    """Формирует короткую пометку причины для заголовка «Золотая середина» относительно дешёвого билета.
+
+    Примеры:
+    - (быстрее на 1 ч 10 м за +240 ₽)
+    - (на 1 пересадку меньше за +120 ₽)
+    - (с багажом за +300 ₽)
+    """
+    if cheapest is None:
+        return ""
+    if cheapest.currency != o.currency:
+        return ""
+
+    price_diff = o.price - cheapest.price
+    if price_diff < 0:
+        return ""
+
+    curr_sym = SYMBOLS.get(o.currency, o.currency)
+    price_part = f"+{price_diff} {curr_sym}"
+
+    # 1. Время короче на ≥ 20% и на ≥ 30 минут
+    dur_cheap = total_duration_minutes(cheapest)
+    dur_o = total_duration_minutes(o)
+    if dur_cheap is not None and dur_o is not None:
+        time_diff = dur_cheap - dur_o
+        if (
+            time_diff >= MIDDLE_MIN_TIME_GAIN_MINUTES
+            and time_diff >= dur_cheap * MIDDLE_MIN_TIME_GAIN_RATIO - 1e-9
+        ):
+            h = time_diff // 60
+            m = time_diff % 60
+            if h > 0 and m > 0:
+                time_str = f"{h} ч {m} м"
+            elif h > 0:
+                time_str = f"{h} ч"
+            else:
+                time_str = f"{m} м"
+            return f"(быстрее на {time_str} за {price_part})"
+
+    # 2. Число пересадок меньше (с учётом обратного плеча)
+    tr_cheap = total_transfers(cheapest)
+    tr_o = total_transfers(o)
+    if tr_cheap is not None and tr_o is not None and tr_o < tr_cheap:
+        diff_tr = tr_cheap - tr_o
+        if diff_tr % 10 == 1 and diff_tr % 100 != 11:
+            w = "пересадку"
+        elif 2 <= diff_tr % 10 <= 4 and not (12 <= diff_tr % 100 <= 14):
+            w = "пересадки"
+        else:
+            w = "пересадок"
+        return f"(на {diff_tr} {w} меньше за {price_part})"
+
+    # 3. Есть багаж, а у дешёвого нет
+    if baggage_state(o) is True and baggage_state(cheapest) is not True:
+        return f"(с багажом за {price_part})"
+
+    return ""
+
+
 def offer_card(
     o: Offer,
     q: Query | None,
@@ -307,10 +378,25 @@ def offer_card(
     number: int,
     title: str | None = None,
     baggage_mode: str = "any",
+    cheapest: Offer | None = None,
 ) -> list[str]:
     """Карточка билета: заголовок, цена и авиакомпания, плечи в цитате, ссылка."""
-    icon = CARD_ICONS.get(title or "", "🎫")
-    head = f"<b>{number}  {icon} {escape(title)}</b>" if title else f"<b>{number}</b>"
+    display_title = title
+    if title and title.startswith("Золотая середина") and cheapest is not None:
+        note = format_middle_diff(cheapest, o)
+        if note and note not in title:
+            display_title = f"{title} {note}"
+
+    icon = CARD_ICONS.get(title or "")
+    if icon is None and title:
+        for k, v in CARD_ICONS.items():
+            if title.startswith(k):
+                icon = v
+                break
+    if icon is None:
+        icon = "🎫"
+
+    head = f"<b>{number}  {icon} {escape(display_title)}</b>" if display_title else f"<b>{number}</b>"
     price_row = _price_html(o)
     airline = _airline_label(o)
     if airline:
@@ -607,9 +693,17 @@ def build_compact_report(
         header_lines.append(_baggage_filter_line(baggage_mode, dropped_baggage))
     header_lines.append("")
 
+    cheapest_offer = next((o for t, o in cards if t == "Самый дешёвый"), None)
     card_blocks: list[list[str]] = []
     for counter, (title, o) in enumerate(cards, start=1):
-        card = offer_card(o, q, number=counter, title=title, baggage_mode=baggage_mode)
+        card = offer_card(
+            o,
+            q,
+            number=counter,
+            title=title,
+            baggage_mode=baggage_mode,
+            cheapest=cheapest_offer,
+        )
         card.append("")
         card_blocks.append(card)
 
