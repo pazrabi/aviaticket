@@ -16,6 +16,7 @@ from .config import Settings, SiteConfig
 from .dispatcher import check_site_fuse, _get_metrics, _FUSE_STATE
 from .droidhub import (
     DroidhubError,
+    PreemptedError,
     PreferenceList,
     candidates,
     fetch_page_snapshot_any,
@@ -599,6 +600,8 @@ async def _from_browser(
                     url,
                     **fetch_kwargs,
                 )
+            except PreemptedError:
+                raise
             except Exception as exc:
                 last_exc = exc
                 if stats is not None:
@@ -1053,6 +1056,8 @@ async def _run_site(
             fetch_seconds=stats.get("fetch_seconds"),
             priority=priority,
         )
+    except PreemptedError:
+        raise
     except DroidhubError as e:
         log.warning("Ошибка droidhub на сайте %s: %s", site.name, e)
         is_captcha = "капч" in str(e).lower() or "блокировк" in str(e).lower()
@@ -1165,20 +1170,26 @@ async def search(
         else:
             dev_order = device_assignments.get(s.name)
             async with sem:
-                res = await _run_site(
-                    s,
-                    q,
-                    settings,
-                    priority=priority,
-                    guard=g,
-                    device_order=dev_order,
-                    search_id=search_id,
-                    now=now,
-                    search_started=search_started,
-                    deep=deep,
-                )
+                try:
+                    res = await _run_site(
+                        s,
+                        q,
+                        settings,
+                        priority=priority,
+                        guard=g,
+                        device_order=dev_order,
+                        search_id=search_id,
+                        now=now,
+                        search_started=search_started,
+                        deep=deep,
+                    )
+                except PreemptedError:
+                    if priority >= 1:
+                        log.info("Сайт %s вытеснен живым поиском (пропуск без ошибки)", s.name)
+                        return None
+                    raise
 
-        if on_site_done is not None:
+        if on_site_done is not None and res is not None:
             try:
                 ret = on_site_done(res)
                 if inspect.isawaitable(ret):
@@ -1187,4 +1198,5 @@ async def search(
                 log.exception("Исключение в on_site_done для сайта %s: %s", s.name, e)
         return res
 
-    return await asyncio.gather(*(guarded(s) for s in sites))
+    results = await asyncio.gather(*(guarded(s) for s in sites))
+    return [r for r in results if r is not None]
