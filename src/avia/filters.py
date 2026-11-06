@@ -9,10 +9,18 @@ from .criteria import SearchCriteria
 from .models import Offer, SiteResult
 from .offers import baggage_state
 
-# Пороги для карточки «Золотая середина»
-MIDDLE_MAX_EXTRA_RATIO = 0.15
-MIDDLE_MIN_TIME_GAIN_RATIO = 0.20
-MIDDLE_MIN_TIME_GAIN_MINUTES = 30
+# Пороги для карточки «Золотая середина» и отбора «5 билетов на сайт»
+BALANCE_MAX_PREMIUM_PCT = 30.0
+BALANCE_MIN_SAVING_MINUTES = 120
+BALANCE_MIN_SAVING_SHARE = 0.25
+SITE_TOP_CHEAP = 2
+SITE_TOP_BALANCE = 2
+SITE_TOP_FAST = 1
+
+# Для обратной совместимости
+MIDDLE_MAX_EXTRA_RATIO = BALANCE_MAX_PREMIUM_PCT / 100.0
+MIDDLE_MIN_TIME_GAIN_RATIO = BALANCE_MIN_SAVING_SHARE
+MIDDLE_MIN_TIME_GAIN_MINUTES = BALANCE_MIN_SAVING_MINUTES
 MIDDLE_DEFAULT_HOUR_COST = 300
 
 _DURATION_REGEX = re.compile(
@@ -108,33 +116,61 @@ def total_transfers(offer: Offer) -> int | None:
     return tot
 
 
-def is_noticeably_better(candidate: Offer, cheapest: Offer) -> bool:
-    """Проверяет, что кандидат заметно лучше самого дешёвого билета по удобству:
+def is_noticeably_better(
+    candidate: Offer,
+    cheapest: Offer,
+    settings: Any = None,
+    *,
+    baggage_mode: str = "any",
+    min_saving_minutes: int | None = None,
+    min_saving_share: float | None = None,
+) -> bool:
+    """Проверяет, что кандидат заметно лучше самого дешёвого билета:
     хотя бы одно из:
-    - суммарное время короче на ≥ 20% и на ≥ 30 минут;
-    - число пересадок меньше (с учётом обратного плеча);
-    - есть багаж/ручная кладь, а у дешёвого нет (baggage_state is True против False/None).
+    - суммарное время короче хотя бы на BALANCE_MIN_SAVING_MINUTES (120 мин)
+      И хотя бы на BALANCE_MIN_SAVING_SHARE (0.25) от времени дешёвого;
+    - есть багаж (baggage_state is True), а у дешёвого нет (baggage_state is not True).
+      Условие по багажу действует только в режиме baggage_mode == 'any'.
+    Условие «меньше пересадок» убрано по правилу владельца.
     """
-    # 1. Суммарное время короче на ≥ 20% и на ≥ 30 минут
+    if isinstance(settings, str):
+        baggage_mode = settings
+        settings = None
+
+    saving_min = (
+        min_saving_minutes
+        if min_saving_minutes is not None
+        else (
+            settings.balance_min_saving_minutes
+            if settings and hasattr(settings, "balance_min_saving_minutes")
+            else BALANCE_MIN_SAVING_MINUTES
+        )
+    )
+    saving_share = (
+        min_saving_share
+        if min_saving_share is not None
+        else (
+            settings.balance_min_saving_share
+            if settings and hasattr(settings, "balance_min_saving_share")
+            else BALANCE_MIN_SAVING_SHARE
+        )
+    )
+
+    # 1. «заметно быстрее»
     dur_cheap = total_duration_minutes(cheapest)
     dur_cand = total_duration_minutes(candidate)
     if dur_cheap is not None and dur_cand is not None:
         time_gain = dur_cheap - dur_cand
         if (
-            time_gain >= MIDDLE_MIN_TIME_GAIN_MINUTES
-            and time_gain >= dur_cheap * MIDDLE_MIN_TIME_GAIN_RATIO - 1e-9
+            time_gain >= saving_min
+            and time_gain >= dur_cheap * saving_share - 1e-9
         ):
             return True
 
-    # 2. Число пересадок меньше (с учётом обратного плеча)
-    tr_cheap = total_transfers(cheapest)
-    tr_cand = total_transfers(candidate)
-    if tr_cheap is not None and tr_cand is not None and tr_cand < tr_cheap:
-        return True
-
-    # 3. Есть багаж/ручная кладь, а у дешёвого нет
-    if baggage_state(candidate) is True and baggage_state(cheapest) is not True:
-        return True
+    # 2. «с багажом» (только в режиме 'any')
+    if baggage_mode == "any":
+        if baggage_state(candidate) is True and baggage_state(cheapest) is not True:
+            return True
 
     return False
 
@@ -256,7 +292,14 @@ def _is_same_offer(a: Offer, b: Offer) -> bool:
 
 
 def pick_cards(
-    offers: Sequence[Offer], criteria: SearchCriteria
+    offers: Sequence[Offer],
+    criteria: SearchCriteria,
+    settings: Any = None,
+    *,
+    baggage_mode: str = "any",
+    max_premium_pct: float | None = None,
+    min_saving_minutes: int | None = None,
+    min_saving_share: float | None = None,
 ) -> list[tuple[str, Offer]]:
     if not offers:
         return []
@@ -286,26 +329,36 @@ def pick_cards(
         if not any(_is_same_offer(cand_balance, x) for x in chosen):
             best_balance = cand_balance
 
-    # 3. («Золотая середина», до 15% дороже дешёвого и заметно лучше по удобству)
-    effective_hour_cost = (
-        criteria.hour_cost if criteria.hour_cost is not None else MIDDLE_DEFAULT_HOUR_COST
+    # 3. («Золотая середина», до BALANCE_MAX_PREMIUM_PCT% дороже дешёвого и заметно лучше по удобству)
+    prem_pct = (
+        max_premium_pct
+        if max_premium_pct is not None
+        else (
+            settings.balance_max_premium_pct
+            if settings and hasattr(settings, "balance_max_premium_pct")
+            else BALANCE_MAX_PREMIUM_PCT
+        )
     )
-    max_price = cheapest.price * (1.0 + MIDDLE_MAX_EXTRA_RATIO) + 1e-6
+    max_price = cheapest.price * (1.0 + prem_pct / 100.0)
     middle_candidates: list[Offer] = []
     for o in offers:
         if any(_is_same_offer(o, x) for x in chosen):
             continue
-        if o.price > max_price:
+        if o.price >= max_price:
             continue
-        if not is_noticeably_better(o, cheapest):
+        if not is_noticeably_better(
+            o,
+            cheapest,
+            settings,
+            baggage_mode=baggage_mode,
+            min_saving_minutes=min_saving_minutes,
+            min_saving_share=min_saving_share,
+        ):
             continue
         middle_candidates.append(o)
 
     if middle_candidates:
-        best_middle = min(
-            enumerate(middle_candidates),
-            key=lambda it: (balance_score(it[1], effective_hour_cost), it[1].price, it[0]),
-        )[1]
+        best_middle = min(middle_candidates, key=lambda o: o.price)
         # Если ровно тот же билет уже выбран как «Лучший баланс», «Золотая середина» не добавляется (не дублировать).
         if best_balance is None or not _is_same_offer(best_middle, best_balance):
             cards.append(("Золотая середина", best_middle))
@@ -317,3 +370,113 @@ def pick_cards(
         chosen.append(best_balance)
 
     return cards
+
+
+def pick_site_top(
+    offers: Sequence[Offer],
+    settings: Any = None,
+    baggage_mode: str = "any",
+) -> list[Offer]:
+    """Из офферов ОДНОГО сайта (после фильтров багажа и критериев, отсортированных по цене)
+    выбрать до 5 билетов:
+    - SITE_TOP_CHEAP (по умолчанию 2) самых дешёвых по цене;
+    - SITE_TOP_BALANCE (по умолчанию 2) «золотой середины» по правилу выше среди оставшихся
+      (ориентир — самый дешёвый билет этого сайта);
+    - SITE_TOP_FAST (по умолчанию 1) самый быстрый по total_duration_minutes среди оставшихся
+      (билеты без известного времени не участвуют).
+    Один билет занимает одно место (_is_same_offer).
+    Если для какого-то слота нет кандидата (нет времени в пути, никто не прошёл правило середины,
+    у сайта меньше 5 билетов), место добирается следующим по цене.
+    Результат отсортирован по цене.
+    """
+    if isinstance(settings, str):
+        baggage_mode = settings
+        settings = None
+
+    if not offers:
+        return []
+
+    # Очищаем старые метки ролей на случай переиспользования объектов
+    for o in offers:
+        if hasattr(o, "_site_top_role"):
+            delattr(o, "_site_top_role")
+
+    n_cheap = (
+        settings.site_top_cheap
+        if settings and hasattr(settings, "site_top_cheap")
+        else SITE_TOP_CHEAP
+    )
+    n_balance = (
+        settings.site_top_balance
+        if settings and hasattr(settings, "site_top_balance")
+        else SITE_TOP_BALANCE
+    )
+    n_fast = (
+        settings.site_top_fast
+        if settings and hasattr(settings, "site_top_fast")
+        else SITE_TOP_FAST
+    )
+    max_premium_pct = (
+        settings.balance_max_premium_pct
+        if settings and hasattr(settings, "balance_max_premium_pct")
+        else BALANCE_MAX_PREMIUM_PCT
+    )
+
+    # Список офферов отсортирован по цене
+    sorted_offers = sorted(offers, key=lambda o: o.price)
+    cheapest = sorted_offers[0]
+
+    chosen: list[Offer] = []
+    balance_offers: list[Offer] = []
+    fast_offers: list[Offer] = []
+
+    def is_chosen(offer: Offer) -> bool:
+        return any(_is_same_offer(offer, c) for c in chosen)
+
+    # 1. SITE_TOP_CHEAP самых дешёвых по цене
+    for o in sorted_offers:
+        if not is_chosen(o):
+            chosen.append(o)
+            o._site_top_role = "cheap"
+            if len(chosen) >= n_cheap:
+                break
+
+    # 2. SITE_TOP_BALANCE «золотой середины» среди оставшихся (ориентир — самый дешёвый билет сайта)
+    max_price = cheapest.price * (1.0 + max_premium_pct / 100.0)
+    for o in sorted_offers:
+        if len(balance_offers) >= n_balance:
+            break
+        if is_chosen(o):
+            continue
+        if o.price >= max_price:
+            continue
+        if is_noticeably_better(o, cheapest, settings=settings, baggage_mode=baggage_mode):
+            chosen.append(o)
+            balance_offers.append(o)
+            o._site_top_role = "balance"
+
+    # 3. SITE_TOP_FAST самый быстрый по total_duration_minutes среди оставшихся
+    candidates_with_time = [
+        o for o in sorted_offers if not is_chosen(o) and total_duration_minutes(o) is not None
+    ]
+    if candidates_with_time and n_fast > 0:
+        fastest_rem = min(
+            candidates_with_time, key=lambda o: (total_duration_minutes(o), o.price)
+        )
+        chosen.append(fastest_rem)
+        fast_offers.append(fastest_rem)
+        fastest_rem._site_top_role = "fast"
+
+    # 4. Если слоты не заполнены, место добирается следующим по цене
+    target_count = n_cheap + n_balance + n_fast
+    if len(chosen) < target_count:
+        for o in sorted_offers:
+            if not is_chosen(o):
+                chosen.append(o)
+                o._site_top_role = "fallback"
+                if len(chosen) >= target_count:
+                    break
+
+    # Результат отсортирован по цене
+    chosen.sort(key=lambda o: o.price)
+    return chosen

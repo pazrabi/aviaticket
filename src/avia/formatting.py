@@ -6,10 +6,13 @@ from typing import Sequence
 
 from .criteria import SearchCriteria
 from .filters import (
+    BALANCE_MIN_SAVING_MINUTES,
+    BALANCE_MIN_SAVING_SHARE,
     MIDDLE_MIN_TIME_GAIN_MINUTES,
     MIDDLE_MIN_TIME_GAIN_RATIO,
     pareto_front,
     pick_cards,
+    pick_site_top,
     total_duration_minutes,
     total_transfers,
 )
@@ -314,14 +317,25 @@ def _price_html(o: Offer) -> str:
     return text
 
 
-def format_middle_diff(cheapest: Offer | None, o: Offer) -> str:
+def format_middle_diff(
+    cheapest: Offer | None,
+    o: Offer,
+    settings: Any = None,
+    *,
+    baggage_mode: str = "any",
+    min_saving_minutes: int | None = None,
+    min_saving_share: float | None = None,
+) -> str:
     """Формирует короткую пометку причины для заголовка «Золотая середина» относительно дешёвого билета.
 
     Примеры:
-    - (быстрее на 1 ч 10 м за +240 ₽)
-    - (на 1 пересадку меньше за +120 ₽)
-    - (с багажом за +300 ₽)
+    - (на 1 ч 10 м быстрее, +240 ₽)
+    - (с багажом, +300 ₽)
     """
+    if isinstance(settings, str):
+        baggage_mode = settings
+        settings = None
+
     if cheapest is None:
         return ""
     if cheapest.currency != o.currency:
@@ -331,17 +345,33 @@ def format_middle_diff(cheapest: Offer | None, o: Offer) -> str:
     if price_diff < 0:
         return ""
 
-    curr_sym = SYMBOLS.get(o.currency, o.currency)
-    price_part = f"+{price_diff} {curr_sym}"
+    saving_min = (
+        min_saving_minutes
+        if min_saving_minutes is not None
+        else (
+            settings.balance_min_saving_minutes
+            if settings and hasattr(settings, "balance_min_saving_minutes")
+            else BALANCE_MIN_SAVING_MINUTES
+        )
+    )
+    saving_share = (
+        min_saving_share
+        if min_saving_share is not None
+        else (
+            settings.balance_min_saving_share
+            if settings and hasattr(settings, "balance_min_saving_share")
+            else BALANCE_MIN_SAVING_SHARE
+        )
+    )
 
-    # 1. Время короче на ≥ 20% и на ≥ 30 минут
+    # 1. Время короче хотя бы на saving_min И хотя бы на saving_share
     dur_cheap = total_duration_minutes(cheapest)
     dur_o = total_duration_minutes(o)
     if dur_cheap is not None and dur_o is not None:
         time_diff = dur_cheap - dur_o
         if (
-            time_diff >= MIDDLE_MIN_TIME_GAIN_MINUTES
-            and time_diff >= dur_cheap * MIDDLE_MIN_TIME_GAIN_RATIO - 1e-9
+            time_diff >= saving_min
+            and time_diff >= dur_cheap * saving_share - 1e-9
         ):
             h = time_diff // 60
             m = time_diff % 60
@@ -351,24 +381,12 @@ def format_middle_diff(cheapest: Offer | None, o: Offer) -> str:
                 time_str = f"{h} ч"
             else:
                 time_str = f"{m} м"
-            return f"(быстрее на {time_str} за {price_part})"
+            return f"(на {time_str} быстрее, +{money(price_diff, o.currency)})"
 
-    # 2. Число пересадок меньше (с учётом обратного плеча)
-    tr_cheap = total_transfers(cheapest)
-    tr_o = total_transfers(o)
-    if tr_cheap is not None and tr_o is not None and tr_o < tr_cheap:
-        diff_tr = tr_cheap - tr_o
-        if diff_tr % 10 == 1 and diff_tr % 100 != 11:
-            w = "пересадку"
-        elif 2 <= diff_tr % 10 <= 4 and not (12 <= diff_tr % 100 <= 14):
-            w = "пересадки"
-        else:
-            w = "пересадок"
-        return f"(на {diff_tr} {w} меньше за {price_part})"
-
-    # 3. Есть багаж, а у дешёвого нет
-    if baggage_state(o) is True and baggage_state(cheapest) is not True:
-        return f"(с багажом за {price_part})"
+    # 2. Есть багаж, а у дешёвого нет (только в режиме 'any')
+    if baggage_mode == "any":
+        if baggage_state(o) is True and baggage_state(cheapest) is not True:
+            return f"(с багажом, +{money(price_diff, o.currency)})"
 
     return ""
 
@@ -381,11 +399,12 @@ def offer_card(
     title: str | None = None,
     baggage_mode: str = "any",
     cheapest: Offer | None = None,
+    settings: Any = None,
 ) -> list[str]:
     """Карточка билета: заголовок, цена и авиакомпания, плечи в цитате, ссылка."""
     display_title = title
     if title and title.startswith("Золотая середина") and cheapest is not None:
-        note = format_middle_diff(cheapest, o)
+        note = format_middle_diff(cheapest, o, settings=settings, baggage_mode=baggage_mode)
         if note and note not in title:
             display_title = f"{title} {note}"
 
@@ -461,6 +480,7 @@ def build_report(
     *,
     baggage_mode: str = "any",
     dropped: int = 0,
+    settings: Any = None,
 ) -> tuple[list[str], list[Offer]]:
     """Полный список по сайтам (каждая часть ≤ 4000 символов) и плоский список показанных билетов."""
     header_lines = _trip_head(q)
@@ -505,21 +525,60 @@ def build_report(
         site_head = [f"<b>{escape(site_label(r.site))}</b>  <i>{r.elapsed:.0f} с</i>"]
         site_head += [f"<i>{escape(n)}</i>" for n in notes]
 
+        if top_n is not None and top_n > 5:
+            # Для глубокого поиска (TOP_N > 5)
+            seen_deep: set[tuple[str, ...]] = set()
+            site_offers: list[Offer] = []
+            for o in r.offers:
+                body = offer_body(o, q, baggage_mode)
+                key = (str(o.price), _airline_label(o) or "", *body)
+                if key in seen_deep:
+                    continue
+                seen_deep.add(key)
+                site_offers.append(o)
+                if len(site_offers) >= top_n:
+                    break
+        else:
+            site_offers = pick_site_top(
+                r.offers,
+                settings=settings,
+                baggage_mode=baggage_mode,
+            )
+            if top_n is not None and top_n < len(site_offers):
+                site_offers = site_offers[:top_n]
+
+        cheapest_site = min(r.offers, key=lambda o: o.price) if r.offers else None
+
         seen: set[tuple[str, ...]] = set()
         blocks: list[tuple[Offer, list[str]]] = []
-        for o in r.offers:
+        for o in site_offers:
             body = offer_body(o, q, baggage_mode)
             key = (str(o.price), _airline_label(o) or "", *body)
             if key in seen:
                 continue
             seen.add(key)
-            row = f"<b>{{n}}.</b> {_price_html(o)}"
+
+            badge = ""
+            role = getattr(o, "_site_top_role", None)
+            if role == "balance":
+                reason = format_middle_diff(cheapest_site, o, settings=settings, baggage_mode=baggage_mode)
+                reason_clean = reason.strip("()")
+                badge = f"⚖️ {escape(reason_clean)}" if reason_clean else "⚖️"
+            elif role == "fast":
+                badge = "⚡"
+
+            price_str = _price_html(o)
+            if badge:
+                price_str += f"  {badge}"
+
+            row = f"<b>{{n}}.</b> {price_str}"
             airline = _airline_label(o)
             if airline:
                 row += f"  ·  {airline}"
             blocks.append((o, [row] + [f"    {b}" for b in body]))
-            if len(blocks) >= top_n:
-                break
+
+        if not blocks:
+            continue
 
         if not fits(site_head + blocks[0][1]):
             flush()
@@ -561,9 +620,17 @@ def format_report(
     *,
     baggage_mode: str = "any",
     dropped: int = 0,
+    settings: Any = None,
 ) -> str:
     """Формирует текстовый отчёт со сквозной нумерацией вариантов."""
-    parts, _ = build_report(q, results, top_n, baggage_mode=baggage_mode, dropped=dropped)
+    parts, _ = build_report(
+        q,
+        results,
+        top_n,
+        baggage_mode=baggage_mode,
+        dropped=dropped,
+        settings=settings,
+    )
     return "\n".join(parts)
 
 
@@ -656,6 +723,7 @@ def build_compact_report(
     baggage_mode: str = "any",
     dropped_baggage: int = 0,
     dropped_criteria: int = 0,
+    settings: Any = None,
 ) -> tuple[list[str], list[Offer], list[Offer]]:
     """Сводка с карточками (pick_cards), плоским списком (flat) и пулом билетов (pool)."""
     unique_offers: list[Offer] = []
@@ -679,7 +747,7 @@ def build_compact_report(
     others.sort(key=lambda o: (o.currency, o.price))
     pool = pareto + others
 
-    cards = pick_cards(pool, criteria)
+    cards = pick_cards(pool, criteria, settings=settings, baggage_mode=baggage_mode)
     flat = [o for _, o in cards]
 
     header_lines = _trip_head(q)
@@ -705,6 +773,7 @@ def build_compact_report(
             title=title,
             baggage_mode=baggage_mode,
             cheapest=cheapest_offer,
+            settings=settings,
         )
         card.append("")
         card_blocks.append(card)
