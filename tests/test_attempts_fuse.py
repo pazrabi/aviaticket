@@ -436,9 +436,9 @@ async def test_fuse_probe_attempt_after_probe_seconds(tmp_path, monkeypatch):
 
     t0 = 1000.0
     store.record_run(source="user", site="site_probe", ok=False, partial=False, captcha=False,
-                     error="err1", offers=0, elapsed=2.0, device="dev1", ts=t0 - 10)
+                     error="телефон недоступен (502)", offers=0, elapsed=2.0, device="dev1", ts=t0 - 10)
     store.record_run(source="user", site="site_probe", ok=False, partial=False, captcha=False,
-                     error="err2", offers=0, elapsed=2.0, device="dev2", ts=t0)
+                     error="телефон недоступен (502)", offers=0, elapsed=2.0, device="dev2", ts=t0)
 
     phones_called = 0
 
@@ -572,3 +572,25 @@ async def test_fuse_priority_greater_than_zero_unaffected(tmp_path, monkeypatch)
     assert len(results) == 1
     assert phones_called is True
     assert results[0].ok is True
+
+
+def test_empty_results_do_not_trigger_fuse(tmp_path):
+    """Пустая выдача (редкий маршрут без билетов) не считается поломкой сайта."""
+    from avia.pipeline import check_site_fuse, reset_fuse_state
+
+    reset_fuse_state()
+    store = MetricsStore(tmp_path / "metrics.sqlite")
+    t0 = 5000.0
+    for i, dev in enumerate(["a", "b", "c"]):
+        store.record_run(source="user", site="s_empty", ok=False, partial=False, captcha=False,
+                         error="формат выдачи мог измениться, 0 вариантов при непустой странице",
+                         offers=0, elapsed=3.0, device=dev, ts=t0 + i)
+    settings = Settings(sites=[], storage_dir=tmp_path, metrics=store)
+    assert check_site_fuse("s_empty", settings, now=t0 + 10)[0] is False
+    reset_fuse_state()
+    # а вот капчи на двух телефонах срабатывают
+    for i, dev in enumerate(["a", "b"]):
+        store.record_run(source="user", site="s_cap", ok=False, partial=False, captcha=True,
+                         error="сайт показал капчу на телефоне", offers=0, elapsed=3.0, device=dev, ts=t0 + i)
+    assert check_site_fuse("s_cap", settings, now=t0 + 10)[0] is True
+    reset_fuse_state()

@@ -45,7 +45,9 @@ def is_unavailable(r: SiteResult) -> bool:
     if r.ok:
         return False
     err = (r.error or "").lower()
-    return bool(r.captcha) or any(w in err for w in ("капч", "блокировк", "телефон", "очередь droidhub"))
+    return bool(r.captcha) or any(
+        w in err for w in ("капч", "блокировк", "телефон", "очередь droidhub", "временно недоступен")
+    )
 
 
 def _error_line(r: SiteResult) -> str:

@@ -244,6 +244,9 @@ class MetricsStore:
                     SELECT device, ok, captcha, ts
                     FROM site_runs
                     WHERE site = ? AND ts >= ?
+                      AND (ok = 1 OR captcha = 1 OR error LIKE '%502%' OR error LIKE '%429%'
+                           OR error LIKE '%аймаут%' OR error LIKE '%недоступ%' OR error LIKE '%капч%'
+                           OR error LIKE '%сети%')
                     ORDER BY ts ASC
                     """,
                     (site, float(since_ts)),

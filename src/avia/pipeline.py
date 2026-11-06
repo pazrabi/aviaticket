@@ -882,24 +882,3 @@ async def search(
         return res
 
     return await asyncio.gather(*(guarded(s) for s in sites))
-
-
-# Добавляем распознавание «временно недоступен» в formatting.is_unavailable
-try:
-    from . import formatting as _fmt
-
-    if hasattr(_fmt, "is_unavailable") and not getattr(_fmt.is_unavailable, "_fuse_patched", False):
-        _orig_is_unavail = _fmt.is_unavailable
-
-        def _fuse_is_unavailable(r: Any) -> bool:
-            if r.ok:
-                return False
-            err = (getattr(r, "error", "") or "").lower()
-            if "временно недоступен" in err:
-                return True
-            return _orig_is_unavail(r)
-
-        _fuse_is_unavailable._fuse_patched = True  # type: ignore[attr-defined]
-        _fmt.is_unavailable = _fuse_is_unavailable
-except Exception:
-    pass
