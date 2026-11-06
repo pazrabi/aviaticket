@@ -100,6 +100,69 @@ def _hit_time_cap(priority: int, cur_stats: dict[str, Any], wait_seconds: Any) -
     return cap > 0 and fetched >= cap * 0.8
 
 
+def _can_retry_on_phone(
+    priority: int,
+    cur_stats: dict[str, Any],
+    wait_seconds: Any,
+    remaining_cands: Sequence[str] | None,
+    settings: Settings,
+    site_name: str,
+    search_started: float | None = None,
+    now: float | None = None,
+) -> bool:
+    """Проверяет, разрешён ли повтор на следующем телефоне для живого поиска.
+
+    Повтор на следующем телефоне разрешён, если «сколько уже прошло с начала поиска +
+    ожидаемое время (медиана) этой пары сайт/телефон следующего кандидата» <= live_safety_seconds.
+    Если search_started is None, используется старое поведение _hit_time_cap.
+    Фон и подписки (priority != 0) не меняются (всегда разрешён повтор при наличии кандидатов).
+    """
+    if priority != 0:
+        return not _hit_time_cap(priority, cur_stats, wait_seconds)
+
+    if search_started is None:
+        return not _hit_time_cap(priority, cur_stats, wait_seconds)
+
+    if not remaining_cands:
+        return False
+
+    cap_val = getattr(settings, "live_safety_seconds", 90.0)
+    safety_cap = float(cap_val) if cap_val is not None else 90.0
+    if safety_cap <= 0:
+        return True
+
+    next_phone = remaining_cands[0]
+
+    expected_sec: float | None = None
+    try:
+        from .speed import get_speed_table
+
+        table = get_speed_table(settings)
+        st = table.get_stats(site_name, next_phone, "live", now=now)
+        exp = st.cost if st.cost is not None else st.median_fetch
+        if exp is not None and exp > 0:
+            expected_sec = float(exp)
+    except Exception:
+        expected_sec = None
+
+    if expected_sec is None:
+        wake = float(getattr(settings, "phone_wake_seconds", 5.0) or 5.0)
+        try:
+            site_wait = float(wait_seconds or 0.0)
+        except (TypeError, ValueError):
+            site_wait = 0.0
+        expected_sec = wake + site_wait
+
+    current_ts = time.monotonic() if now is None else now
+    elapsed = max(0.0, current_ts - search_started)
+
+    return (elapsed + expected_sec) <= safety_cap
+
+
+_can_retry = _can_retry_on_phone
+can_retry_on_phone = _can_retry_on_phone
+
+
 class ParserEmptyError(Exception):
     """Исключение при 0 вариантов от парсера на непустой странице."""
 
@@ -349,6 +412,8 @@ async def _from_browser(
     device_order: list[str] | None = None,
     search_id: str | None = None,
     attempt_tracker: list[int] | None = None,
+    search_started: float | None = None,
+    now: float | None = None,
 ) -> tuple[list[Offer], str | None, bool]:
     if attempt_tracker is None:
         attempt_tracker = [0]
@@ -625,7 +690,16 @@ async def _from_browser(
                     t_first_offer=cur_stats.get("t_first_offer"),
                     t_last_improve=cur_stats.get("t_last_improve"),
                 )
-                if remaining_cands and not _hit_time_cap(priority, cur_stats, wait_seconds):
+                if remaining_cands and _can_retry_on_phone(
+                    priority,
+                    cur_stats,
+                    wait_seconds,
+                    remaining_cands,
+                    settings,
+                    site.name,
+                    search_started=search_started,
+                    now=now,
+                ):
                     try:
                         from .droidhub import _record_failure
                         _record_failure(
@@ -708,7 +782,16 @@ async def _from_browser(
                     t_first_offer=cur_stats.get("t_first_offer"),
                     t_last_improve=cur_stats.get("t_last_improve"),
                 )
-                if remaining_cands and not _hit_time_cap(priority, cur_stats, wait_seconds):
+                if remaining_cands and _can_retry_on_phone(
+                    priority,
+                    cur_stats,
+                    wait_seconds,
+                    remaining_cands,
+                    settings,
+                    site.name,
+                    search_started=search_started,
+                    now=now,
+                ):
                     try:
                         from .droidhub import _record_failure
                         _record_failure(
@@ -809,6 +892,7 @@ async def _run_site(
     device_order: list[str] | None = None,
     search_id: str | None = None,
     now: float | None = None,
+    search_started: float | None = None,
 ) -> SiteResult:
     if q.return_date and not site.url_template_rt:
         return SiteResult(
@@ -853,6 +937,8 @@ async def _run_site(
                     device_order=device_order,
                     search_id=search_id,
                     attempt_tracker=attempt_tracker,
+                    search_started=search_started,
+                    now=now,
                 )
             return await _from_browser(
                 site,
@@ -864,6 +950,8 @@ async def _run_site(
                 device_order=device_order,
                 search_id=search_id,
                 attempt_tracker=attempt_tracker,
+                search_started=search_started,
+                now=now,
             )
         except TypeError:
             try:
@@ -895,7 +983,27 @@ async def _run_site(
                         exc.snapshot_path.unlink()
                     except OSError:
                         pass
-                if _hit_time_cap(priority, stats, actual_wait_sec):
+                if phone_enabled(settings, site):
+                    cand_list = [
+                        c
+                        for c in (
+                            device_order
+                            or candidates(settings, site, priority=priority)
+                        )
+                        if c != stats.get("device")
+                    ]
+                    if not _can_retry_on_phone(
+                        priority,
+                        stats,
+                        actual_wait_sec,
+                        cand_list,
+                        settings,
+                        site.name,
+                        search_started=search_started,
+                        now=now,
+                    ):
+                        raise
+                elif _hit_time_cap(priority, stats, actual_wait_sec):
                     # упёрлись в лимит ожидания: повтор потратит столько же времени и даст то же
                     raise
                 bad_dev = stats.get("device")
@@ -1003,6 +1111,7 @@ async def search(
 ) -> list[SiteResult]:
     if search_id is None:
         search_id = uuid.uuid4().hex[:8]
+    search_started = now if now is not None else time.monotonic()
     sites = [s for s in settings.sites if s.enabled]
     # живой поиск идёт всеми сайтами сразу (телефоны сами делят работу через очередь хаба);
     # подписки и фон остаются осторожными: не больше 2 сайтов разом
@@ -1049,6 +1158,7 @@ async def search(
                     device_order=dev_order,
                     search_id=search_id,
                     now=now,
+                    search_started=search_started,
                 )
 
         if on_site_done is not None:

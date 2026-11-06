@@ -35,7 +35,6 @@ from .formatting import (
     build_report,
     date_ru,
     format_details,
-    format_late_site_notification,
     is_unavailable,
     money,
 )
@@ -501,15 +500,23 @@ class Bot:
                             on_site_done=updater.on_site_done,
                         )
                     )
-                    if self.s.live_deadline_seconds > 0:
+                    if self.s.live_safety_seconds > 0:
                         done, pending = await asyncio.wait(
                             [search_task],
-                            timeout=self.s.live_deadline_seconds,
+                            timeout=self.s.live_safety_seconds,
                         )
                         timed_out = search_task in pending
                     else:
                         await search_task
                         timed_out = False
+
+                    if timed_out:
+                        search_task.cancel()
+                        await asyncio.wait([search_task], timeout=5.0)
+                        try:
+                            search_task.exception()
+                        except (asyncio.CancelledError, asyncio.InvalidStateError):
+                            pass
             finally:
                 self._active_searches -= 1
 
@@ -521,13 +528,7 @@ class Bot:
             if not timed_out:
                 assert search_task is not None
                 results = search_task.result()
-                self._record_metrics("user", results)
-                if self.metrics is not None and results:
-                    self.metrics.record_search(  # type: ignore[attr-defined]
-                        "user", time.monotonic() - t_search0, results, queue_seconds=t_gate - t_search0
-                    )
             else:
-                assert search_task is not None
                 answered_sites = dict(updater.results_by_site)
                 results = []
                 for s in enabled_sites:
@@ -538,14 +539,19 @@ class Bot:
                             SiteResult(
                                 site=s.name,
                                 ok=False,
+                                error="сайт временно недоступен",
                                 offers=[],
-                                error="не успел к дедлайну, результат придёт отдельным сообщением",
-                                partial=False,
                             )
                         )
                 for name, res in answered_sites.items():
                     if not any(s.name == name for s in enabled_sites):
                         results.append(res)
+
+            self._record_metrics("user", results)
+            if self.metrics is not None and results:
+                self.metrics.record_search(  # type: ignore[attr-defined]
+                    "user", time.monotonic() - t_search0, results, queue_seconds=t_gate - t_search0
+                )
 
             results = assign_ids(results)
             try:
@@ -603,30 +609,6 @@ class Bot:
                 dropped_baggage=dropped_baggage,
                 dropped_criteria=dropped_criteria,
             )
-
-            if timed_out and search_task is not None:
-                card_min_price: int | None = None
-                card_min_currency: str = "RUB"
-                if flat:
-                    min_card_offer = min(flat, key=lambda o: o.price)
-                    card_min_price = min_card_offer.price
-                    card_min_currency = min_card_offer.currency
-
-                answered_site_names = set(updater.results_by_site.keys())
-                bg_coro = self._finish_late_search(
-                    chat_id=chat_id,
-                    q=q,
-                    req=req,
-                    search_task=search_task,
-                    answered_site_names=answered_site_names,
-                    card_min_price=card_min_price,
-                    card_min_currency=card_min_currency,
-                    t_search0=t_search0,
-                    t_gate=t_gate,
-                )
-                bg_task = asyncio.create_task(bg_coro)
-                self._bg_tasks.add(bg_task)
-                bg_task.add_done_callback(self._bg_tasks.discard)
         except Exception as e:
             log.exception("search failed")
             await self.send(chat_id, f"⚠️ {escape(friendly_error(e))}")
@@ -640,73 +622,6 @@ class Bot:
                         await self.call("editMessageText", chat_id=chat_id, message_id=wait_msg_id, text="Готово")
                     except Exception:
                         pass
-
-    async def _finish_late_search(
-        self,
-        chat_id: int,
-        q: Query,
-        req: SearchRequest,
-        search_task: asyncio.Task,
-        answered_site_names: set[str],
-        card_min_price: int | None,
-        card_min_currency: str,
-        t_search0: float,
-        t_gate: float,
-    ) -> None:
-        """Догоняет опоздавшие сайты в фоне, фиксирует метрики/историю и досылает билет, если найден дешевле."""
-        try:
-            real_results: list[SiteResult] = await search_task
-        except Exception as e:
-            log.exception("Фоновая задача поиска завершилась с ошибкой: %s", e)
-            return
-
-        try:
-            self._record_metrics("user", real_results)
-            if self.metrics is not None and real_results:
-                self.metrics.record_search(  # type: ignore[attr-defined]
-                    "user", time.monotonic() - t_search0, real_results, queue_seconds=t_gate - t_search0
-                )
-        except Exception:
-            log.exception("Ошибка записи метрик для фонового поиска")
-
-        real_results_assigned = assign_ids(real_results)
-        try:
-            await asyncio.to_thread(self.history.annotate, q, real_results_assigned)
-        except Exception:
-            log.exception("история цен недоступна")
-
-        try:
-            snap = self.store.get(chat_id)
-            if snap is not None and snap.query == q:
-                res_dict = {r.site: r for r in snap.results}
-                for r in real_results_assigned:
-                    res_dict[r.site] = r
-                snap.results = list(res_dict.values())
-        except Exception:
-            pass
-
-        late_results = [r for r in real_results_assigned if r.site not in answered_site_names]
-        for late_res in late_results:
-            if not late_res.ok or not late_res.offers:
-                continue
-            try:
-                late_crit, _ = apply_criteria([late_res], req.criteria)
-                late_filtered, _ = filter_by_baggage(late_crit, req.baggage_mode)
-                if not late_filtered or not late_filtered[0].offers:
-                    continue
-                min_late_offer = min(late_filtered[0].offers, key=lambda o: o.price)
-                if card_min_price is None or min_late_offer.price < card_min_price:
-                    msg = format_late_site_notification(
-                        site=late_res.site,
-                        price=min_late_offer.price,
-                        currency=min_late_offer.currency,
-                        card_min_price=card_min_price,
-                        card_min_currency=card_min_currency,
-                        page_url=late_res.page_url,
-                    )
-                    await self.send(chat_id, msg)
-            except Exception as e:
-                log.exception("Ошибка при отправке досылки для %s: %s", late_res.site, e)
 
     def _admit(self, user: dict, chat: dict | None) -> bool:
         """Пускает администраторов и (в открытом режиме) любого человека из личного чата; регистрирует в users."""

@@ -1,4 +1,6 @@
-"""Тесты для шага 5б: дедлайн живого поиска, выдача по мере готовности и досылка опоздавших."""
+"""Тесты для предохранителя живого поиска (шаг 6):
+отмена по live_safety_seconds, ответ с готовыми сайтами, недоступные сайты в конце, отсутствие досылок.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -11,6 +13,7 @@ import pytest
 
 from avia.bot import Bot, WaitMessageUpdater
 from avia.config import Settings, SiteConfig
+import avia.formatting
 from avia.models import Offer, Query, SiteResult
 from avia.pipeline import search
 
@@ -48,25 +51,33 @@ def _isolate_bot_state(tmp_path, monkeypatch):
     monkeypatch.setattr(avia.bot, "MetricsStore", lambda _path: MetricsStore(tmp_path / "metrics.sqlite"))
 
 
-def make_bot(tmp_path: Path, sites: list[SiteConfig] | None = None, deadline: float = 30.0) -> RecordingBot:
+def make_bot(tmp_path: Path, sites: list[SiteConfig] | None = None, safety_seconds: float = 90.0) -> RecordingBot:
     settings = Settings(
         sites=sites or [],
-        tg_token="dummy_token_live_deadline",
+        tg_token="dummy_token_live_safety",
         tg_allowed_ids={123},
         storage_dir=tmp_path,
-        live_deadline_seconds=deadline,
+        live_safety_seconds=safety_seconds,
     )
     return RecordingBot(settings)
 
 
+def test_finish_late_search_and_notification_removed(tmp_path):
+    """Метод Bot._finish_late_search и функция format_late_site_notification удалены."""
+    bot = make_bot(tmp_path)
+    assert not hasattr(Bot, "_finish_late_search")
+    assert not hasattr(bot, "_finish_late_search")
+    assert not hasattr(avia.formatting, "format_late_site_notification")
+
+
 @pytest.mark.asyncio
-async def test_live_deadline_all_sites_fast(tmp_path, monkeypatch):
-    """(а) Все сайты быстрее дедлайна — карточка формируется как раньше, без досылок."""
+async def test_live_safety_all_sites_fast(tmp_path, monkeypatch):
+    """Все сайты быстрее предохранителя — карточка формируется штатно, без отмен и досылок."""
     sites = [
         SiteConfig(name="fast1", url_template="http://fast1"),
         SiteConfig(name="fast2", url_template="http://fast2"),
     ]
-    bot = make_bot(tmp_path, sites=sites, deadline=2.0)
+    bot = make_bot(tmp_path, sites=sites, safety_seconds=2.0)
 
     async def fast_search(q, s, priority=0, on_site_done=None, **kwargs):
         res1 = SiteResult("fast1", True, [Offer("fast1", 5000, airline="Air1")])
@@ -86,43 +97,44 @@ async def test_live_deadline_all_sites_fast(tmp_path, monkeypatch):
     }
     await bot.handle(msg)
 
-    # Сообщение ожидания содержит имена сайтов и новый текст
     send_calls = [p for m, p in bot.calls if m == "sendMessage"]
-    assert any("обычно до 30 секунд" in p["text"] for p in send_calls)
-    assert not any("это займёт несколько минут" in p["text"] for p in send_calls)
+    assert any("5\xa0000\xa0₽" in p["text"] or "5 000" in p["text"] for p in send_calls)
 
-    # Карточка отправлена пользователю
-    assert any("5 000 ₽" in p["text"] for p in send_calls)
-
-    # Сообщение ожидания удалено
     del_calls = [m for m, _ in bot.calls if m == "deleteMessage"]
     assert len(del_calls) >= 1
 
-    # Никаких оповещений о досылке не отправлялось
-    assert not any("➕ Опоздал сайт" in p["text"] for p in send_calls)
+    # Никаких слов «не успел», «опоздал», «дедлайн»
+    for p in send_calls:
+        t = p["text"].lower()
+        assert "не успел" not in t
+        assert "опоздал" not in t
+        assert "дедлайн" not in t
 
 
 @pytest.mark.asyncio
-async def test_live_deadline_slow_site_cheaper_sends_notification(tmp_path, monkeypatch):
-    """(б) Один сайт медленнее дедлайна — карточка уходит без него, затем приходит досылка (если дешевле)."""
+async def test_live_safety_slow_site_cancelled_and_unavailable_at_end(tmp_path, monkeypatch):
+    """Поиск длиннее live_safety_seconds отменяется, ответ содержит ответившие сайты,
+
+    остальные оформлены как «временно недоступен» и в конце (💤), досылки нет.
+    """
     sites = [
         SiteConfig(name="fast_site", url_template="http://fast"),
         SiteConfig(name="slow_site", url_template="http://slow"),
     ]
-    bot = make_bot(tmp_path, sites=sites, deadline=0.2)
+    bot = make_bot(tmp_path, sites=sites, safety_seconds=0.08)
+
+    cancelled = asyncio.Event()
 
     async def slow_search(q, s, priority=0, on_site_done=None, **kwargs):
         res_fast = SiteResult("fast_site", True, [Offer("fast_site", 8000, airline="FastAir")])
         if on_site_done:
             await on_site_done(res_fast)
-        # Сайт slow_site отвечает заметно дольше дедлайна (0.2 с)
-        await asyncio.sleep(0.35)
-        res_slow = SiteResult(
-            "slow_site",
-            True,
-            [Offer("slow_site", 6500, airline="SlowAir")],
-            page_url="https://slow.test/search",
-        )
+        try:
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        res_slow = SiteResult("slow_site", True, [Offer("slow_site", 6500, airline="SlowAir")])
         if on_site_done:
             await on_site_done(res_slow)
         return [res_fast, res_slow]
@@ -138,82 +150,45 @@ async def test_live_deadline_slow_site_cheaper_sends_notification(tmp_path, monk
     await bot.handle(msg)
     elapsed = time.monotonic() - t0
 
-    # Карточка ушла человеку в районе дедлайна (~0.2 с), не дожидаясь slow_site (0.35 с)
-    assert elapsed < 0.32
+    # Сработало быстро по предохранителю (~0.08 с), не ждало 5 с
+    assert elapsed < 1.0
+    assert cancelled.is_set(), "search_task должен быть отменён"
 
-    # Проверяем, что в первой карточке указан статус slow_site с ошибкой о дедлайне
     send_texts = [p["text"] for m, p in bot.calls if m == "sendMessage"]
-    assert any("не успел к дедлайну, результат придёт отдельным сообщением" in t for t in send_texts)
-    assert any("8 000 ₽" in t for t in send_texts)
 
-    # Ждём завершения фоновой догоняющей задачи
-    await asyncio.sleep(0.25)
+    # Ответивший сайт показан в выдаче
+    assert any("8\xa0000\xa0₽" in t or "8 000" in t for t in send_texts)
 
-    # Проверяем, что после завершения пришла досылка с более дешёвой ценой и ссылкой
+    # Неответивший сайт slow_site показан как «пока недоступен» со значком 💤
+    assert any("💤" in t and "slow_site" in t and "пока недоступен" in t for t in send_texts)
+
+    # Никаких слов «не успел», «опоздал», «дедлайн» в сообщениях пользователю
+    for t in send_texts:
+        tl = t.lower()
+        assert "не успел" not in tl
+        assert "опоздал" not in tl
+        assert "дедлайн" not in tl
+
+    # Ждём немного, чтобы убедиться, что никакой досылки не отправляется
+    await asyncio.sleep(0.15)
     send_texts_after = [p["text"] for m, p in bot.calls if m == "sendMessage"]
-    late_msgs = [t for t in send_texts_after if "➕ Опоздал сайт slow_site" in t]
-    assert len(late_msgs) == 1
-    late_text = late_msgs[0]
-    assert "нашёл дешевле — 6 500 ₽ (в карточке было 8 000 ₽)" in late_text
-    assert "https://slow.test/search" in late_text
+    assert len(send_texts_after) == len(send_texts), "Никаких дополнительных сообщений/досылок"
 
 
 @pytest.mark.asyncio
-async def test_live_deadline_slow_site_expensive_no_notification(tmp_path, monkeypatch):
-    """(б) Один сайт медленнее дедлайна — если билет дороже, досылка НЕ отправляется."""
-    sites = [
-        SiteConfig(name="fast_site", url_template="http://fast"),
-        SiteConfig(name="slow_site", url_template="http://slow"),
-    ]
-    bot = make_bot(tmp_path, sites=sites, deadline=0.2)
-
-    async def slow_search(q, s, priority=0, on_site_done=None, **kwargs):
-        res_fast = SiteResult("fast_site", True, [Offer("fast_site", 5000, airline="FastAir")])
-        if on_site_done:
-            await on_site_done(res_fast)
-        await asyncio.sleep(0.35)
-        # slow_site нашёл дороже (9000 > 5000)
-        res_slow = SiteResult(
-            "slow_site",
-            True,
-            [Offer("slow_site", 9000, airline="SlowAir")],
-            page_url="https://slow.test/search",
-        )
-        if on_site_done:
-            await on_site_done(res_slow)
-        return [res_fast, res_slow]
-
-    monkeypatch.setattr("avia.bot.search", slow_search)
-
-    msg = {
-        "chat": {"id": 123},
-        "from": {"id": 123},
-        "text": "/price MOW LED 10.12",
-    }
-    await bot.handle(msg)
-
-    # Ждём фоновую задачу
-    await asyncio.sleep(0.25)
-
-    send_texts = [p["text"] for m, p in bot.calls if m == "sendMessage"]
-    # Никакой досылки не отправлялось
-    assert not any("➕ Опоздал сайт" in t for t in send_texts)
-
-
-@pytest.mark.asyncio
-async def test_live_deadline_zero_disables_deadline(tmp_path, monkeypatch):
-    """(в) live_deadline_seconds=0 — прежнее поведение (ждёт все сайты)."""
+async def test_live_safety_zero_disables_timeout(tmp_path, monkeypatch):
+    """live_safety_seconds=0 — предохранитель отключён (дожидается все сайты)."""
     sites = [
         SiteConfig(name="site1", url_template="http://site1"),
         SiteConfig(name="site2", url_template="http://site2"),
     ]
-    bot = make_bot(tmp_path, sites=sites, deadline=0)
+    bot = make_bot(tmp_path, sites=sites, safety_seconds=0)
 
     async def slow_search(q, s, priority=0, on_site_done=None, **kwargs):
         res1 = SiteResult("site1", True, [Offer("site1", 4000)])
         if on_site_done:
             await on_site_done(res1)
-        await asyncio.sleep(0.15)
+        await asyncio.sleep(0.05)
         res2 = SiteResult("site2", True, [Offer("site2", 3500)])
         if on_site_done:
             await on_site_done(res2)
@@ -226,21 +201,19 @@ async def test_live_deadline_zero_disables_deadline(tmp_path, monkeypatch):
         "from": {"id": 123},
         "text": "/price MOW LED 10.12",
     }
-    t0 = time.monotonic()
     await bot.handle(msg)
-    elapsed = time.monotonic() - t0
 
-    # Дождался оба сайта
-    assert elapsed >= 0.14
     send_texts = [p["text"] for m, p in bot.calls if m == "sendMessage"]
-    # Оба сайта попали в первоначальную карточку
-    assert not any("не успел к дедлайну" in t for t in send_texts)
-    assert not any("➕ Опоздал сайт" in t for t in send_texts)
+    assert any("3\xa0500\xa0₽" in t or "3 500" in t for t in send_texts)
+    for t in send_texts:
+        tl = t.lower()
+        assert "не успел" not in tl
+        assert "дедлайн" not in tl
 
 
 @pytest.mark.asyncio
 async def test_pipeline_search_exception_in_on_site_done_ignored(tmp_path, monkeypatch):
-    """(г) Исключение в on_site_done не ломает pipeline.search."""
+    """Исключение в on_site_done не ломает pipeline.search."""
     settings = Settings(
         sites=[
             SiteConfig(name="site1", url_template="http://s1", source="api", parser="travelpayouts"),
@@ -277,7 +250,7 @@ async def test_pipeline_search_exception_in_on_site_done_ignored(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_wait_message_throttle_interval_with_fake_clock():
-    """(д) Редактирование сообщения ожидания не чаще интервала 1.5 с (поддельные часы)."""
+    """Редактирование сообщения ожидания не чаще интервала 1.5 с (поддельные часы)."""
     calls: list[tuple[str, dict[str, Any]]] = []
 
     class DummyBot:
@@ -300,7 +273,6 @@ async def test_wait_message_throttle_interval_with_fake_clock():
         min_interval=1.5,
     )
 
-    import time
     original_monotonic = time.monotonic
 
     def fake_monotonic():
@@ -344,23 +316,23 @@ async def test_wait_message_throttle_interval_with_fake_clock():
 
 
 @pytest.mark.asyncio
-async def test_user_can_start_new_search_while_late_search_running(tmp_path, monkeypatch):
-    """Пользователь может запустить новый поиск, пока старый догоняется в фоне (chat_id не в busy)."""
+async def test_user_can_start_new_search_after_safety_cap(tmp_path, monkeypatch):
+    """После срабатывания предохранителя пользователь не заблокирован в busy."""
     sites = [
         SiteConfig(name="fast", url_template="http://fast"),
         SiteConfig(name="slow", url_template="http://slow"),
     ]
-    bot = make_bot(tmp_path, sites=sites, deadline=0.1)
+    bot = make_bot(tmp_path, sites=sites, safety_seconds=0.05)
 
     async def slow_search(q, s, priority=0, on_site_done=None, **kwargs):
         res_fast = SiteResult("fast", True, [Offer("fast", 8000)])
         if on_site_done:
             await on_site_done(res_fast)
-        await asyncio.sleep(0.3)
-        res_slow = SiteResult("slow", True, [Offer("slow", 5000)])
-        if on_site_done:
-            await on_site_done(res_slow)
-        return [res_fast, res_slow]
+        try:
+            await asyncio.sleep(5.0)
+        except asyncio.CancelledError:
+            raise
+        return [res_fast]
 
     monkeypatch.setattr("avia.bot.search", slow_search)
 
@@ -369,11 +341,10 @@ async def test_user_can_start_new_search_while_late_search_running(tmp_path, mon
         "from": {"id": 123},
         "text": "/price MOW LED 10.12",
     }
-    # Первый поиск отдаёт карточку по дедлайну
     await bot.handle(msg1)
     assert 123 not in bot.busy
 
-    # Второй поиск запускается сразу же, пока первый догоняется
+    # Второй поиск сразу запускается
     msg2 = {
         "chat": {"id": 123},
         "from": {"id": 123},
@@ -381,9 +352,5 @@ async def test_user_can_start_new_search_while_late_search_running(tmp_path, mon
     }
     await bot.handle(msg2)
 
-    # Проверяем, что не было сообщения о занятости
     busy_msgs = [p["text"] for m, p in bot.calls if m == "sendMessage" and "Предыдущий поиск ещё идёт" in p["text"]]
     assert len(busy_msgs) == 0
-
-    # Дожидаемся завершения фоновых задач
-    await asyncio.sleep(0.35)
