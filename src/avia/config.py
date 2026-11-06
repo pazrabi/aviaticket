@@ -117,6 +117,8 @@ class Settings:
     speed_refresh_seconds: int = 300
     speed_live_min_p_lower: float = 0.6
     phone_min_battery: int = 15
+    live_assignment: bool = True
+    phone_wake_seconds: float = 5.0
     metrics: Any = None
 
     def __post_init__(self) -> None:
@@ -208,6 +210,12 @@ def load_settings(path: Path | None = None) -> Settings:
         phone_min_battery = int(os.getenv("PHONE_MIN_BATTERY", "15"))
     except ValueError:
         phone_min_battery = 15
+    live_assignment_env = os.getenv("LIVE_ASSIGNMENT", "1").strip().lower()
+    live_assignment = live_assignment_env not in ("0", "false", "no", "off")
+    try:
+        phone_wake_seconds = float(os.getenv("PHONE_WAKE_SECONDS", "5.0"))
+    except ValueError:
+        phone_wake_seconds = 5.0
 
     return Settings(
         sites=sites,
@@ -268,4 +276,6 @@ def load_settings(path: Path | None = None) -> Settings:
         speed_refresh_seconds=speed_refresh_seconds,
         speed_live_min_p_lower=speed_live_min_p_lower,
         phone_min_battery=phone_min_battery,
+        live_assignment=live_assignment,
+        phone_wake_seconds=phone_wake_seconds,
     )

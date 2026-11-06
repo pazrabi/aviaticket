@@ -240,6 +240,7 @@ async def _from_browser(
     weight: int = 0,
     stats: dict | None = None,
     exclude_devices: set[str] | None = None,
+    device_order: list[str] | None = None,
 ) -> tuple[list[Offer], str | None, bool]:
     extra = await resolve_extra(site, q)
     url = build_url(site, q, extra=extra)
@@ -292,6 +293,15 @@ async def _from_browser(
             filtered = [c for c in remaining_cands if c not in exclude_devices]
             if filtered:
                 remaining_cands = filtered
+        if priority == 0 and device_order:
+            order_seen: set[str] = set()
+            ordered_part: list[str] = []
+            for d in device_order:
+                if d in remaining_cands and d not in order_seen:
+                    order_seen.add(d)
+                    ordered_part.append(d)
+            rest_part = [d for d in remaining_cands if d not in order_seen]
+            remaining_cands = ordered_part + rest_part
         last_snap = None
         last_finished = True
         last_exc: Exception | None = None
@@ -458,6 +468,7 @@ async def _run_site(
     *,
     priority: int = 0,
     guard: SearchGuard | None = None,
+    device_order: list[str] | None = None,
 ) -> SiteResult:
     if q.return_date and not site.url_template_rt:
         return SiteResult(
@@ -479,7 +490,14 @@ async def _run_site(
         try:
             if exclude:
                 return await _from_browser(
-                    site, q, settings, priority=priority, weight=weight, stats=stats, exclude_devices=exclude
+                    site,
+                    q,
+                    settings,
+                    priority=priority,
+                    weight=weight,
+                    stats=stats,
+                    exclude_devices=exclude,
+                    device_order=device_order,
                 )
             return await _from_browser(
                 site,
@@ -488,9 +506,24 @@ async def _run_site(
                 priority=priority,
                 weight=weight,
                 stats=stats,
+                device_order=device_order,
             )
         except TypeError:
-            return await _from_browser(site, q, settings)
+            try:
+                if exclude:
+                    return await _from_browser(
+                        site, q, settings, priority=priority, weight=weight, stats=stats, exclude_devices=exclude
+                    )
+                return await _from_browser(
+                    site,
+                    q,
+                    settings,
+                    priority=priority,
+                    weight=weight,
+                    stats=stats,
+                )
+            except TypeError:
+                return await _from_browser(site, q, settings)
 
     async def _fetch() -> tuple[list[Offer], str | None, bool]:
         if site.source == "api":
@@ -610,6 +643,16 @@ async def search(
     sem = asyncio.Semaphore(max(1, int(limit)))
     g = guard if guard is not None else globals()["guard"]
 
+    device_assignments: dict[str, list[str]] = {}
+    if priority == 0 and getattr(settings, "live_assignment", True):
+        try:
+            from .dispatcher import plan_live_assignment
+
+            device_assignments = plan_live_assignment(settings, sites)
+        except Exception as e:
+            log.warning("Ошибка при расчёте live assignment: %s", e)
+            device_assignments = {}
+
     async def guarded(s: SiteConfig) -> SiteResult:
         if q.return_date and not s.url_template_rt:
             return SiteResult(
@@ -618,7 +661,8 @@ async def search(
                 offers=[],
                 error="для этого сайта обратные билеты пока не поддерживаются",
             )
+        dev_order = device_assignments.get(s.name)
         async with sem:
-            return await _run_site(s, q, settings, priority=priority, guard=g)
+            return await _run_site(s, q, settings, priority=priority, guard=g, device_order=dev_order)
 
     return await asyncio.gather(*(guarded(s) for s in sites))
