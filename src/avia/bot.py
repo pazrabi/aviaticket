@@ -183,13 +183,16 @@ class Bot:
         self.http = httpx.AsyncClient(timeout=70)
         self.busy: set[int] = set()
         self.users = UserStore(settings.storage_dir / "users.sqlite")
-        self.phones = PhoneRegistry(
-            storage_dir=settings.storage_dir,
-            phones_new_policy=getattr(settings, "phones_new_policy", "check"),
-            phones_snapshot_ttl_seconds=getattr(settings, "phones_snapshot_ttl_seconds", 180),
-            phones_hold=getattr(settings, "phones_hold", None),
-        )
-        self.s.phones = self.phones
+        if getattr(settings, "phones", None) is not None:
+            self.phones = settings.phones
+        else:
+            self.phones = PhoneRegistry(
+                storage_dir=settings.storage_dir,
+                phones_new_policy=getattr(settings, "phones_new_policy", "check"),
+                phones_snapshot_ttl_seconds=getattr(settings, "phones_snapshot_ttl_seconds", 180),
+                phones_hold=getattr(settings, "phones_hold", None),
+            )
+            self.s.phones = self.phones
         self._phones_fail_count: int = 0
         self._phones_task: asyncio.Task | None = None
         try:
@@ -225,6 +228,7 @@ class Bot:
         self._last_manual_backup_at: float = 0.0
         self._last_parser_watch: float = 0.0
         self._last_samples_check: float = 0.0
+        self._last_soft_allow: float = 0.0
         try:
             from .samples import install_sample_hook
             install_sample_hook()
@@ -1692,6 +1696,22 @@ class Bot:
                             self._last_parser_watch = time.time()
                         except Exception:
                             log.exception("ошибка проверки парсеров в parser_watch")
+
+                if getattr(self.s, "soft_allow_enabled", True):
+                    if time.time() - getattr(self, "_last_soft_allow", 0.0) >= 1800:
+                        self._last_soft_allow = time.time()
+                        try:
+                            from .phone_check import probe_denied_pairs
+
+                            async def _run_soft_allow() -> None:
+                                try:
+                                    await probe_denied_pairs(self.s, bot=self)
+                                except Exception:
+                                    log.exception("ошибка мягкого sites_allow")
+
+                            asyncio.create_task(_run_soft_allow())
+                        except Exception:
+                            log.exception("ошибка запуска фоновой проверки мягкого sites_allow")
 
                 if time.time() - self._last_samples_check >= 7 * 86400:
                     try:

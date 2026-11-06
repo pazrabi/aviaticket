@@ -223,6 +223,7 @@ class PhoneRegistry:
                         "sites_allow": None,
                         "sites_deny": [],
                         "note": "",
+                        "probe_at": {},
                     }
                     self._phones[dev_id] = entry
                     changed = True
@@ -384,6 +385,40 @@ class PhoneRegistry:
             self._save_locked()
             return True
 
+    def get_probe_at(self, id: str, site_name: str | None = None) -> Any:
+        """Возвращает время последней пробы сайта на телефоне или словарь {site: ts}."""
+        clean_id = str(id).strip()
+        with self._lock:
+            entry = self._phones.get(clean_id)
+            if entry is None:
+                return None if site_name is not None else {}
+            probes = entry.get("probe_at")
+            if not isinstance(probes, dict):
+                probes = {}
+            if site_name is not None:
+                return probes.get(str(site_name).strip())
+            return dict(probes)
+
+    def set_probe_at(self, id: str, site_name: str, ts: float | None = None) -> bool:
+        """Устанавливает время последней пробы пары (сайт, телефон) и сохраняет на диск."""
+        clean_id = str(id).strip()
+        clean_site = str(site_name).strip()
+        if not clean_id or not clean_site:
+            return False
+        if ts is None:
+            ts_val = time.time()
+        else:
+            ts_val = float(ts)
+        with self._lock:
+            entry = self._phones.get(clean_id)
+            if entry is None:
+                return False
+            if "probe_at" not in entry or not isinstance(entry["probe_at"], dict):
+                entry["probe_at"] = {}
+            entry["probe_at"][clean_site] = ts_val
+            self._save_locked()
+            return True
+
     def register(
         self,
         id: str,
@@ -393,6 +428,7 @@ class PhoneRegistry:
         sites_deny: list[str] | None = None,
         note: str = "",
         first_seen: float | None = None,
+        probe_at: dict[str, float] | None = None,
     ) -> None:
         """Регистрирует устройство напрямую в реестре (для инициализации и тестов)."""
         clean_id = str(id).strip()
@@ -405,6 +441,7 @@ class PhoneRegistry:
                 "sites_allow": sites_allow,
                 "sites_deny": sites_deny or [],
                 "note": note,
+                "probe_at": dict(probe_at) if probe_at else {},
             }
             self._is_first_refresh = False
             self._save_locked()
@@ -421,6 +458,7 @@ class PhoneRegistry:
                 item["is_hold_env"] = self._is_held_by_env(dev_id)
                 item["note"] = entry.get("note", "")
                 item["checking"] = dev_id in self._checking
+                item["probe_at"] = dict(entry.get("probe_at") or {})
                 if snap is not None:
                     age = now_mono - snap.updated_at
                     item["online"] = snap.online

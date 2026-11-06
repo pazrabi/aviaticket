@@ -125,6 +125,9 @@ class Settings:
     site_fuse_window_seconds: int = 300
     site_fuse_min_phones: int = 2
     site_fuse_probe_seconds: int = 600
+    soft_allow_enabled: bool = True
+    soft_allow_interval_hours: float = 24.0
+    soft_allow_max_pairs_per_run: int = 2
     metrics: Any = None
 
     def __post_init__(self) -> None:
@@ -245,6 +248,17 @@ def load_settings(path: Path | None = None) -> Settings:
     except ValueError:
         site_fuse_probe_seconds = 600
 
+    soft_allow_env = os.getenv("SOFT_ALLOW", "1").strip().lower()
+    soft_allow_enabled = soft_allow_env not in ("0", "false", "False", "no", "off")
+    try:
+        soft_allow_interval_hours = float(os.getenv("SOFT_ALLOW_INTERVAL_HOURS", "24"))
+    except ValueError:
+        soft_allow_interval_hours = 24.0
+    try:
+        soft_allow_max_pairs = int(os.getenv("SOFT_ALLOW_MAX_PAIRS", "2"))
+    except ValueError:
+        soft_allow_max_pairs = 2
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -312,6 +326,9 @@ def load_settings(path: Path | None = None) -> Settings:
         site_fuse_window_seconds=site_fuse_window_seconds,
         site_fuse_min_phones=site_fuse_min_phones,
         site_fuse_probe_seconds=site_fuse_probe_seconds,
+        soft_allow_enabled=soft_allow_enabled,
+        soft_allow_interval_hours=soft_allow_interval_hours,
+        soft_allow_max_pairs_per_run=soft_allow_max_pairs,
     )
 
 

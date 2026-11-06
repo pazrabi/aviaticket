@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import copy
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from html import escape
 import logging
 from pathlib import Path
@@ -662,3 +662,229 @@ async def run_phone_check(
     finally:
         reg.set_checking(clean_id, False)
         set_checking(clean_id, False)
+
+
+_soft_allow_lock: asyncio.Lock = asyncio.Lock()
+_soft_allow_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _get_soft_allow_lock() -> asyncio.Lock:
+    global _soft_allow_lock, _soft_allow_loop
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _soft_allow_loop is not loop:
+        _soft_allow_lock = asyncio.Lock()
+        _soft_allow_loop = loop
+    return _soft_allow_lock
+
+
+def _is_pass_good(p: PassResult, ref_price: float | None = None) -> bool:
+    """True, если проход успешный и цена не расходится с эталоном более чем на 15%."""
+    if not p.ok or p.captcha or p.offers_count == 0:
+        return False
+    if not (p.results_complete or p.offers_count >= 5):
+        return False
+    if ref_price is not None and ref_price > 0 and p.min_price is not None:
+        diff = abs(p.min_price - ref_price) / ref_price
+        if diff > 0.15:
+            return False
+    return True
+
+
+async def probe_denied_pairs(
+    settings: Settings,
+    bot: Any = None,
+    *,
+    now: float | None = None,
+    max_pairs: int | None = None,
+) -> list[tuple[str, str, bool]]:
+    """Периодическая мягкая перепроверка запрещённых пар сайт × телефон (soft sites_allow).
+
+    Возвращает список проверенных пар [(site_name, phone_id, is_ok), ...].
+    """
+    cur_now = time.time() if now is None else float(now)
+    cur_date = date.fromtimestamp(cur_now)
+    ctrl_depart = cur_date + timedelta(days=DEFAULT_CONTROL_DAYS_AHEAD)
+    query = Query(
+        origin=DEFAULT_CONTROL_ORIGIN,
+        destination=DEFAULT_CONTROL_DESTINATION,
+        depart=ctrl_depart,
+        adults=1,
+    )
+
+    limit = max_pairs if max_pairs is not None else getattr(settings, "soft_allow_max_pairs_per_run", 2)
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 2
+
+    if limit <= 0:
+        return []
+
+    lock = _get_soft_allow_lock()
+    if lock.locked():
+        logger.debug("probe_denied_pairs: предыдущий запуск ещё не завершён")
+        return []
+
+    async with lock:
+        reg = getattr(settings, "phones", None)
+        if reg is None:
+            if bot is not None and getattr(bot, "phones", None) is not None:
+                reg = bot.phones
+                settings.phones = reg
+            else:
+                from .phones import PhoneRegistry
+                reg = PhoneRegistry(settings.storage_dir)
+                settings.phones = reg
+
+        metrics_store = None
+        if bot is not None and getattr(bot, "metrics", None) is not None:
+            metrics_store = bot.metrics
+        elif getattr(settings, "metrics", None) is not None:
+            metrics_store = settings.metrics
+        else:
+            try:
+                metrics_store = MetricsStore(Path(settings.storage_dir) / "metrics.sqlite")
+            except Exception:
+                metrics_store = None
+
+        from .speed import get_speed_table
+        speed_table = get_speed_table(settings)
+
+        interval_hours = float(getattr(settings, "soft_allow_interval_hours", 24.0))
+        interval_seconds = interval_hours * 3600.0
+
+        results: list[tuple[str, str, bool]] = []
+        all_phones = reg.all()
+
+        for dev_id, phone_info in all_phones.items():
+            if len(results) >= limit:
+                break
+
+            # Телефон со статусом 'active'
+            if phone_info.get("status") != "active":
+                continue
+
+            # Не в PHONES_HOLD
+            if phone_info.get("is_hold_env", False):
+                continue
+
+            # Телефон не помечен «проверяется»
+            if reg.is_checking(dev_id) or is_checking(dev_id):
+                continue
+
+            # Доступен в хабе: онлайн и свежий снимок состояния
+            # если определить нельзя — пропусти телефон
+            if phone_info.get("online") is not True or not phone_info.get("is_online_fresh", False):
+                continue
+
+            # Телефон не занят в хабе
+            if phone_info.get("busy"):
+                continue
+
+            # Телефон не занят живым поиском в droidhub
+            try:
+                from .droidhub import _is_device_available
+                if not _is_device_available(dev_id):
+                    continue
+            except Exception:
+                pass
+
+            # sites_allow: если sites_allow is None — телефон допущен везде, пропусти
+            sites_allow = phone_info.get("sites_allow")
+            if sites_allow is None:
+                continue
+
+            allowed_set = set(sites_allow)
+
+            # Включённые browser-сайты с phone из settings.sites, отсутствующие в его sites_allow
+            denied_sites = [
+                s for s in settings.sites
+                if getattr(s, "enabled", True)
+                and getattr(s, "source", "browser") == "browser"
+                and getattr(s, "phone", None)
+                and s.name not in allowed_set
+            ]
+
+            for site in denied_sites:
+                if len(results) >= limit:
+                    break
+
+                # Кулдаун капчи: если in_quarantine и consecutive_captchas > 0 — НЕ пробуй
+                pst = speed_table.get_pair_status(site.name, dev_id, now=cur_now)
+                if pst.in_quarantine and pst.consecutive_captchas > 0:
+                    continue
+
+                # Интервал: последняя проба не меньше soft_allow_interval_hours назад
+                last_probe = reg.get_probe_at(dev_id, site.name)
+                if last_probe is not None and (cur_now - float(last_probe)) < interval_seconds:
+                    continue
+
+                # Проверка пары
+                ref_price = get_reference_price(settings, site.name, query, exclude_device=dev_id, now=cur_now)
+                passes: list[PassResult] = []
+                good_streak = 0
+
+                reg.set_checking(dev_id, True)
+                try:
+                    for pass_num in range(1, 4):
+                        p_res = await run_site_pass(
+                            settings=settings,
+                            site=site,
+                            query=query,
+                            device_id=dev_id,
+                            pass_num=pass_num,
+                            metrics=metrics_store,
+                        )
+                        passes.append(p_res)
+
+                        if _is_pass_good(p_res, ref_price):
+                            good_streak += 1
+                        else:
+                            good_streak = 0
+
+                        # Прерывайся, если 2 успешных подряд
+                        if good_streak >= 2:
+                            break
+                        # Или если первые два провалились
+                        if pass_num == 2 and not any(_is_pass_good(p, ref_price) for p in passes):
+                            break
+                finally:
+                    reg.set_checking(dev_id, False)
+
+                good_passes = [p for p in passes if _is_pass_good(p, ref_price)]
+                is_ok = len(good_passes) >= 2
+
+                # Обновляем probe_at
+                reg.set_probe_at(dev_id, site.name, cur_now)
+
+                if is_ok:
+                    current_entry = reg.get(dev_id) or {}
+                    cur_allow = list(current_entry.get("sites_allow") or [])
+                    if site.name not in cur_allow:
+                        cur_allow.append(site.name)
+                    cur_deny = [s for s in (current_entry.get("sites_deny") or []) if s != site.name]
+                    reg.set_sites(dev_id, allow=cur_allow, deny=cur_deny)
+                    allowed_set.add(site.name)
+
+                    date_str = cur_date.isoformat()
+                    reg.set_note(dev_id, f"Допущен: {site.name} (авто, {date_str})")
+
+                    phone_name = current_entry.get("name") or dev_id
+                    notify_msg = f"✅ Телефон {phone_name} снова допущен на {site.name}"
+                    if bot is not None:
+                        notify_fn = getattr(bot, "_notify_admins", None)
+                        if notify_fn is None and hasattr(bot, "bot"):
+                            notify_fn = getattr(bot.bot, "_notify_admins", None)
+                        if callable(notify_fn):
+                            try:
+                                await notify_fn(notify_msg)
+                            except Exception as e:
+                                logger.warning("Ошибка оповещения админов: %s", e)
+
+                results.append((site.name, dev_id, is_ok))
+
+        return results
+
