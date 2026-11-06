@@ -130,6 +130,10 @@ class JobsUnsupported(DroidhubError):
 _jobs_unsupported: bool = False
 # Сайты, где задание хаба не отдало ни одного ответа (а старый fetch_page отдаёт): {сайт: до какого времени без заданий}
 _jobs_bad_sites: dict[str, float] = {}
+# Счётчик ударов на сайт: {сайт: [список монотонных моментов]}
+_jobs_bad_strikes: dict[str, list[float]] = {}
+JOBS_BAD_WINDOW_SECONDS: float = 1800.0
+JOBS_BAD_FIRST_SECONDS: float = 300.0
 JOBS_BAD_SITE_SECONDS: float = 21600.0
 POLL_MIN_INTERVAL: float = 0.3
 DELETE_TIMEOUT: float = 3.0
@@ -140,6 +144,7 @@ def reset_jobs_supported() -> None:
     global _jobs_unsupported
     _jobs_unsupported = False
     _jobs_bad_sites.clear()
+    _jobs_bad_strikes.clear()
 
 
 def _sync_loop_state() -> asyncio.AbstractEventLoop | None:
@@ -1288,8 +1293,19 @@ async def fetch_page_snapshot_any(
                         # задание закончилось без единого ответа: хаб в этом режиме не видит выдачу сайта.
                         # Старый fetch_page её видит, поэтому берём его сразу и на время отключаем задания для сайта.
                         bad_name = site_name or _infer_site_name(url)
-                        _jobs_bad_sites[bad_name] = time.monotonic() + JOBS_BAD_SITE_SECONDS
-                        logger.warning("Задание хаба для %s не отдало ответов, переходим на fetch_page на %d с (до починки хаба)", bad_name, int(JOBS_BAD_SITE_SECONDS))
+                        now = time.monotonic()
+                        cutoff = now - JOBS_BAD_WINDOW_SECONDS
+                        strikes = [t for t in _jobs_bad_strikes.get(bad_name, []) if t >= cutoff]
+                        strikes.append(now)
+                        _jobs_bad_strikes[bad_name] = strikes
+                        pause_sec = JOBS_BAD_FIRST_SECONDS if len(strikes) == 1 else JOBS_BAD_SITE_SECONDS
+                        _jobs_bad_sites[bad_name] = now + pause_sec
+                        logger.warning(
+                            "Задание хаба для %s не отдало ответов (ударов: %d), переходим на fetch_page на %d с (до починки хаба)",
+                            bad_name,
+                            len(strikes),
+                            int(pause_sec),
+                        )
                         snap, finished = await _fetch_device_snapshot(
                             settings,
                             dev,
@@ -1304,6 +1320,8 @@ async def fetch_page_snapshot_any(
                             stats["fetch_seconds"] = fetch_sec
                             stats["tried"] = list(tried)
                         return snap, finished
+                    if snap.json_payloads:
+                        _jobs_bad_strikes.pop(site_name or _infer_site_name(url), None)
                     fetch_sec = time.monotonic() - t_fetch_start
                     if stats is not None:
                         stats["fetch_seconds"] = fetch_sec
