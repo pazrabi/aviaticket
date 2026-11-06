@@ -713,3 +713,19 @@ def format_details(o: Offer, q: Query) -> str:
         lines.append(f"<i>Цена снята в {datetime.fromtimestamp(o.fetched_at):%H:%M}</i>")
 
     return "\n".join(lines).strip()
+
+
+def format_late_site_notification(
+    site: str,
+    price: int,
+    currency: str,
+    card_min_price: int | None,
+    card_min_currency: str = "RUB",
+    page_url: str | None = None,
+) -> str:
+    """Форматирует отдельное короткое сообщение об опоздавшем сайте, нашедшем билет дешевле."""
+    price_str = money(price, currency)
+    card_str = money(card_min_price, card_min_currency) if card_min_price is not None else "—"
+    link = f' — <a href="{escape(page_url, quote=True)}">открыть выдачу</a>' if page_url else ""
+    return f"➕ Опоздал сайт {site}: нашёл дешевле — {price_str} (в карточке было {card_str}){link}"
+

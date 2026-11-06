@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
+import inspect
 import json
 import logging
 from pathlib import Path
 import re
 import time
+from typing import Awaitable, Callable
 
 from .collector import fetch_snapshot, Snapshot
 from .config import Settings, SiteConfig
@@ -635,6 +637,7 @@ async def search(
     *,
     priority: int = 0,
     guard: SearchGuard | None = None,
+    on_site_done: Callable[[SiteResult], Awaitable[None] | None] | None = None,
 ) -> list[SiteResult]:
     sites = [s for s in settings.sites if s.enabled]
     # живой поиск идёт всеми сайтами сразу (телефоны сами делят работу через очередь хаба);
@@ -655,14 +658,24 @@ async def search(
 
     async def guarded(s: SiteConfig) -> SiteResult:
         if q.return_date and not s.url_template_rt:
-            return SiteResult(
+            res = SiteResult(
                 site=s.name,
                 ok=False,
                 offers=[],
                 error="для этого сайта обратные билеты пока не поддерживаются",
             )
-        dev_order = device_assignments.get(s.name)
-        async with sem:
-            return await _run_site(s, q, settings, priority=priority, guard=g, device_order=dev_order)
+        else:
+            dev_order = device_assignments.get(s.name)
+            async with sem:
+                res = await _run_site(s, q, settings, priority=priority, guard=g, device_order=dev_order)
+
+        if on_site_done is not None:
+            try:
+                ret = on_site_done(res)
+                if inspect.isawaitable(ret):
+                    await ret
+            except Exception as e:
+                log.exception("Исключение в on_site_done для сайта %s: %s", s.name, e)
+        return res
 
     return await asyncio.gather(*(guarded(s) for s in sites))

@@ -119,6 +119,7 @@ class Settings:
     phone_min_battery: int = 15
     live_assignment: bool = True
     phone_wake_seconds: float = 5.0
+    live_deadline_seconds: float = 30.0
     metrics: Any = None
 
     def __post_init__(self) -> None:
@@ -216,6 +217,10 @@ def load_settings(path: Path | None = None) -> Settings:
         phone_wake_seconds = float(os.getenv("PHONE_WAKE_SECONDS", "5.0"))
     except ValueError:
         phone_wake_seconds = 5.0
+    try:
+        live_deadline_seconds = float(os.getenv("LIVE_DEADLINE_SECONDS", "30"))
+    except ValueError:
+        live_deadline_seconds = 30.0
 
     return Settings(
         sites=sites,
@@ -278,4 +283,5 @@ def load_settings(path: Path | None = None) -> Settings:
         phone_min_battery=phone_min_battery,
         live_assignment=live_assignment,
         phone_wake_seconds=phone_wake_seconds,
+        live_deadline_seconds=live_deadline_seconds,
     )
