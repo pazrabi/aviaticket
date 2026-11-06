@@ -8,8 +8,6 @@ from .criteria import SearchCriteria
 from .filters import (
     BALANCE_MIN_SAVING_MINUTES,
     BALANCE_MIN_SAVING_SHARE,
-    MIDDLE_MIN_TIME_GAIN_MINUTES,
-    MIDDLE_MIN_TIME_GAIN_RATIO,
     SITE_TOP_BALANCE,
     SITE_TOP_CHEAP,
     SITE_TOP_FAST,
@@ -17,7 +15,6 @@ from .filters import (
     pick_cards,
     pick_site_top,
     total_duration_minutes,
-    total_transfers,
 )
 from .models import Leg, Offer, Query, SiteResult
 from .offers import baggage_state, compute_offer_id, merge_same_flights
@@ -539,9 +536,9 @@ def build_report(
             unique_site_offers.append(o)
 
         target_site_top = (
-            (settings.site_top_cheap + settings.site_top_balance + settings.site_top_fast)
-            if settings and hasattr(settings, "site_top_cheap")
-            else (SITE_TOP_CHEAP + SITE_TOP_BALANCE + SITE_TOP_FAST)
+            getattr(settings, "site_top_cheap", SITE_TOP_CHEAP)
+            + getattr(settings, "site_top_balance", SITE_TOP_BALANCE)
+            + getattr(settings, "site_top_fast", SITE_TOP_FAST)
         )
 
         if top_n is not None and top_n > target_site_top:
@@ -757,15 +754,6 @@ def build_compact_report(
     pool = pareto + others
 
     cards = pick_cards(pool, criteria, settings=settings, baggage_mode=baggage_mode)
-    # Совместимость с test_compact_report_best_balance_card_only_with_hour_cost,
-    # который ожидает ровно 2 карточки без hour_cost на тестовых данных [10000, 25000, 13000].
-    if (
-        criteria.hour_cost is None
-        and len(pool) == 3
-        and [o.price for o in pool] == [10000, 13000, 25000]
-        and [getattr(o, "duration", None) for o in pool] == ["10 ч", "3 ч", "2 ч"]
-    ):
-        cards = [c for c in cards if c[0] != "Золотая середина"]
     flat = [o for _, o in cards]
 
     header_lines = _trip_head(q)
