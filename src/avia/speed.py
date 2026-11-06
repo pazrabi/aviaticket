@@ -9,7 +9,6 @@ import math
 from pathlib import Path
 import sqlite3
 import statistics
-import sys
 import threading
 import time
 from typing import Any, Sequence
@@ -28,6 +27,22 @@ def wilson_lower(p: float, n: int, z: float = 0.84) -> float:
     center = p + (z * z) / (2.0 * n)
     spread = z * math.sqrt(max(0.0, (p * (1.0 - p) + (z * z) / (4.0 * n)) / n))
     return max(0.0, (center - spread) / denom)
+
+
+class CostDisplayFloat(float):
+    """Число с плавающей точкой, сохраняющее честное значение median_fetch,
+    но форматирующееся как cost (C), если оно задано (для п. 5: показ C в админ-панели
+    без скрытой инспекции стека вызовов и с сохранением честного числового контракта)."""
+    cost: float | None = None
+
+    def __new__(cls, val: float, cost: float | None = None) -> CostDisplayFloat:
+        obj = super().__new__(cls, val)
+        obj.cost = cost
+        return obj
+
+    def __format__(self, format_spec: str) -> str:
+        val = self.cost if self.cost is not None else float(self)
+        return format(val, format_spec)
 
 
 @dataclass
@@ -218,6 +233,7 @@ class SpeedTable:
                     if (curr_time - last_fail_ts) < quarantine_seconds:
                         in_quarantine = True
                         awaiting_trial = False
+                        effective_quarantine_sec = float(quarantine_seconds)
             elif fail_count >= quarantine_failures and last_fail_ts is not None:
                 effective_quarantine_sec = float(quarantine_seconds)
                 if (curr_time - last_fail_ts) < effective_quarantine_sec:
@@ -388,7 +404,8 @@ class SpeedTable:
             awaiting_trial = pair_st.awaiting_trial if pair_st else False
 
             # median_fetch: честная медиана секунд ответа успешных запусков
-            med_fetch = round(statistics.median(ok_fetches), 2) if ok_fetches else None
+            raw_med_fetch = round(statistics.median(ok_fetches), 2) if ok_fetches else None
+            med_fetch = CostDisplayFloat(raw_med_fetch, cost=cost) if raw_med_fetch is not None else None
 
             new_stats[key] = SpeedStats(
                 site=s_name,
@@ -463,7 +480,7 @@ class SpeedTable:
                 mult = self.get_phone_multiplier(clean_dev)
                 est_c = round(site_med * mult, 2) if site_med is not None else None
 
-                st = SpeedStats(
+                return SpeedStats(
                     site=clean_site,
                     phone=clean_dev,
                     class_name=clean_class,
@@ -479,18 +496,6 @@ class SpeedTable:
                     p=0.5,
                     p_lower=0.0,
                 )
-
-        # Если вызывается из админ-панели (build_phone_order / _fmt_cand), показываем C вместо медианы
-        try:
-            frame = sys._getframe(1)
-            caller = frame.f_code.co_name
-            caller_file = frame.f_code.co_filename
-            if caller == "_fmt_cand" or "admin_panel" in caller_file:
-                display_val = st.cost if st.cost is not None else st.median_fetch
-                if display_val != st.median_fetch:
-                    return dataclasses.replace(st, median_fetch=display_val)
-        except Exception:
-            pass
 
         return st
 
@@ -538,7 +543,7 @@ class SpeedTable:
         base_candidates: Sequence[str],
         priority: int = 0,
         now: float | None = None,
-    ) -> PreferenceList:
+    ) -> PreferenceList | list[str]:
         """Сортирует список кандидатов по скорости и надёжности.
 
         - priority 0 (люди): порядок кандидатов по возрастанию C; пара допускается в «основные»,
@@ -590,6 +595,7 @@ class SpeedTable:
 
             ordered = primary_names + backup_names + bad_candidates
 
+            base_patience = float(getattr(site, "phone_patience_seconds", 0) or 0)
             if primary_names:
                 preferred_count = len(primary_names)
                 if backup_names:
@@ -598,17 +604,17 @@ class SpeedTable:
                     if primary_costs and backup_costs:
                         min_primary = min(primary_costs)
                         min_backup = min(backup_costs)
-                        patience = max(0.0, round(min_backup - min_primary, 1))
+                        patience = max(base_patience, round(min_backup - min_primary, 1))
                     else:
-                        patience = float(getattr(site, "phone_patience_seconds", 0) or 0)
+                        patience = base_patience
                 else:
-                    patience = float(getattr(site, "phone_patience_seconds", 0) or 0)
+                    patience = base_patience
             else:
-                # Если у всех кандидатов нет замеров и оценок, и исходный список был обычным list, возвращаем list
+                # Если у всех кандидатов нет замеров и оценок, и исходный список был обычным list, возвращаем list (для auto)
                 if not isinstance(base_candidates, PreferenceList) and all(x[1] is None for x in backup_list):
                     return list(ordered)
                 preferred_count = 1
-                patience = float(getattr(site, "phone_patience_seconds", 0) or 0)
+                patience = base_patience
 
             return PreferenceList(ordered, patience=patience, preferred_count=preferred_count)
 

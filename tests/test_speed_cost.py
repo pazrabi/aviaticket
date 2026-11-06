@@ -6,6 +6,7 @@ import time
 import pytest
 
 from avia.config import Settings, SiteConfig
+from avia.droidhub import PreferenceList
 from avia.metrics import MetricsStore
 from avia.speed import SpeedTable, get_speed_table, reset_speed_tables, wilson_lower
 
@@ -491,4 +492,107 @@ def test_unified_phone_multiplier_across_classes(tmp_path):
     st_live = table.get_stats("site_2", "phone_bg_only", "live")
     assert st_live.n == 0
     assert st_live.cost == 20.0
+
+
+# ---------------------------------------------------------------------------
+# 10. Проверка замечаний ревьюера: quarantine_seconds при 502 после капчи,
+# patience не падает ниже site.phone_patience_seconds, PreferenceList всегда
+# ---------------------------------------------------------------------------
+
+
+def test_502_quarantine_after_captcha_resets_quarantine_seconds(tmp_path):
+    """При переходе в карантин по 502 во время awaiting_trial после капчи quarantine_seconds сбрасывается в 600 с."""
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+    site = SiteConfig(name="as", url_template="https://test", phone="dev_trial,dev_other")
+    settings = Settings(sites=[site], storage_dir=tmp_path, metrics=store, speed_quarantine_seconds=600)
+    table = get_speed_table(settings)
+
+    # Капча в t=1000 -> кулдаун 1 ч (3600 с)
+    store.record_run("user", "as", ok=False, partial=False, captcha=True, error="captcha",
+                     offers=0, elapsed=1.0, ts=1000.0, device="dev_trial", priority=0)
+
+    # Через 3601 с (t=4601) кулдаун капчи истек -> awaiting_trial, quarantine_seconds=3600
+    table.refresh(now=4601.0)
+    pst = table.get_pair_status("as", "dev_trial", now=4601.0)
+    assert pst.in_quarantine is False
+    assert pst.awaiting_trial is True
+    assert pst.quarantine_seconds == 3600.0
+
+    # Во время попыток пара ловит 3 провала подряд 502 (в t=4602, t=4603, t=4604)
+    for i in range(3):
+        store.record_run("bg", "as", ok=False, partial=False, captcha=False, error="502",
+                         offers=0, elapsed=1.0, ts=4602.0 + i, device="dev_trial", priority=2)
+
+    # В t=4605 пара уходит в карантин по 502 (3 провала) на 10 минут (600 с)
+    table.refresh(now=4605.0)
+    pst_502 = table.get_pair_status("as", "dev_trial", now=4605.0)
+    assert pst_502.in_quarantine is True
+    assert pst_502.awaiting_trial is False
+    # Длительность карантина должна быть 600.0 с (а не 3600.0 с)
+    assert pst_502.quarantine_seconds == 600.0
+
+
+def test_live_search_patience_not_below_site_patience_when_backup_cost_smaller(tmp_path):
+    """Терпение живого поиска не сбрасывается ниже site.phone_patience_seconds, даже если cost запасного меньше."""
+    db_path = tmp_path / "metrics.sqlite"
+    store = MetricsStore(db_path)
+    t0 = time.time() - 3600.0
+
+    # dev_primary: проверенный, надёжный (p_lower >= 0.6) на as, cost = 20.0 с
+    for i in range(10):
+        store.record_run("user", "as", ok=True, partial=False, captcha=False, error=None,
+                         offers=5, elapsed=20.0, ts=t0 + i, device="dev_primary", fetch_seconds=20.0, priority=0)
+
+    # dev_backup: имеет замеры на other_site (быстрый, multiplier = 10 / 20 = 0.5)
+    for i in range(6):
+        store.record_run("user", "other_site", ok=True, partial=False, captcha=False, error=None,
+                         offers=5, elapsed=20.0, ts=t0 + i, device="dev_slow", fetch_seconds=20.0, priority=0)
+        store.record_run("user", "other_site", ok=True, partial=False, captcha=False, error=None,
+                         offers=5, elapsed=10.0, ts=t0 + i, device="dev_backup", fetch_seconds=10.0, priority=0)
+
+    site = SiteConfig(name="as", url_template="https://test", phone="dev_primary,dev_backup", phone_patience_seconds=12.0)
+    settings = Settings(sites=[site], storage_dir=tmp_path, metrics=store, speed_min_samples=5, speed_live_min_p_lower=0.6)
+    table = get_speed_table(settings)
+    table.refresh(now=t0 + 50)
+
+    st_prim = table.get_stats("as", "dev_primary", "live")
+    st_back = table.get_stats("as", "dev_backup", "live")
+    assert st_prim.p_lower >= 0.6  # основной
+    assert st_back.n == 0  # новый для сайта as -> попадает в backup_list
+    assert st_back.cost == 13.33  # 20.0 * (10 / 15)
+    assert st_back.cost < st_prim.cost  # номинальный cost запасного меньше основного
+
+    cands = table.order_candidates(site, ["dev_primary", "dev_backup"], priority=0, now=t0 + 50)
+    assert isinstance(cands, PreferenceList)
+    assert list(cands) == ["dev_primary", "dev_backup"]
+    assert cands.preferred_count == 1
+    # min_backup - min_primary = 10.0 - 20.0 = -10.0 < 0, терпение должно остаться равным base_patience (12.0 с), а не 0.0
+    assert cands.patience == 12.0
+
+
+def test_order_candidates_type_hinting_and_preference_list(tmp_path):
+    """order_candidates возвращает PreferenceList, если base_candidates — PreferenceList, и сохраняет list для unmeasured list."""
+    site = SiteConfig(name="as", url_template="https://test", phone="dev_x,dev_y", phone_patience_seconds=7.0)
+    settings = Settings(sites=[site], storage_dir=tmp_path)
+    table = get_speed_table(settings)
+
+    # Обычный list без замеров сохраняет тип list (для совместимости с phone="auto")
+    raw_list = ["dev_x", "dev_y"]
+    cands_live = table.order_candidates(site, raw_list, priority=0)
+    assert isinstance(cands_live, list)
+    assert not isinstance(cands_live, PreferenceList)
+    assert list(cands_live) == ["dev_x", "dev_y"]
+
+    # PreferenceList на входе всегда возвращает PreferenceList
+    pref_list = PreferenceList(["dev_x", "dev_y"])
+    cands_pref = table.order_candidates(site, pref_list, priority=0)
+    assert isinstance(cands_pref, PreferenceList)
+    assert cands_pref.patience == 7.0
+    assert cands_pref.preferred_count == 1
+    assert list(cands_pref) == ["dev_x", "dev_y"]
+
+    cands_bg = table.order_candidates(site, pref_list, priority=1)
+    assert isinstance(cands_bg, PreferenceList)
+    assert list(cands_bg) == ["dev_x", "dev_y"]
 
