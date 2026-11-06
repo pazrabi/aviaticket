@@ -57,12 +57,16 @@ def _record_attempt_helper(
     stop_reason: str | None = None,
     t_first_offer: float | None = None,
     t_last_improve: float | None = None,
+    role: str | None = None,
 ) -> None:
-    role = "primary"
-    if attempt_tracker is not None:
-        if attempt_tracker[0] > 0:
-            role = "retry"
-        attempt_tracker[0] += 1
+    eff_role = role or "primary"
+    if eff_role != "hedge":
+        eff_role = "primary"
+        if attempt_tracker is not None:
+            if attempt_tracker[0] > 0:
+                eff_role = "retry"
+            attempt_tracker[0] += 1
+    role = eff_role
     metrics = _get_metrics(settings)
     if metrics is not None:
         source = "user" if priority == 0 else ("sub" if priority == 1 else "bg")
@@ -419,6 +423,9 @@ async def _from_browser(
     search_started: float | None = None,
     now: float | None = None,
     deep: bool = False,
+    target_device: str | None = None,
+    already_acquired: bool = False,
+    role: str = "primary",
 ) -> tuple[list[Offer], str | None, bool]:
     if attempt_tracker is None:
         attempt_tracker = [0]
@@ -482,6 +489,8 @@ async def _from_browser(
                     ordered_part.append(d)
             rest_part = [d for d in remaining_cands if d not in order_seen]
             remaining_cands = ordered_part + rest_part
+        if target_device:
+            remaining_cands = [target_device]
         last_snap = None
         last_finished = True
         last_exc: Exception | None = None
@@ -590,6 +599,7 @@ async def _from_browser(
                     "patience": cur_patience,
                     "site_name": site.name,
                     "max_seconds": wait_seconds,
+                    "already_acquired": already_acquired,
                 }
                 if eval_cb is not None:
                     fetch_kwargs["evaluate"] = eval_cb
@@ -626,6 +636,7 @@ async def _from_browser(
                     stop_reason=cur_stats.get("stop_reason"),
                     t_first_offer=cur_stats.get("t_first_offer"),
                     t_last_improve=cur_stats.get("t_last_improve"),
+                    role=role,
                 )
                 raise
 
@@ -658,6 +669,7 @@ async def _from_browser(
                     stop_reason=cur_stats.get("stop_reason"),
                     t_first_offer=cur_stats.get("t_first_offer"),
                     t_last_improve=cur_stats.get("t_last_improve"),
+                    role=role,
                 )
                 if remaining_cands:
                     try:
@@ -701,6 +713,7 @@ async def _from_browser(
                     stop_reason=cur_stats.get("stop_reason"),
                     t_first_offer=cur_stats.get("t_first_offer"),
                     t_last_improve=cur_stats.get("t_last_improve"),
+                    role=role,
                 )
                 if remaining_cands and _can_retry_on_phone(
                     priority,
@@ -756,6 +769,7 @@ async def _from_browser(
                     stop_reason=cur_stats.get("stop_reason"),
                     t_first_offer=cur_stats.get("t_first_offer"),
                     t_last_improve=cur_stats.get("t_last_improve"),
+                    role=role,
                 )
                 raise
             except Exception as exc:
@@ -775,6 +789,7 @@ async def _from_browser(
                     stop_reason=cur_stats.get("stop_reason"),
                     t_first_offer=cur_stats.get("t_first_offer"),
                     t_last_improve=cur_stats.get("t_last_improve"),
+                    role=role,
                 )
                 raise
 
@@ -794,6 +809,7 @@ async def _from_browser(
                     stop_reason=cur_stats.get("stop_reason"),
                     t_first_offer=cur_stats.get("t_first_offer"),
                     t_last_improve=cur_stats.get("t_last_improve"),
+                    role=role,
                 )
                 if remaining_cands and _can_retry_on_phone(
                     priority,
@@ -840,6 +856,7 @@ async def _from_browser(
                 stop_reason=cur_stats.get("stop_reason"),
                 t_first_offer=cur_stats.get("t_first_offer"),
                 t_last_improve=cur_stats.get("t_last_improve"),
+                role=role,
             )
             try:
                 if site.name in _FUSE_STATE and offers:
@@ -908,6 +925,7 @@ async def _run_site(
     now: float | None = None,
     search_started: float | None = None,
     deep: bool = False,
+    hedge_tracker: Any | None = None,
 ) -> SiteResult:
     if q.return_date and not site.url_template_rt:
         return SiteResult(
@@ -939,6 +957,149 @@ async def _run_site(
     weight = int(actual_wait_sec or 0)
 
     async def _fetch_browser(exclude: set[str] | None = None) -> tuple[list[Offer], str | None, bool]:
+        enable_hedge = (
+            priority == 0
+            and not deep
+            and getattr(settings, "hedge", True)
+            and phone_enabled(settings, site)
+            and exclude is None
+        )
+        if enable_hedge:
+            try:
+                from .hedge import hedge_risky, get_hedge_stats, HedgeTracker
+                from .droidhub import try_acquire_free, release
+
+                ht = hedge_tracker
+                if ht is None:
+                    ht = HedgeTracker(max_hedges=int(getattr(settings, "hedge_max_per_search", 2)))
+
+                cands = candidates(settings, site, priority=0)
+                primary_dev = (device_order[0] if device_order else (cands[0] if cands else None))
+
+                if primary_dev and len(cands) >= 2 and hedge_risky(site.name, primary_dev, settings, now=now):
+                    stats_info = get_hedge_stats(site.name, primary_dev, settings, now=now)
+                    if stats_info.get("is_fail_risky"):
+                        delay = float(getattr(settings, "hedge_delay_seconds", 0.0))
+                    else:
+                        p50 = float(stats_info.get("p50", 0.0))
+                        delay = p50 if p50 > 0 else float(getattr(settings, "hedge_delay_seconds", 0.0))
+                    delay = max(0.0, delay)
+
+                    async def _run_copy(
+                        target_d: str | None,
+                        role: str,
+                        already_acq: bool,
+                    ) -> tuple[list[Offer], str | None, bool, dict[str, Any]]:
+                        c_stats: dict[str, Any] = {}
+                        tr = [0]
+                        d_order = [target_d] if target_d else device_order
+                        try:
+                            o, u, p = await _from_browser(
+                                site,
+                                q,
+                                settings,
+                                priority=priority,
+                                weight=weight,
+                                stats=c_stats,
+                                device_order=d_order,
+                                search_id=search_id,
+                                attempt_tracker=tr,
+                                search_started=search_started,
+                                now=now,
+                                deep=deep,
+                                target_device=target_d,
+                                already_acquired=already_acq,
+                                role=role,
+                            )
+                            return o, u, p, c_stats
+                        finally:
+                            if already_acq and target_d:
+                                try:
+                                    await release(target_d)
+                                except Exception:
+                                    pass
+
+                    primary_task = asyncio.create_task(
+                        _run_copy(primary_dev, role="primary", already_acq=False)
+                    )
+
+                    hedge_started = False
+                    hedge_task = None
+                    hedge_dev = None
+
+                    if delay > 0:
+                        try:
+                            done, _ = await asyncio.wait([primary_task], timeout=delay)
+                            if primary_task in done:
+                                exc = primary_task.exception()
+                                if exc is None:
+                                    o, u, p, c_st = primary_task.result()
+                                    if o:
+                                        stats.update(c_st)
+                                        return o, u, p
+                        except Exception:
+                            pass
+
+                    # Если основная копия уже завершилась успешно с офферами — возвращаем её
+                    if primary_task.done() and primary_task.exception() is None:
+                        o, u, p, c_st = primary_task.result()
+                        if o:
+                            stats.update(c_st)
+                            return o, u, p
+
+                    # Пытаемся запустить хедж
+                    if await ht.try_acquire(site.name):
+                        hedge_dev = try_acquire_free(cands, exclude=primary_dev)
+                        if hedge_dev is None:
+                            await ht.release(site.name)
+                        else:
+                            hedge_started = True
+                            hedge_task = asyncio.create_task(
+                                _run_copy(hedge_dev, role="hedge", already_acq=True)
+                            )
+
+                    if not hedge_started:
+                        o, u, p, c_st = await primary_task
+                        stats.update(c_st)
+                        return o, u, p
+
+                    tasks = {primary_task, hedge_task}
+                    first_done, remaining = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+                    winner_data = None
+                    winner_task = None
+                    for t in first_done:
+                        if t.exception() is None:
+                            o, u, p, c_st = t.result()
+                            if o:
+                                winner_data = (o, u, p, c_st)
+                                winner_task = t
+                                break
+
+                    if winner_data is not None:
+                        loser = (tasks - {winner_task}).pop()
+                        loser.cancel()
+                        try:
+                            await loser
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        o, u, p, c_st = winner_data
+                        stats.update(c_st)
+                        return o, u, p
+
+                    # Если первая копия закончилась ошибкой/пусто — ждём вторую
+                    if remaining:
+                        other_task = remaining.pop()
+                        try:
+                            o, u, p, c_st = await other_task
+                            stats.update(c_st)
+                            return o, u, p
+                        except Exception as other_exc:
+                            if primary_task.exception() is not None:
+                                raise primary_task.exception()
+                            raise other_exc
+            except Exception as e:
+                log.warning("Сбой в логике хеджей для %s: %s, откат на обычный запуск", site.name, e)
         try:
             if exclude:
                 return await _from_browser(
@@ -1150,6 +1311,15 @@ async def search(
             log.warning("Ошибка при расчёте live assignment: %s", e)
             device_assignments = {}
 
+    hedge_tracker = None
+    if priority == 0 and getattr(settings, "hedge", True):
+        try:
+            from .hedge import HedgeTracker
+
+            hedge_tracker = HedgeTracker(max_hedges=int(getattr(settings, "hedge_max_per_search", 2)))
+        except Exception as e:
+            log.warning("Ошибка инициализации HedgeTracker: %s", e)
+
     async def guarded(s: SiteConfig) -> SiteResult:
         if q.return_date and not s.url_template_rt:
             res = SiteResult(
@@ -1182,6 +1352,7 @@ async def search(
                         now=now,
                         search_started=search_started,
                         deep=deep,
+                        hedge_tracker=hedge_tracker,
                     )
                 except PreemptedError:
                     if priority >= 1:
