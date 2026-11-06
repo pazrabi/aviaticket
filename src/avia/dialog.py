@@ -90,6 +90,14 @@ class SearchRequest:
 
 
 @dataclass
+class DeepSearchRequest:
+    query: Query
+    baggage_mode: str = "any"
+    criteria: SearchCriteria = field(default_factory=SearchCriteria)
+    snapshot: SearchSnapshot | None = None
+
+
+@dataclass
 class HistoryRequest:
     query: Query
 
@@ -132,6 +140,7 @@ def compact_keyboard(dialog_id: str, *, has_more: bool) -> list[list[tuple[str, 
         ("🔔 Следить за ценой", f"track:{dialog_id}"),
         ("🔎 Новый поиск", f"new:{dialog_id}"),
     ])
+    rows.append([("🔎 Глубокий поиск", f"deep:{dialog_id}")])
     return rows
 
 
@@ -690,6 +699,24 @@ class Dialog:
 
         if action == "hist":
             return self._on_hist_callback(chat_id, parts)
+
+        if action == "deep":
+            snap = self.store.get(chat_id)
+            if snap is None:
+                return [
+                    Reply(
+                        text="Сначала запустите обычный поиск",
+                        answer="Сначала запустите обычный поиск",
+                    )
+                ]
+            return [
+                DeepSearchRequest(
+                    query=snap.query,
+                    baggage_mode=snap.baggage_mode,
+                    criteria=snap.criteria,
+                    snapshot=snap,
+                )
+            ]
 
         cb_dialog_id = sub_id_or_dialog_id
         session = self.sessions.get(chat_id)

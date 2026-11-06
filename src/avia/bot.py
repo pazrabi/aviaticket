@@ -18,8 +18,10 @@ from . import admin_panel, advice, analytics, charts, forecast
 from .backup import backup_all, list_backups
 from .bg_collector import BackgroundCollector
 from .config import Settings, load_settings
+from .deep_cache import DeepCache
 from .dialog import (
     HELP,
+    DeepSearchRequest,
     Dialog,
     HistoryRequest,
     Reply,
@@ -27,6 +29,7 @@ from .dialog import (
     Session,
     Step,
     compact_keyboard,
+    full_keyboard,
     to_reply_markup,
 )
 from .filters import apply_criteria
@@ -223,6 +226,7 @@ class Bot:
             self.subs = SubscriptionStore(settings.storage_dir / "subscriptions.sqlite")
             self.store = store if store is not None else ResultStore()
             self.dialog = Dialog(store=self.store, subs=self.subs)
+        self.deep_cache = DeepCache(ttl_seconds=getattr(settings, "deep_cache_ttl_seconds", 900))
         self._backup_in_progress: bool = False
         self._last_manual_backup_at: float = 0.0
         self._last_parser_watch: float = 0.0
@@ -335,6 +339,8 @@ class Bot:
                         await self.send(chat_id, item.text, reply_markup=reply_markup)
             elif isinstance(item, SearchRequest):
                 await self._run_search(chat_id, item)
+            elif isinstance(item, DeepSearchRequest):
+                await self._run_deep_search(chat_id, item)
             elif isinstance(item, HistoryRequest):
                 await self._handle_history_request(chat_id, item)
 
@@ -611,6 +617,261 @@ class Bot:
             )
         except Exception as e:
             log.exception("search failed")
+            await self.send(chat_id, f"⚠️ {escape(friendly_error(e))}")
+        finally:
+            self.busy.discard(chat_id)
+            if wait_msg_id is not None:
+                try:
+                    await self.call("deleteMessage", chat_id=chat_id, message_id=wait_msg_id)
+                except Exception:
+                    try:
+                        await self.call("editMessageText", chat_id=chat_id, message_id=wait_msg_id, text="Готово")
+                    except Exception:
+                        pass
+
+    async def _run_deep_search(self, chat_id: int, req: DeepSearchRequest) -> None:
+        q = req.query
+        baggage_mode = req.baggage_mode
+        criteria = req.criteria
+        snap = req.snapshot or self.store.get(chat_id)
+        if snap is None:
+            await self.send(chat_id, "Сначала запустите обычный поиск")
+            return
+
+        # 1. Проверяем кеш полной выдачи
+        cached = self.deep_cache.get(q)
+        if cached is not None:
+            results, age_seconds = cached
+            age_min = max(1, int(round(age_seconds / 60)))
+            filtered_crit, dropped_criteria = apply_criteria(results, criteria)
+            filtered, dropped_baggage = filter_by_baggage(filtered_crit, baggage_mode)
+            chunks, full_flat = build_report(
+                q,
+                filtered,
+                baggage_mode=baggage_mode,
+                dropped=dropped_baggage,
+                title=f"🔎 Глубокий поиск: полная выдача\n<i>из кеша, возраст {age_min} мин</i>",
+            )
+            session = self.dialog.sessions.get(chat_id)
+            if session is None or not session.dialog_id:
+                session = Session(
+                    step=Step.DONE,
+                    origin=q.origin,
+                    destination=q.destination,
+                    depart=q.depart,
+                    return_date=q.return_date,
+                    adults=q.adults,
+                    baggage_mode=baggage_mode,
+                    criteria=criteria,
+                    dialog_id=secrets.token_hex(2),
+                )
+                self.dialog.sessions[chat_id] = session
+            else:
+                session.step = Step.DONE
+
+            kb = full_keyboard(session.dialog_id)
+            reply_markup = to_reply_markup(kb)
+            for i, chunk in enumerate(chunks):
+                rm = reply_markup if i == len(chunks) - 1 else None
+                await self.send(chat_id, chunk, reply_markup=rm)
+
+            self.store.put(
+                chat_id,
+                q,
+                filtered,
+                baggage_mode,
+                full_flat,
+                criteria=criteria,
+                pool=full_flat,
+                shown=len(full_flat),
+                view="full",
+                dropped_baggage=dropped_baggage,
+                dropped_criteria=dropped_criteria,
+            )
+            return
+
+        # 2. Кеша нет: проверяем занятость чата
+        if chat_id in self.busy:
+            await self.send(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите.")
+            return
+
+        # 3. Проверяем и списываем дневной лимит поиска
+        if (
+            chat_id not in self.s.tg_allowed_ids
+            and not self.users.try_use_search(chat_id, self.s.daily_search_limit)
+        ):
+            await self.send(
+                chat_id,
+                f"😴 На сегодня лимит поисков исчерпан ({self.s.daily_search_limit}). Завтра можно снова, "
+                "отслеживания продолжают работать.",
+            )
+            return
+
+        self.busy.add(chat_id)
+        wait_msg_id = None
+        updater = None
+        try:
+            enabled_sites = [s for s in self.s.sites if s.enabled]
+            header = (
+                f"🔎 <b>Ищу глубже: жду полную выдачу со всех сайтов, это до 2 минут</b>\n"
+                f"{escape(city_name(q.origin))} → {escape(city_name(q.destination))}, {date_ru(q.depart)}"
+            )
+            footer = "<i>Ищу глубже: жду полную выдачу со всех сайтов, это до 2 минут</i>"
+            lines = [header, ""]
+            if enabled_sites:
+                lines.extend(f"⏳ {escape(s.name)}" for s in enabled_sites)
+                lines.append("")
+            lines.append(footer)
+            initial_wait_text = "\n".join(lines)
+
+            wait_msg = await self.send(chat_id, initial_wait_text)
+            if isinstance(wait_msg, dict):
+                wait_msg_id = wait_msg.get("message_id")
+
+            updater = WaitMessageUpdater(
+                bot=self,
+                chat_id=chat_id,
+                message_id=wait_msg_id,
+                sites=enabled_sites,
+                header=header,
+                footer=footer,
+            )
+
+            self._active_searches += 1
+            t_search0 = time.monotonic()
+            t_gate = t_search0
+            timed_out = False
+            search_task: asyncio.Task | None = None
+            try:
+                async with self._gate.slot(0):
+                    t_gate = time.monotonic()
+                    t_search0 = t_gate
+                    search_task = asyncio.create_task(
+                        _search_call(
+                            search,
+                            q,
+                            self.s,
+                            priority=0,
+                            deep=True,
+                            samples_dir=self.s.storage_dir / "samples",
+                            on_site_done=updater.on_site_done,
+                        )
+                    )
+                    deep_timeout = getattr(self.s, "deep_safety_seconds", 150.0)
+                    if deep_timeout > 0:
+                        done, pending = await asyncio.wait(
+                            [search_task],
+                            timeout=deep_timeout,
+                        )
+                        timed_out = search_task in pending
+                    else:
+                        await search_task
+                        timed_out = False
+
+                    if timed_out:
+                        search_task.cancel()
+                        await asyncio.wait([search_task], timeout=5.0)
+                        try:
+                            search_task.exception()
+                        except (asyncio.CancelledError, asyncio.InvalidStateError):
+                            pass
+            finally:
+                self._active_searches -= 1
+
+            try:
+                await updater.flush()
+            except Exception:
+                pass
+
+            if not timed_out:
+                assert search_task is not None
+                results = search_task.result()
+            else:
+                answered_sites = dict(updater.results_by_site)
+                results = []
+                for s in enabled_sites:
+                    if s.name in answered_sites:
+                        results.append(answered_sites[s.name])
+                    else:
+                        results.append(
+                            SiteResult(
+                                site=s.name,
+                                ok=False,
+                                error="сайт временно недоступен",
+                                offers=[],
+                            )
+                        )
+                for name, res in answered_sites.items():
+                    if not any(s.name == name for s in enabled_sites):
+                        results.append(res)
+
+            self._record_metrics("user", results)
+            if self.metrics is not None and results:
+                self.metrics.record_search(  # type: ignore[attr-defined]
+                    "user",
+                    time.monotonic() - t_search0,
+                    results,
+                    queue_seconds=t_gate - t_search0,
+                    cls="deep",
+                )
+
+            # Сохраняем в DeepCache
+            self.deep_cache.put(q, results)
+
+            results = assign_ids(results)
+            try:
+                await asyncio.to_thread(self.history.annotate, q, results)
+            except Exception:
+                log.exception("история цен недоступна")
+
+            filtered_crit, dropped_criteria = apply_criteria(results, criteria)
+            filtered, dropped_baggage = filter_by_baggage(filtered_crit, baggage_mode)
+            chunks, full_flat = build_report(
+                q,
+                filtered,
+                baggage_mode=baggage_mode,
+                dropped=dropped_baggage,
+                title="🔎 Глубокий поиск: полная выдача",
+            )
+
+            session = self.dialog.sessions.get(chat_id)
+            if session is None or not session.dialog_id:
+                session = Session(
+                    step=Step.DONE,
+                    origin=q.origin,
+                    destination=q.destination,
+                    depart=q.depart,
+                    return_date=q.return_date,
+                    adults=q.adults,
+                    baggage_mode=baggage_mode,
+                    criteria=criteria,
+                    dialog_id=secrets.token_hex(2),
+                )
+                self.dialog.sessions[chat_id] = session
+            else:
+                session.step = Step.DONE
+
+            kb = full_keyboard(session.dialog_id)
+            reply_markup = to_reply_markup(kb)
+            for i, chunk in enumerate(chunks):
+                rm = reply_markup if i == len(chunks) - 1 else None
+                await self.send(chat_id, chunk, reply_markup=rm)
+
+            self.store.put(
+                chat_id,
+                q,
+                filtered,
+                baggage_mode,
+                full_flat,
+                criteria=criteria,
+                pool=full_flat,
+                shown=len(full_flat),
+                view="full",
+                dropped_baggage=dropped_baggage,
+                dropped_criteria=dropped_criteria,
+            )
+        except Exception as e:
+            log.exception("deep search failed")
             await self.send(chat_id, f"⚠️ {escape(friendly_error(e))}")
         finally:
             self.busy.discard(chat_id)

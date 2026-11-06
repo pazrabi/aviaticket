@@ -126,6 +126,8 @@ class Settings:
     live_assignment: bool = True
     phone_wake_seconds: float = 5.0
     live_safety_seconds: float = 90.0
+    deep_safety_seconds: float = 150.0
+    deep_cache_ttl_seconds: int = 900
     parser_timeout_seconds: float = 5.0
     site_fuse_enabled: bool = True
     site_fuse_window_seconds: int = 300
@@ -238,6 +240,14 @@ def load_settings(path: Path | None = None) -> Settings:
         live_safety_seconds = float(os.getenv("LIVE_SAFETY_SECONDS", "90.0"))
     except ValueError:
         live_safety_seconds = 90.0
+    try:
+        deep_safety_seconds = float(os.getenv("DEEP_SAFETY_SECONDS", "150.0"))
+    except ValueError:
+        deep_safety_seconds = 150.0
+    try:
+        deep_cache_ttl_seconds = int(os.getenv("DEEP_CACHE_TTL_SECONDS", "900"))
+    except ValueError:
+        deep_cache_ttl_seconds = 900
     try:
         parser_timeout_seconds = float(os.getenv("PARSER_TIMEOUT_SECONDS", "5.0"))
     except ValueError:
@@ -370,6 +380,8 @@ def load_settings(path: Path | None = None) -> Settings:
         live_assignment=live_assignment,
         phone_wake_seconds=phone_wake_seconds,
         live_safety_seconds=live_safety_seconds,
+        deep_safety_seconds=deep_safety_seconds,
+        deep_cache_ttl_seconds=deep_cache_ttl_seconds,
         parser_timeout_seconds=parser_timeout_seconds,
         site_fuse_enabled=site_fuse_enabled,
         site_fuse_window_seconds=site_fuse_window_seconds,

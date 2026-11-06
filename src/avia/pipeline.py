@@ -109,11 +109,12 @@ def _can_retry_on_phone(
     site_name: str,
     search_started: float | None = None,
     now: float | None = None,
+    deep: bool = False,
 ) -> bool:
     """Проверяет, разрешён ли повтор на следующем телефоне для живого поиска.
 
     Повтор на следующем телефоне разрешён, если «сколько уже прошло с начала поиска +
-    ожидаемое время (медиана) этой пары сайт/телефон следующего кандидата» <= live_safety_seconds.
+    ожидаемое время (медиана) этой пары сайт/телефон следующего кандидата» <= live_safety_seconds (или deep_safety_seconds при deep=True).
     Если search_started is None, используется старое поведение _hit_time_cap.
     Фон и подписки (priority != 0) не меняются (всегда разрешён повтор при наличии кандидатов).
     """
@@ -126,8 +127,10 @@ def _can_retry_on_phone(
     if not remaining_cands:
         return False
 
-    cap_val = getattr(settings, "live_safety_seconds", 90.0)
-    safety_cap = float(cap_val) if cap_val is not None else 90.0
+    cap_attr = "deep_safety_seconds" if deep else "live_safety_seconds"
+    default_cap = 150.0 if deep else 90.0
+    cap_val = getattr(settings, cap_attr, default_cap)
+    safety_cap = float(cap_val) if cap_val is not None else default_cap
     if safety_cap <= 0:
         return True
 
@@ -414,18 +417,19 @@ async def _from_browser(
     attempt_tracker: list[int] | None = None,
     search_started: float | None = None,
     now: float | None = None,
+    deep: bool = False,
 ) -> tuple[list[Offer], str | None, bool]:
     if attempt_tracker is None:
         attempt_tracker = [0]
     extra = await resolve_extra(site, q)
     url = build_url(site, q, extra=extra)
 
-    if priority > 0 and getattr(site, "phone_full_wait_seconds", None) is not None:
+    if (priority > 0 or deep) and getattr(site, "phone_full_wait_seconds", None) is not None:
         wait_seconds = site.phone_full_wait_seconds
     else:
         wait_seconds = getattr(site, "phone_wait_seconds", 40)
 
-    if priority > 0 and getattr(site, "phone_full_wait_for", None) is not None:
+    if (priority > 0 or deep) and getattr(site, "phone_full_wait_for", None) is not None:
         wait_for = site.phone_full_wait_for
     else:
         wait_for = getattr(site, "phone_wait_for", "")
@@ -497,7 +501,7 @@ async def _from_browser(
                 pref_arg = remaining_cands
 
             eval_cb = None
-            if priority == 0 and getattr(settings, "fast_stop", True):
+            if not deep and priority == 0 and getattr(settings, "fast_stop", True):
                 from . import stop_rule
                 stable_sec = stop_rule.stable_seconds_for(site.name, settings)
                 cap_sec = float(wait_seconds or 40.0)
@@ -575,20 +579,25 @@ async def _from_browser(
                 eval_cb = _evaluate_cb
 
             try:
+                fetch_kwargs: dict[str, Any] = {
+                    "wait_seconds": wait_seconds,
+                    "capture_json": site.phone_capture_json,
+                    "wait_for": wait_for,
+                    "priority": priority,
+                    "weight": effective_weight,
+                    "stats": cur_stats,
+                    "patience": cur_patience,
+                    "site_name": site.name,
+                    "max_seconds": wait_seconds,
+                }
+                if eval_cb is not None:
+                    fetch_kwargs["evaluate"] = eval_cb
+
                 snap, finished = await fetch_page_snapshot_any(
                     settings,
                     pref_arg,
                     url,
-                    wait_seconds=wait_seconds,
-                    capture_json=site.phone_capture_json,
-                    wait_for=wait_for,
-                    priority=priority,
-                    weight=effective_weight,
-                    stats=cur_stats,
-                    patience=cur_patience,
-                    site_name=site.name,
-                    evaluate=eval_cb,
-                    max_seconds=wait_seconds,
+                    **fetch_kwargs,
                 )
             except Exception as exc:
                 last_exc = exc
@@ -699,6 +708,7 @@ async def _from_browser(
                     site.name,
                     search_started=search_started,
                     now=now,
+                    deep=deep,
                 ):
                     try:
                         from .droidhub import _record_failure
@@ -791,6 +801,7 @@ async def _from_browser(
                     site.name,
                     search_started=search_started,
                     now=now,
+                    deep=deep,
                 ):
                     try:
                         from .droidhub import _record_failure
@@ -893,6 +904,7 @@ async def _run_site(
     search_id: str | None = None,
     now: float | None = None,
     search_started: float | None = None,
+    deep: bool = False,
 ) -> SiteResult:
     if q.return_date and not site.url_template_rt:
         return SiteResult(
@@ -917,7 +929,7 @@ async def _run_site(
     g = guard if guard is not None else globals()["guard"]
     stats: dict[str, Any] = {}
     attempt_tracker: list[int] = [0]
-    if priority > 0 and getattr(site, "phone_full_wait_seconds", None) is not None:
+    if (priority > 0 or deep) and getattr(site, "phone_full_wait_seconds", None) is not None:
         actual_wait_sec = site.phone_full_wait_seconds
     else:
         actual_wait_sec = getattr(site, "phone_wait_seconds", 0) or 0
@@ -939,6 +951,7 @@ async def _run_site(
                     attempt_tracker=attempt_tracker,
                     search_started=search_started,
                     now=now,
+                    deep=deep,
                 )
             return await _from_browser(
                 site,
@@ -952,6 +965,7 @@ async def _run_site(
                 attempt_tracker=attempt_tracker,
                 search_started=search_started,
                 now=now,
+                deep=deep,
             )
         except TypeError:
             try:
@@ -1001,6 +1015,7 @@ async def _run_site(
                         site.name,
                         search_started=search_started,
                         now=now,
+                        deep=deep,
                     ):
                         raise
                 elif _hit_time_cap(priority, stats, actual_wait_sec):
@@ -1108,6 +1123,7 @@ async def search(
     on_site_done: Callable[[SiteResult], Awaitable[None] | None] | None = None,
     search_id: str | None = None,
     now: float | None = None,
+    deep: bool = False,
 ) -> list[SiteResult]:
     if search_id is None:
         search_id = uuid.uuid4().hex[:8]
@@ -1159,6 +1175,7 @@ async def search(
                     search_id=search_id,
                     now=now,
                     search_started=search_started,
+                    deep=deep,
                 )
 
         if on_site_done is not None:

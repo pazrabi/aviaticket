@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS searches (
     first_seconds  REAL,
     sites_total    INTEGER NOT NULL,
     sites_ok       INTEGER NOT NULL,
-    queue_seconds  REAL
+    queue_seconds  REAL,
+    cls            TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_searches_ts ON searches (ts);
 
@@ -150,6 +151,10 @@ class MetricsStore:
                 conn.execute("ALTER TABLE attempts ADD COLUMN t_first_offer REAL")
             if "t_last_improve" not in cols_att:
                 conn.execute("ALTER TABLE attempts ADD COLUMN t_last_improve REAL")
+
+            cols_srch = {row[1] for row in conn.execute("PRAGMA table_info(searches)").fetchall()}
+            if "cls" not in cols_srch:
+                conn.execute("ALTER TABLE searches ADD COLUMN cls TEXT")
         self._initialized = True
 
     def _connect(self) -> sqlite3.Connection:
@@ -818,10 +823,12 @@ def _record_search(
     results: Sequence[SiteResult],
     queue_seconds: float | None = None,
     ts: float | None = None,
+    cls: str | None = "fast",
 ) -> None:
     """Итог всего поиска: сколько ждал человек, когда пришла первая цена, сколько сайтов ответило."""
     try:
         oks = [float(r.elapsed) for r in results if r.ok and r.offers]
+        cls_val = cls if cls is not None else "fast"
         row = (
             time.time() if ts is None else float(ts),
             source,
@@ -830,11 +837,12 @@ def _record_search(
             len(results),
             len(oks),
             float(queue_seconds) if queue_seconds is not None else None,
+            cls_val,
         )
         with self._connect() as db:
             db.execute(
-                "INSERT INTO searches (ts, source, total_seconds, first_seconds, sites_total, sites_ok, queue_seconds)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO searches (ts, source, total_seconds, first_seconds, sites_total, sites_ok, queue_seconds, cls)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 row,
             )
     except Exception:
