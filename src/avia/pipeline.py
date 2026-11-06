@@ -38,6 +38,9 @@ guard = SearchGuard()
 # Пауза перед повторной попыткой при 0 вариантов (ParserEmptyError)
 EMPTY_RETRY_DELAY: float = 3.0
 
+# Минимальный интервал между быстрыми разборами в evaluate (сек)
+PARSER_MIN_INTERVAL: float = 1.0
+
 
 def _record_attempt_helper(
     settings: Settings,
@@ -50,6 +53,9 @@ def _record_attempt_helper(
     queue_wait: float | None,
     search_id: str | None,
     attempt_tracker: list[int] | None = None,
+    stop_reason: str | None = None,
+    t_first_offer: float | None = None,
+    t_last_improve: float | None = None,
 ) -> None:
     role = "primary"
     if attempt_tracker is not None:
@@ -69,6 +75,9 @@ def _record_attempt_helper(
             fetch_seconds=fetch_seconds,
             queue_wait=queue_wait,
             search_id=search_id,
+            stop_reason=stop_reason,
+            t_first_offer=t_first_offer,
+            t_last_improve=t_last_improve,
         )
 
 
@@ -281,6 +290,21 @@ async def _process_snapshot(
     return sorted(offers, key=lambda o: o.price), snap.url, partial
 
 
+def _quick_parse_offers(site: SiteConfig, snap: Snapshot, q: Query) -> list[Offer]:
+    """Быстрый синхронный разбор офферов парсером сайта для evaluate."""
+    parser = PARSERS.get(site.parser) if site and site.parser else None
+    if parser is None:
+        return []
+    if inspect.iscoroutinefunction(parser):
+        offers = asyncio.run(parser(snap, q))
+    else:
+        offers = parser(snap, q)
+    if not offers or not isinstance(offers, list):
+        return []
+    offers, _ = filter_wrong_dates(offers, q)
+    return offers
+
+
 _timeline_tasks: set[asyncio.Task] = set()
 
 
@@ -407,6 +431,84 @@ async def _from_browser(
                 cur_patience = orig_patience
                 pref_arg = remaining_cands
 
+            eval_cb = None
+            if priority == 0 and getattr(settings, "fast_stop", True):
+                from . import stop_rule
+                stable_sec = stop_rule.stable_seconds_for(site.name, settings)
+                cap_sec = float(wait_seconds or 40.0)
+                stop_params = stop_rule.StopParams(stable_seconds=stable_sec, cap_seconds=cap_sec)
+
+                best_min: float | None = None
+                n_offers: int = 0
+                t_first_offer: float | None = None
+                t_last_improve: float | None = None
+                last_parse_time: float = 0.0
+                last_parsed_count: int = 0
+
+                async def _evaluate_cb(snap_so_far: Snapshot, hub_state: dict[str, Any]) -> str | None:
+                    nonlocal best_min, n_offers, t_first_offer, t_last_improve
+                    nonlocal last_parse_time, last_parsed_count
+
+                    now = time.monotonic()
+                    curr_count = len(snap_so_far.json_payloads)
+                    has_new = curr_count > last_parsed_count
+                    hub_st = hub_state.get("state")
+                    should_parse = has_new and (
+                        now - last_parse_time >= PARSER_MIN_INTERVAL or last_parse_time == 0.0 or hub_st in ("done", "failed")
+                    )
+
+                    if should_parse:
+                        last_parse_time = now
+                        last_parsed_count = curr_count
+                        parsed_offers: list[Offer] = []
+                        try:
+                            parsed_offers = await asyncio.wait_for(
+                                asyncio.to_thread(_quick_parse_offers, site, snap_so_far, q),
+                                timeout=5.0,
+                            )
+                        except (asyncio.TimeoutError, TimeoutError, ParserEmptyError):
+                            parsed_offers = []
+                        except Exception as e:
+                            log.warning("Ошибка быстрого разбора для %s: %s", site.name, e)
+                            parsed_offers = []
+
+                        prices = [float(o.price) for o in parsed_offers if getattr(o, "price", None) is not None]
+                        if prices:
+                            cur_min = min(prices)
+                            valid_ts = [t for t in snap_so_far.payload_times if t is not None]
+                            latest_t = valid_ts[-1] if valid_ts else float(hub_state.get("elapsed") or 0.0)
+
+                            if best_min is None:
+                                best_min = cur_min
+                                n_offers = len(prices)
+                                t_first_offer = latest_t
+                                t_last_improve = latest_t
+                            elif cur_min < best_min:
+                                best_min = cur_min
+                                n_offers = len(prices)
+                                t_last_improve = latest_t
+                            else:
+                                n_offers = max(n_offers, len(prices))
+
+                    _evaluate_cb.t_first_offer = t_first_offer
+                    _evaluate_cb.t_last_improve = t_last_improve
+
+                    st = {
+                        "elapsed": float(hub_state.get("elapsed") or 0.0),
+                        "wait_for_seen": bool(hub_state.get("wait_for_seen", False)),
+                        "network_quiet": bool(hub_state.get("network_quiet", False)),
+                        "captcha": bool(hub_state.get("captcha", False) or snap_so_far.blocked),
+                        "best_min": best_min,
+                        "n_offers": n_offers,
+                        "t_last_improve": t_last_improve,
+                        "job_state": hub_state.get("state") or "running",
+                    }
+                    return stop_rule.decide(st, stop_params)
+
+                _evaluate_cb.t_first_offer = None
+                _evaluate_cb.t_last_improve = None
+                eval_cb = _evaluate_cb
+
             try:
                 snap, finished = await fetch_page_snapshot_any(
                     settings,
@@ -420,6 +522,8 @@ async def _from_browser(
                     stats=cur_stats,
                     patience=cur_patience,
                     site_name=site.name,
+                    evaluate=eval_cb,
+                    max_seconds=wait_seconds,
                 )
             except Exception as exc:
                 last_exc = exc
@@ -442,6 +546,9 @@ async def _from_browser(
                     queue_wait=cur_stats.get("queue_wait"),
                     search_id=search_id,
                     attempt_tracker=attempt_tracker,
+                    stop_reason=cur_stats.get("stop_reason"),
+                    t_first_offer=cur_stats.get("t_first_offer"),
+                    t_last_improve=cur_stats.get("t_last_improve"),
                 )
                 raise
 
@@ -471,6 +578,9 @@ async def _from_browser(
                     queue_wait=cur_stats.get("queue_wait"),
                     search_id=search_id,
                     attempt_tracker=attempt_tracker,
+                    stop_reason=cur_stats.get("stop_reason"),
+                    t_first_offer=cur_stats.get("t_first_offer"),
+                    t_last_improve=cur_stats.get("t_last_improve"),
                 )
                 if remaining_cands:
                     try:
@@ -492,6 +602,9 @@ async def _from_browser(
                 raise RuntimeError("сайт показал капчу на телефоне")
 
             partial = not finished
+            stop_reason = cur_stats.get("stop_reason")
+            if stop_reason in ("stable", "quiet", "cap"):
+                partial = True
             try:
                 offers, page_url, partial = await _process_snapshot(site, snap, q, settings, partial=partial)
             except ParserEmptyError as exc:
@@ -508,6 +621,9 @@ async def _from_browser(
                     queue_wait=cur_stats.get("queue_wait"),
                     search_id=search_id,
                     attempt_tracker=attempt_tracker,
+                    stop_reason=cur_stats.get("stop_reason"),
+                    t_first_offer=cur_stats.get("t_first_offer"),
+                    t_last_improve=cur_stats.get("t_last_improve"),
                 )
                 if remaining_cands and not _hit_time_cap(priority, cur_stats, wait_seconds):
                     try:
@@ -550,6 +666,9 @@ async def _from_browser(
                     queue_wait=cur_stats.get("queue_wait"),
                     search_id=search_id,
                     attempt_tracker=attempt_tracker,
+                    stop_reason=cur_stats.get("stop_reason"),
+                    t_first_offer=cur_stats.get("t_first_offer"),
+                    t_last_improve=cur_stats.get("t_last_improve"),
                 )
                 raise
             except Exception as exc:
@@ -566,6 +685,9 @@ async def _from_browser(
                     queue_wait=cur_stats.get("queue_wait"),
                     search_id=search_id,
                     attempt_tracker=attempt_tracker,
+                    stop_reason=cur_stats.get("stop_reason"),
+                    t_first_offer=cur_stats.get("t_first_offer"),
+                    t_last_improve=cur_stats.get("t_last_improve"),
                 )
                 raise
 
@@ -582,6 +704,9 @@ async def _from_browser(
                     queue_wait=cur_stats.get("queue_wait"),
                     search_id=search_id,
                     attempt_tracker=attempt_tracker,
+                    stop_reason=cur_stats.get("stop_reason"),
+                    t_first_offer=cur_stats.get("t_first_offer"),
+                    t_last_improve=cur_stats.get("t_last_improve"),
                 )
                 if remaining_cands and not _hit_time_cap(priority, cur_stats, wait_seconds):
                     try:
@@ -615,6 +740,9 @@ async def _from_browser(
                 queue_wait=cur_stats.get("queue_wait"),
                 search_id=search_id,
                 attempt_tracker=attempt_tracker,
+                stop_reason=cur_stats.get("stop_reason"),
+                t_first_offer=cur_stats.get("t_first_offer"),
+                t_last_improve=cur_stats.get("t_last_improve"),
             )
             try:
                 if site.name in _FUSE_STATE and offers:

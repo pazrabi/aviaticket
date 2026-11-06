@@ -44,7 +44,10 @@ CREATE TABLE IF NOT EXISTS attempts (
     outcome       TEXT NOT NULL,
     offers        INTEGER NOT NULL,
     fetch_seconds REAL,
-    queue_wait    REAL
+    queue_wait    REAL,
+    stop_reason   TEXT,
+    t_first_offer REAL,
+    t_last_improve REAL
 );
 CREATE INDEX IF NOT EXISTS ix_attempts_ts ON attempts (ts);
 CREATE INDEX IF NOT EXISTS ix_attempts_search_id ON attempts (search_id);
@@ -139,6 +142,14 @@ class MetricsStore:
                 conn.execute("ALTER TABLE site_runs ADD COLUMN priority INTEGER")
             if "min_price" not in cols:
                 conn.execute("ALTER TABLE site_runs ADD COLUMN min_price REAL")
+
+            cols_att = {row[1] for row in conn.execute("PRAGMA table_info(attempts)").fetchall()}
+            if "stop_reason" not in cols_att:
+                conn.execute("ALTER TABLE attempts ADD COLUMN stop_reason TEXT")
+            if "t_first_offer" not in cols_att:
+                conn.execute("ALTER TABLE attempts ADD COLUMN t_first_offer REAL")
+            if "t_last_improve" not in cols_att:
+                conn.execute("ALTER TABLE attempts ADD COLUMN t_last_improve REAL")
         self._initialized = True
 
     def _connect(self) -> sqlite3.Connection:
@@ -214,6 +225,9 @@ class MetricsStore:
         queue_wait: float | None = None,
         search_id: str | None = None,
         ts: float | None = None,
+        stop_reason: str | None = None,
+        t_first_offer: float | None = None,
+        t_last_improve: float | None = None,
     ) -> None:
         """Записывает попытку обращения к сайту на конкретном телефоне."""
         try:
@@ -226,14 +240,18 @@ class MetricsStore:
             offers_cnt = int(offers) if offers is not None else 0
             fs_val = float(fetch_seconds) if fetch_seconds is not None else None
             qw_val = float(queue_wait) if queue_wait is not None else None
+            stop_reason_str = str(stop_reason).strip() if stop_reason and str(stop_reason).strip() else None
+            t_first_val = float(t_first_offer) if t_first_offer is not None else None
+            t_last_val = float(t_last_improve) if t_last_improve is not None else None
 
             with self._connect() as db:
                 db.execute(
                     """
                     INSERT INTO attempts (
-                        ts, search_id, site, device, source, role, outcome, offers, fetch_seconds, queue_wait
+                        ts, search_id, site, device, source, role, outcome, offers, fetch_seconds, queue_wait,
+                        stop_reason, t_first_offer, t_last_improve
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record_ts,
@@ -246,6 +264,9 @@ class MetricsStore:
                         offers_cnt,
                         fs_val,
                         qw_val,
+                        stop_reason_str,
+                        t_first_val,
+                        t_last_val,
                     ),
                 )
         except Exception:
