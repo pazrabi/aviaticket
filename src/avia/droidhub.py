@@ -108,7 +108,7 @@ class JobsUnsupported(DroidhubError):
 _jobs_unsupported: bool = False
 # Сайты, где задание хаба не отдало ни одного ответа (а старый fetch_page отдаёт): {сайт: до какого времени без заданий}
 _jobs_bad_sites: dict[str, float] = {}
-JOBS_BAD_SITE_SECONDS: float = 1800.0
+JOBS_BAD_SITE_SECONDS: float = 21600.0
 POLL_MIN_INTERVAL: float = 0.3
 DELETE_TIMEOUT: float = 3.0
 
@@ -1129,7 +1129,7 @@ async def fetch_page_snapshot_any(
                         # Старый fetch_page её видит, поэтому берём его сразу и на время отключаем задания для сайта.
                         bad_name = site_name or _infer_site_name(url)
                         _jobs_bad_sites[bad_name] = time.monotonic() + JOBS_BAD_SITE_SECONDS
-                        logger.warning("Задание хаба для %s не отдало ответов, переходим на fetch_page на %d с", bad_name, int(JOBS_BAD_SITE_SECONDS))
+                        logger.warning("Задание хаба для %s не отдало ответов, переходим на fetch_page на %d с (до починки хаба)", bad_name, int(JOBS_BAD_SITE_SECONDS))
                         snap, finished = await _fetch_device_snapshot(
                             settings,
                             dev,
