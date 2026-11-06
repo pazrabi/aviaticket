@@ -692,18 +692,11 @@ def test_overview_search_queue_display(tmp_path):
     txt_dict = admin_panel.build_overview(ctx_with_dict)
     assert "Очередь поисков: идёт 1 из 2, ждут: люди 1, подписки 2, фон 3" in txt_dict
 
-    # 3. С объектом PriorityGate
-    from avia.prio_gate import PriorityGate
-    gate = PriorityGate(3)
-    ctx_with_gate = dict(ctx_without)
-    ctx_with_gate["search_queue"] = gate
-    txt_gate = admin_panel.build_overview(ctx_with_gate)
-    assert "Очередь поисков: идёт 0 из 3, ждут: люди 0, подписки 0, фон 0" in txt_gate
-
-    # 4. Проверка контекста в Bot
+    # 3. Проверка контекста в Bot
     bot = make_bot(tmp_path, allowed_ids={1})
     ov_data = bot._collect_overview_data()
     assert "search_queue" in ov_data
+    assert "gate" not in ov_data
     assert ov_data["search_queue"]["capacity"] == bot.s.max_parallel_searches
     txt_bot_ov = admin_panel.build_overview(ov_data)
     assert f"Очередь поисков: идёт 0 из {bot.s.max_parallel_searches}, ждут: люди 0, подписки 0, фон 0" in txt_bot_ov
