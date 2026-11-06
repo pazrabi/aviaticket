@@ -140,6 +140,7 @@ class Settings:
     price_timeline: bool = True
     fast_stop: bool = True
     stop_stable_seconds: float = 8.0
+    preempt: bool = True
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -312,6 +313,9 @@ def load_settings(path: Path | None = None) -> Settings:
     except ValueError:
         stop_stable_seconds = 8.0
 
+    preempt_env = os.getenv("PREEMPT", "1").strip().lower()
+    preempt = preempt_env not in ("0", "false", "False", "no", "off")
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -393,6 +397,7 @@ def load_settings(path: Path | None = None) -> Settings:
         price_timeline=price_timeline,
         fast_stop=fast_stop,
         stop_stable_seconds=stop_stable_seconds,
+        preempt=preempt,
     )
 
 

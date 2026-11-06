@@ -101,6 +101,27 @@ class DroidhubError(Exception):
         self.status_code = status_code
 
 
+class PreemptedError(DroidhubError):
+    """Фоновая загрузка вытеснена живым поиском."""
+
+    def __init__(self, message: str = "фоновая загрузка вытеснена живым поиском", status_code: int | None = None) -> None:
+        super().__init__(message, status_code=status_code)
+
+
+@dataclass
+class ActiveLoad:
+    priority: int
+    cancel: Any  # async callable или asyncio.Task
+    started_at: float
+    preempted: bool = False
+
+
+# Реестр текущих загрузок: device_id -> ActiveLoad
+_active_loads: dict[str, ActiveLoad] = {}
+# Время последнего вытеснения по телефонам: device_id -> float (монотонное время)
+_last_preempt: dict[str, float] = {}
+
+
 class JobsUnsupported(DroidhubError):
     """Хаб не поддерживает задания fetch_jobs (404/405)."""
 
@@ -122,7 +143,7 @@ def reset_jobs_supported() -> None:
 
 def _sync_loop_state() -> asyncio.AbstractEventLoop | None:
     """Синхронизирует блокировки и состояние пула с текущим циклом событий."""
-    global _pool_condition, _pool_loop, _busy_devices, _device_locks, _seq_counter, _waiters
+    global _pool_condition, _pool_loop, _busy_devices, _device_locks, _seq_counter, _waiters, _active_loads, _last_preempt
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
@@ -134,6 +155,8 @@ def _sync_loop_state() -> asyncio.AbstractEventLoop | None:
         _device_locks.clear()
         _seq_counter = 0
         _waiters.clear()
+        _active_loads.clear()
+        _last_preempt.clear()
     return loop
 
 
@@ -159,7 +182,7 @@ def _get_pool_condition() -> asyncio.Condition:
 
 def _reset_pool() -> None:
     """Сброс состояния пула (для изоляции тестов)."""
-    global _pool_condition, _pool_loop, _rr_counter, _seq_counter, _waiters, _clock, _jobs_unsupported
+    global _pool_condition, _pool_loop, _rr_counter, _seq_counter, _waiters, _clock, _jobs_unsupported, _active_loads, _last_preempt
     _busy_devices.clear()
     _device_locks.clear()
     _pool_condition = None
@@ -168,6 +191,8 @@ def _reset_pool() -> None:
     _seq_counter = 0
     _clock = None
     _jobs_unsupported = False
+    _active_loads.clear()
+    _last_preempt.clear()
     for w in _waiters:
         if w.timer_handle is not None:
             w.timer_handle.cancel()
@@ -447,6 +472,17 @@ def _dispatch() -> None:
             i += 1
 
 
+def _is_preempt_enabled(settings: Settings | None = None, preempt: bool | None = None) -> bool:
+    if preempt is not None:
+        return bool(preempt)
+    if settings is not None:
+        val = getattr(settings, "preempt", None)
+        if val is not None:
+            return bool(val)
+    val = os.getenv("PREEMPT", "1").strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
 async def acquire(
     candidates: list[str],
     priority: int = 0,
@@ -457,6 +493,8 @@ async def acquire(
     patience_seconds: float | None = None,
     phone_patience_seconds: float | None = None,
     preferred_count: int | None = None,
+    settings: Settings | None = None,
+    preempt: bool | None = None,
 ) -> str:
     """Ожидает, пока не освободится подходящее устройство из списка кандидатов.
 
@@ -518,6 +556,48 @@ async def acquire(
 
     if fut.done() and not fut.cancelled():
         return fut.result()
+
+    if priority == 0 and _is_preempt_enabled(settings, preempt):
+        try:
+            pref_cnt = getattr(waiter, "preferred_count", 1) or 1
+            is_patience_active = (
+                waiter.prefer_order
+                and waiter.patience > 0
+                and len(waiter.candidates) > pref_cnt
+                and (waiter.deadline - now > 1e-4)
+            )
+            cands_to_check = waiter.candidates[:pref_cnt] if is_patience_active else waiter.candidates
+
+            eligible: list[tuple[float, str, ActiveLoad]] = []
+            for dev in cands_to_check:
+                load = _active_loads.get(dev)
+                if load is not None and load.priority >= 1 and not load.preempted:
+                    last_p = _last_preempt.get(dev)
+                    if last_p is not None and (now - last_p) < 20.0:
+                        continue
+                    eligible.append((load.started_at, dev, load))
+
+            if eligible:
+                best = max(eligible, key=lambda x: x[0])
+                _, target_dev, target_load = best
+                target_load.preempted = True
+                _last_preempt[target_dev] = now
+                logger.info(
+                    "Вытесняем фоновую загрузку (приоритет %s) на телефоне %s в пользу живого поиска",
+                    target_load.priority,
+                    target_dev,
+                )
+                cancel_target = target_load.cancel
+                if isinstance(cancel_target, asyncio.Task) or hasattr(cancel_target, "cancel"):
+                    cancel_target.cancel()
+                elif inspect.iscoroutinefunction(cancel_target):
+                    asyncio.create_task(cancel_target())
+                elif callable(cancel_target):
+                    res = cancel_target()
+                    if inspect.isawaitable(res):
+                        asyncio.create_task(res)
+        except Exception as e:
+            logger.warning("Ошибка при вытеснении фоновой загрузки: %s", e)
 
     if waiter.prefer_order and waiter.patience > 0 and len(waiter.candidates) > waiter.preferred_count:
         if waiter.timer_handle is None:
@@ -1085,11 +1165,20 @@ async def fetch_page_snapshot_any(
             prefer_order=prefer_order,
             patience=acq_patience,
             preferred_count=acq_pref,
+            settings=settings,
         )
         t_acq = time.monotonic() - t_acq_start
         total_queue_wait += t_acq
         attempts += 1
         tried.add(dev)
+
+        load = ActiveLoad(
+            priority=priority,
+            cancel=asyncio.current_task(),
+            started_at=_time(),
+            preempted=False,
+        )
+        _active_loads[dev] = load
 
         if stats is not None:
             stats["device"] = dev
@@ -1184,6 +1273,10 @@ async def fetch_page_snapshot_any(
                     stats["fetch_seconds"] = fetch_sec
                     stats["tried"] = list(tried)
                 return snap, finished
+        except asyncio.CancelledError:
+            if load.preempted:
+                raise PreemptedError(f"загрузка на телефоне {dev} вытеснена живым поиском")
+            raise
         except Exception as exc:
             fetch_sec = time.monotonic() - t_fetch_start
             if stats is not None:
@@ -1212,6 +1305,7 @@ async def fetch_page_snapshot_any(
                 log_exc = log_exc.replace(token, "[REDACTED]")
             logger.warning("Устройство %s вернуло ошибку (%s), пробуем следующее устройство", dev, log_exc)
         finally:
+            _active_loads.pop(dev, None)
             await release(dev)
 
     if last_exc is not None:
