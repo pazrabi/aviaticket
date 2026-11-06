@@ -36,6 +36,7 @@ from .formatting import (
     date_ru,
     format_details,
     format_late_site_notification,
+    is_unavailable,
     money,
 )
 from .guard import friendly_error
@@ -108,7 +109,8 @@ class WaitMessageUpdater:
     def _render(self) -> str:
         lines = [self.header, ""]
         if self.site_status:
-            for s in self.sites:
+            ordered = sorted(self.sites, key=lambda s: self.site_status.get(s.name, "").startswith("💤"))
+            for s in ordered:
                 st = self.site_status.get(s.name, f"⏳ {escape(s.name)}")
                 lines.append(st)
             for name, st in self.site_status.items():
@@ -124,6 +126,8 @@ class WaitMessageUpdater:
             if res.ok and res.offers:
                 min_offer = min(res.offers, key=lambda o: o.price)
                 self.site_status[res.site] = f"✅ {escape(res.site)} · от {money(min_offer.price, min_offer.currency)}"
+            elif is_unavailable(res):
+                self.site_status[res.site] = f"💤 {escape(res.site)} · пока недоступен"
             else:
                 err = res.error or "не ответил"
                 self.site_status[res.site] = f"⚠️ {escape(res.site)} · {escape(err)}"

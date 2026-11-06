@@ -56,7 +56,8 @@ def test_format_report_escapes_and_reports_errors():
     text = format_report(q, [ok, bad])
     assert "A&lt;b&gt;" in text
     assert "9 990 ₽" in text
-    assert "капчу" in text
+    assert "пока недоступен" in text  # капчу человеку не показываем, детали про телефоны ему не нужны
+    assert "капч" not in text and "телефон" not in text
     assert "a=1&amp;b=2" in text
 
 
@@ -169,3 +170,16 @@ def test_pipeline_reports_missing_parser_and_missing_token():
     s = Settings(sites=[api])
     res = asyncio.run(search(Query("MOW", "ALA", date(2026, 12, 10)), s))
     assert not res[0].ok and "TP_TOKEN" in res[0].error
+
+
+def test_unavailable_sites_go_last_without_warning_sign():
+    from avia.formatting import is_unavailable
+
+    q = Query("MOW", "ALA", date(2026, 12, 10))
+    cap = SiteResult("onetwotrip", False, [], "сайт показал капчу на всех телефонах, владельцу нужно пройти её руками", captcha=True)
+    other = SiteResult("tutu", False, [], "таймаут")
+    ok = SiteResult("aviasales", True, parse_offers('[{"price": 9990}]', "aviasales"))
+    assert is_unavailable(cap) and not is_unavailable(other) and not is_unavailable(ok)
+    text = format_report(q, [cap, other, ok])
+    assert text.index("таймаут") < text.index("пока недоступен")
+    assert "⚠️" in text and "💤" in text

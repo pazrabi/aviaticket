@@ -33,7 +33,17 @@ def _link_suffix(r: SiteResult) -> str:
     return f' — <a href="{escape(r.page_url, quote=True)}">открыть выдачу</a>'
 
 
+def is_unavailable(r: SiteResult) -> bool:
+    """Сайт временно недоступен из-за капчи или телефонов: человеку детали не нужны."""
+    if r.ok:
+        return False
+    err = (r.error or "").lower()
+    return bool(r.captcha) or any(w in err for w in ("капч", "блокировк", "телефон", "очередь droidhub"))
+
+
 def _error_line(r: SiteResult) -> str:
+    if is_unavailable(r):
+        return f"💤 <b>{escape(r.site)}</b>: пока недоступен" + _link_suffix(r)
     return f"⚠️ <b>{escape(r.site)}</b>: {escape(r.error or 'ошибка')}" + _link_suffix(r)
 
 
@@ -335,6 +345,8 @@ def _site_issue(r: SiteResult) -> str:
     label = f"<b>{escape(site_label(r.site))}</b>"
     link = f' · <a href="{escape(r.page_url, quote=True)}">открыть выдачу</a>' if r.page_url else ""
     if not r.ok:
+        if is_unavailable(r):
+            return f"💤 {label}: пока недоступен{link}"
         return f"⚠️ {label}: {escape(r.error or 'ошибка')}{link}"
     notes = []
     if r.partial:
@@ -381,7 +393,9 @@ def build_report(
         current = []
 
     issues: list[str] = []
-    for r in results:
+    # недоступные сайты (капча, телефоны) внизу списка предупреждений
+    ordered_results = sorted(results, key=lambda r: is_unavailable(r))
+    for r in ordered_results:
         if not r.ok or not r.offers:
             issues.append(_site_issue(r))
             continue
@@ -588,7 +602,10 @@ def build_compact_report(
         card.append("")
         card_blocks.append(card)
 
-    issue_lines = [_site_issue(r) for r in results if not r.ok]
+    # недоступные сайты внизу списка: обычные предупреждения выше
+    failed = [r for r in results if not r.ok]
+    failed.sort(key=lambda r: is_unavailable(r))
+    issue_lines = [_site_issue(r) for r in failed]
 
     empty_lines: list[str] = []
     if not pool:
