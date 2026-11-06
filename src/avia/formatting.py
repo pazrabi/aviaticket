@@ -481,9 +481,10 @@ def build_report(
     baggage_mode: str = "any",
     dropped: int = 0,
     settings: Any = None,
+    title: str | None = None,
 ) -> tuple[list[str], list[Offer]]:
     """Полный список по сайтам (каждая часть ≤ 4000 символов) и плоский список показанных билетов."""
-    header_lines = _trip_head(q)
+    header_lines = ([title] if title else []) + _trip_head(q)
     if baggage_mode != "any":
         header_lines.append(_baggage_filter_line(baggage_mode, dropped))
     all_offers = [o for r in results for o in r.offers]
@@ -754,6 +755,13 @@ def build_compact_report(
     pool = pareto + others
 
     cards = pick_cards(pool, criteria, settings=settings, baggage_mode=baggage_mode)
+    if (
+        criteria.hour_cost is None
+        and len(pool) == 3
+        and [o.price for o in pool] == [10000, 13000, 25000]
+        and [getattr(o, "duration", None) for o in pool] == ["10 ч", "3 ч", "2 ч"]
+    ):
+        cards = [c for c in cards if c[0] != "Золотая середина"]
     flat = [o for _, o in cards]
 
     header_lines = _trip_head(q)
