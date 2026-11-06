@@ -112,14 +112,47 @@ class Scheduler:
         for sub in due:
             groups.setdefault(sub.group_key(), []).append(sub)
 
-        # Сортируем группы по давности последней проверки (самые просроченные первыми)
+        # Сортируем группы: сначала группы, у которых вылет ближе (минимальная дата вылета),
+        # при равенстве — по давности последней проверки (самые просроченные первыми).
+        def _sub_depart(s: Subscription) -> date:
+            try:
+                dep = getattr(s, "depart", None)
+                if dep is None and hasattr(s, "query"):
+                    try:
+                        dep = s.query().depart
+                    except Exception:
+                        dep = None
+                if isinstance(dep, datetime):
+                    return dep.date()
+                if isinstance(dep, date):
+                    return dep
+                if isinstance(dep, str):
+                    try:
+                        return date.fromisoformat(dep.strip())
+                    except Exception:
+                        pass
+            except Exception as e:
+                log.warning("Ошибка определения даты вылета подписки: %s", e)
+            return date.max
+
+        def _group_min_depart(subs: list[Subscription]) -> date:
+            deps = [_sub_depart(s) for s in subs]
+            return min(deps) if deps else date.max
+
         def _group_staleness(subs: list[Subscription]) -> float:
             checks = [s.last_checked_at for s in subs]
             if any(c is None for c in checks):
                 return float("-inf")
             return min(c for c in checks if c is not None)
 
-        sorted_groups = sorted(groups.items(), key=lambda item: _group_staleness(item[1]))
+        def _group_sort_key(item: tuple[Any, list[Subscription]]) -> tuple[date, float]:
+            try:
+                return (_group_min_depart(item[1]), _group_staleness(item[1]))
+            except Exception as e:
+                log.warning("Ошибка вычисления ключа сортировки группы подписок: %s", e)
+                return (date.max, _group_staleness(item[1]))
+
+        sorted_groups = sorted(groups.items(), key=_group_sort_key)
         if self.max_groups_per_run is not None and self.max_groups_per_run > 0:
             sorted_groups = sorted_groups[: self.max_groups_per_run]
 
@@ -134,6 +167,16 @@ class Scheduler:
                 except Exception:
                     log.exception("Ошибка поиска для группы %s", group_key)
                     continue
+
+                try:
+                    if not results:
+                        log.info(
+                            "Результаты поиска для группы %s пусты (вытеснение), пропускаем отметку проверенными",
+                            group_key,
+                        )
+                        continue
+                except Exception as e:
+                    log.warning("Ошибка проверки пустых результатов группы %s: %s", group_key, e)
 
                 assign_ids(results, now=self.clock())
                 if self.history is not None:

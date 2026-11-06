@@ -146,6 +146,7 @@ class Settings:
     hedge_min_attempts: int = 5
     hedge_max_per_search: int = 2
     hedge_delay_seconds: float = 0.0
+    live_reserve: bool = True
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -340,6 +341,9 @@ def load_settings(path: Path | None = None) -> Settings:
     except ValueError:
         hedge_delay_seconds = 0.0
 
+    live_reserve_env = os.getenv("LIVE_RESERVE", "1").strip().lower()
+    live_reserve = live_reserve_env not in ("0", "false", "False", "no", "off")
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -427,6 +431,7 @@ def load_settings(path: Path | None = None) -> Settings:
         hedge_min_attempts=hedge_min_attempts,
         hedge_max_per_search=hedge_max_per_search,
         hedge_delay_seconds=hedge_delay_seconds,
+        live_reserve=live_reserve,
     )
 
 

@@ -52,6 +52,7 @@ class _Waiter:
     deadline: float = 0.0
     timer_handle: asyncio.TimerHandle | None = None
     preferred_count: int = 1
+    live_reserve: bool = True
 
     @property
     def key(self) -> tuple[int, int, int]:
@@ -488,6 +489,23 @@ def _dispatch() -> None:
         else:
             cand = waiter.candidates
 
+        # Резерв телефонов под живой поиск (priority >= 1)
+        is_reserve_blocked = False
+        if waiter.priority >= 1 and getattr(waiter, "live_reserve", True):
+            try:
+                total_cands = len(waiter.candidates)
+                if total_cands >= 3:
+                    busy_cnt = sum(1 for d in waiter.candidates if d in _busy_devices)
+                    if busy_cnt >= total_cands - 1:
+                        is_reserve_blocked = True
+            except Exception as e:
+                logger.warning("Ошибка проверки резерва телефонов в _dispatch: %s", e)
+                is_reserve_blocked = False
+
+        if is_reserve_blocked:
+            i += 1
+            continue
+
         dev = _try_acquire(cand, waiter.prefer_order)
         if dev is not None:
             if waiter.timer_handle is not None:
@@ -511,6 +529,23 @@ def _is_preempt_enabled(settings: Settings | None = None, preempt: bool | None =
     return val not in ("0", "false", "no", "off")
 
 
+def _is_live_reserve_enabled(
+    settings: Settings | None = None, live_reserve: bool | None = None
+) -> bool:
+    try:
+        if live_reserve is not None:
+            return bool(live_reserve)
+        if settings is not None:
+            val = getattr(settings, "live_reserve", None)
+            if val is not None:
+                return bool(val)
+        val = os.getenv("LIVE_RESERVE", "1").strip().lower()
+        return val not in ("0", "false", "no", "off")
+    except Exception as e:
+        logger.warning("Ошибка определения live_reserve: %s", e)
+        return True
+
+
 async def acquire(
     candidates: list[str],
     priority: int = 0,
@@ -523,6 +558,7 @@ async def acquire(
     preferred_count: int | None = None,
     settings: Settings | None = None,
     preempt: bool | None = None,
+    live_reserve: bool | None = None,
 ) -> str:
     """Ожидает, пока не освободится подходящее устройство из списка кандидатов.
 
@@ -563,6 +599,7 @@ async def acquire(
     loop = asyncio.get_running_loop()
     fut: asyncio.Future[str] = loop.create_future()
     now = _time()
+    reserve_enabled = _is_live_reserve_enabled(settings, live_reserve)
     waiter = _Waiter(
         priority=priority,
         weight=weight,
@@ -573,6 +610,7 @@ async def acquire(
         patience=patience_val,
         deadline=now + patience_val,
         preferred_count=preferred_count_val,
+        live_reserve=reserve_enabled,
     )
 
     # Вставляем в очередь с сохранением сортировки по (priority, -weight, seq)
