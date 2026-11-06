@@ -601,6 +601,8 @@ async def _from_browser(
                     "max_seconds": wait_seconds,
                     "already_acquired": already_acquired,
                 }
+                if deep and getattr(site, "replay_post", None) is not None:
+                    fetch_kwargs["replay_post"] = site.replay_post
                 if eval_cb is not None:
                     fetch_kwargs["evaluate"] = eval_cb
 

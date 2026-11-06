@@ -70,12 +70,15 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import logging
 from typing import Any
 
 from ..collector import Snapshot
 from ..models import Leg, Offer, Query
 from . import register_parser
 from .travelpayouts import format_duration
+
+logger = logging.getLogger(__name__)
 
 
 def _extract_time(dt_str: Any) -> str | None:
@@ -529,6 +532,69 @@ def results_complete(snapshot: Snapshot | None) -> bool:
     return v2_count >= 2
 
 
+def merge_tutu_chunks(chunk1: dict[str, Any], chunk2: dict[str, Any]) -> dict[str, Any]:
+    """Объединяет два чанка выдачи Туту (/avia/offers/v2), дедуплицируя офферы по id."""
+    merged = dict(chunk1)
+
+    # 1. Summary: берем из chunk2 или chunk1
+    s1 = chunk1.get("summary") if isinstance(chunk1.get("summary"), dict) else {}
+    s2 = chunk2.get("summary") if isinstance(chunk2.get("summary"), dict) else {}
+    merged_summary = dict(s1)
+    merged_summary.update(s2)
+    merged["summary"] = merged_summary
+
+    # 2. Dictionary: объединяем секции common и avia
+    d1 = chunk1.get("dictionary") if isinstance(chunk1.get("dictionary"), dict) else {}
+    d2 = chunk2.get("dictionary") if isinstance(chunk2.get("dictionary"), dict) else {}
+    merged_dict: dict[str, Any] = {}
+
+    for section in ("common", "avia"):
+        sec1 = d1.get(section) if isinstance(d1.get(section), dict) else {}
+        sec2 = d2.get(section) if isinstance(d2.get(section), dict) else {}
+        merged_sec = dict(sec1)
+        for tbl_name, tbl_val in sec2.items():
+            if isinstance(tbl_val, dict) and isinstance(merged_sec.get(tbl_name), dict):
+                merged_tbl = dict(merged_sec[tbl_name])
+                merged_tbl.update(tbl_val)
+                merged_sec[tbl_name] = merged_tbl
+            else:
+                merged_sec[tbl_name] = tbl_val
+        merged_dict[section] = merged_sec
+    merged["dictionary"] = merged_dict
+
+    # 3. Offers: actual
+    o1 = (chunk1.get("offers") or {}).get("actual") if isinstance(chunk1.get("offers"), dict) else {}
+    o2 = (chunk2.get("offers") or {}).get("actual") if isinstance(chunk2.get("offers"), dict) else {}
+    merged_actual = dict(o1) if isinstance(o1, dict) else {}
+    if isinstance(o2, dict):
+        for k, v in o2.items():
+            if isinstance(v, dict):
+                off_id = str(v.get("id") or k)
+                # Если оффер уже есть по ID, не удваиваем (сохраняем оффер)
+                merged_actual[off_id] = v
+            else:
+                merged_actual[k] = v
+    merged["offers"] = {"actual": merged_actual}
+
+    return merged
+
+
+def merge_tutu_payloads(payload1: str | dict | list, payload2: str | dict | list) -> dict[str, Any]:
+    """Объединяет два JSON-ответа (в виде строки, dict или list) Туту."""
+    def _unwrap(p: str | dict | list) -> dict[str, Any]:
+        if isinstance(p, str):
+            p = json.loads(p)
+        if isinstance(p, list) and p and isinstance(p[0], dict):
+            return p[0]
+        if isinstance(p, dict):
+            return p
+        return {}
+
+    c1 = _unwrap(payload1)
+    c2 = _unwrap(payload2)
+    return merge_tutu_chunks(c1, c2)
+
+
 @register_parser("tutu")
 def parse_tutu(snapshot: Snapshot, query: Query) -> list[Offer]:
     """Разбирает JSON-ответы Туту (/avia/offers/v2) из snapshot в список Offer."""
@@ -536,9 +602,10 @@ def parse_tutu(snapshot: Snapshot, query: Query) -> list[Offer]:
         return []
 
     # Берём ответы, чей URL содержит '/avia/offers/v2'.
-    # Если пришло несколько, побеждает ответ с большим summary.offersCurrentAmount (при равенстве более поздний).
-    best_chunk: dict[str, Any] | None = None
-    best_amount = -1
+    # Ответы с replayed=True представляют собой вторую страницу (результат replay_post).
+    # Для обычных ответов побеждает ответ с большим summary.offersCurrentAmount (при равенстве более поздний).
+    normal_chunks: list[tuple[int, dict[str, Any]]] = []
+    replayed_chunks: list[dict[str, Any]] = []
 
     for url, body in snapshot.json_payloads:
         if "/avia/offers/v2" not in url:
@@ -558,21 +625,56 @@ def parse_tutu(snapshot: Snapshot, query: Query) -> list[Offer]:
         if not isinstance(chunk, dict):
             continue
 
-        summary = chunk.get("summary")
-        amount = -1
-        if isinstance(summary, dict):
-            raw_amt = summary.get("offersCurrentAmount")
-            if isinstance(raw_amt, (int, float)) and not isinstance(raw_amt, bool):
-                amount = int(raw_amt)
+        is_replayed = bool(
+            chunk.get("replayed", False)
+            or (isinstance(data, dict) and data.get("replayed", False))
+        )
 
+        if is_replayed:
+            replayed_chunks.append(chunk)
+        else:
+            summary = chunk.get("summary")
+            amount = -1
+            if isinstance(summary, dict):
+                raw_amt = summary.get("offersCurrentAmount")
+                if isinstance(raw_amt, (int, float)) and not isinstance(raw_amt, bool):
+                    amount = int(raw_amt)
+            normal_chunks.append((amount, chunk))
+
+    best_chunk: dict[str, Any] | None = None
+    best_amount = -1
+    for amount, chunk in normal_chunks:
         if amount >= best_amount:
             best_amount = amount
             best_chunk = chunk
 
-    if best_chunk is None:
-        return []
+    if not replayed_chunks:
+        if best_chunk is None:
+            return []
+        final_chunk = best_chunk
+    else:
+        if best_chunk is not None:
+            final_chunk = best_chunk
+            for r_chunk in replayed_chunks:
+                try:
+                    final_chunk = merge_tutu_chunks(final_chunk, r_chunk)
+                except Exception as exc:
+                    logger.warning("Ошибка слияния replayed-ответа Туту: %s, откат на базовую порцию", exc)
+        else:
+            final_chunk = replayed_chunks[0]
+            for r_chunk in replayed_chunks[1:]:
+                try:
+                    final_chunk = merge_tutu_chunks(final_chunk, r_chunk)
+                except Exception as exc:
+                    logger.warning("Ошибка слияния replayed-ответов Туту: %s", exc)
 
-    offers_data = best_chunk.get("offers")
+    if final_chunk is None:
+        if best_chunk is not None:
+            final_chunk = best_chunk
+        else:
+            return []
+
+    offers_data = final_chunk.get("offers")
     if not isinstance(offers_data, dict):
         return []
 
@@ -580,7 +682,7 @@ def parse_tutu(snapshot: Snapshot, query: Query) -> list[Offer]:
     if not isinstance(actual_offers, dict) or not actual_offers:
         return []
 
-    dictionary = best_chunk.get("dictionary")
+    dictionary = final_chunk.get("dictionary")
     if not isinstance(dictionary, dict):
         dictionary = {}
 
@@ -626,10 +728,15 @@ def parse_tutu(snapshot: Snapshot, query: Query) -> list[Offer]:
 
     is_roundtrip = query is not None and query.return_date is not None
     offers_by_key: dict[tuple[Any, ...], Offer] = {}
+    seen_offer_ids: set[str] = set()
 
     for _offer_id, offer in actual_offers.items():
         if not isinstance(offer, dict):
             continue
+        off_id = str(offer.get("id") or _offer_id)
+        if off_id in seen_offer_ids:
+            continue
+        seen_offer_ids.add(off_id)
         try:
             route_ids = offer.get("routeIds")
             if not isinstance(route_ids, list) or not route_ids:
