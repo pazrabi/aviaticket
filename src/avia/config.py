@@ -120,6 +120,11 @@ class Settings:
     live_assignment: bool = True
     phone_wake_seconds: float = 5.0
     live_deadline_seconds: float = 30.0
+    parser_timeout_seconds: float = 5.0
+    site_fuse_enabled: bool = True
+    site_fuse_window_seconds: int = 300
+    site_fuse_min_phones: int = 2
+    site_fuse_probe_seconds: int = 600
     metrics: Any = None
 
     def __post_init__(self) -> None:
@@ -221,6 +226,24 @@ def load_settings(path: Path | None = None) -> Settings:
         live_deadline_seconds = float(os.getenv("LIVE_DEADLINE_SECONDS", "30"))
     except ValueError:
         live_deadline_seconds = 30.0
+    try:
+        parser_timeout_seconds = float(os.getenv("PARSER_TIMEOUT_SECONDS", "5.0"))
+    except ValueError:
+        parser_timeout_seconds = 5.0
+    site_fuse_env = os.getenv("SITE_FUSE", "1").strip().lower()
+    site_fuse_enabled = site_fuse_env not in ("0", "false", "no", "off")
+    try:
+        site_fuse_window_seconds = int(os.getenv("SITE_FUSE_WINDOW_SECONDS", "300"))
+    except ValueError:
+        site_fuse_window_seconds = 300
+    try:
+        site_fuse_min_phones = int(os.getenv("SITE_FUSE_MIN_PHONES", "2"))
+    except ValueError:
+        site_fuse_min_phones = 2
+    try:
+        site_fuse_probe_seconds = int(os.getenv("SITE_FUSE_PROBE_SECONDS", "600"))
+    except ValueError:
+        site_fuse_probe_seconds = 600
 
     return Settings(
         sites=sites,
@@ -284,4 +307,30 @@ def load_settings(path: Path | None = None) -> Settings:
         live_assignment=live_assignment,
         phone_wake_seconds=phone_wake_seconds,
         live_deadline_seconds=live_deadline_seconds,
+        parser_timeout_seconds=parser_timeout_seconds,
+        site_fuse_enabled=site_fuse_enabled,
+        site_fuse_window_seconds=site_fuse_window_seconds,
+        site_fuse_min_phones=site_fuse_min_phones,
+        site_fuse_probe_seconds=site_fuse_probe_seconds,
     )
+
+
+# Добавляем распознавание «временно недоступен» в formatting.is_unavailable
+try:
+    from . import formatting as _fmt
+
+    if hasattr(_fmt, "is_unavailable") and not getattr(_fmt.is_unavailable, "_fuse_patched", False):
+        _orig_is_unavail = _fmt.is_unavailable
+
+        def _fuse_is_unavailable(r: Any) -> bool:
+            if r.ok:
+                return False
+            err = (getattr(r, "error", "") or "").lower()
+            if "временно недоступен" in err:
+                return True
+            return _orig_is_unavail(r)
+
+        _fuse_is_unavailable._fuse_patched = True  # type: ignore[attr-defined]
+        _fmt.is_unavailable = _fuse_is_unavailable
+except Exception:
+    pass

@@ -32,6 +32,23 @@ CREATE TABLE IF NOT EXISTS site_runs (
 CREATE INDEX IF NOT EXISTS ix_site_runs_ts ON site_runs (ts);
 CREATE INDEX IF NOT EXISTS ix_site_runs_site_ts ON site_runs (site, ts);
 
+CREATE TABLE IF NOT EXISTS attempts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            REAL NOT NULL,
+    search_id     TEXT,
+    site          TEXT NOT NULL,
+    device        TEXT,
+    source        TEXT NOT NULL,
+    role          TEXT NOT NULL,
+    outcome       TEXT NOT NULL,
+    offers        INTEGER NOT NULL,
+    fetch_seconds REAL,
+    queue_wait    REAL
+);
+CREATE INDEX IF NOT EXISTS ix_attempts_ts ON attempts (ts);
+CREATE INDEX IF NOT EXISTS ix_attempts_search_id ON attempts (search_id);
+CREATE INDEX IF NOT EXISTS ix_attempts_site_ts ON attempts (site, ts);
+
 CREATE TABLE IF NOT EXISTS searches (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     ts             REAL NOT NULL,
@@ -51,6 +68,33 @@ CREATE TABLE IF NOT EXISTS parser_watch_state (
     last_alert_status TEXT NOT NULL
 );
 """
+
+
+class SiteOutcome(tuple):
+    """Кортеж (device, ok) с дополнительными атрибутами captcha и ts."""
+
+    def __new__(cls, device: str | None, ok: bool, captcha: bool = False, ts: float = 0.0) -> SiteOutcome:
+        return super().__new__(cls, (device, ok))
+
+    @property
+    def device(self) -> str | None:
+        return self[0]
+
+    @property
+    def ok(self) -> bool:
+        return self[1]
+
+    @property
+    def captcha(self) -> bool:
+        return bool(self._captcha)
+
+    @property
+    def ts(self) -> float:
+        return float(self._ts)
+
+    def __init__(self, device: str | None, ok: bool, captcha: bool = False, ts: float = 0.0) -> None:
+        self._captcha = captcha
+        self._ts = ts
 
 
 class MetricsStore:
@@ -141,6 +185,81 @@ class MetricsStore:
                 )
         except Exception:
             log.exception("ошибка записи метрики site_run")
+
+    def record_attempt(
+        self,
+        site: str,
+        device: str | None = None,
+        source: str = "user",
+        role: str = "primary",
+        outcome: str = "ok",
+        offers: int = 0,
+        fetch_seconds: float | None = None,
+        queue_wait: float | None = None,
+        search_id: str | None = None,
+        ts: float | None = None,
+    ) -> None:
+        """Записывает попытку обращения к сайту на конкретном телефоне."""
+        try:
+            record_ts = time.time() if ts is None else float(ts)
+            s_id = str(search_id).strip() if search_id and str(search_id).strip() else None
+            dev_str = str(device).strip() if device and str(device).strip() else None
+            src_str = str(source).strip() if source else "user"
+            role_str = str(role).strip() if role else "primary"
+            outcome_str = str(outcome).strip() if outcome else "ok"
+            offers_cnt = int(offers) if offers is not None else 0
+            fs_val = float(fetch_seconds) if fetch_seconds is not None else None
+            qw_val = float(queue_wait) if queue_wait is not None else None
+
+            with self._connect() as db:
+                db.execute(
+                    """
+                    INSERT INTO attempts (
+                        ts, search_id, site, device, source, role, outcome, offers, fetch_seconds, queue_wait
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record_ts,
+                        s_id,
+                        site,
+                        dev_str,
+                        src_str,
+                        role_str,
+                        outcome_str,
+                        offers_cnt,
+                        fs_val,
+                        qw_val,
+                    ),
+                )
+        except Exception:
+            log.exception("ошибка записи метрики attempt")
+
+    def site_recent_outcomes(self, site: str, since_ts: float) -> list[tuple[str | None, bool]]:
+        """Возвращает исходы запусков сайта (device, ok) за период >= since_ts из site_runs."""
+        try:
+            with self._connect() as db:
+                cur = db.execute(
+                    """
+                    SELECT device, ok, captcha, ts
+                    FROM site_runs
+                    WHERE site = ? AND ts >= ?
+                    ORDER BY ts ASC
+                    """,
+                    (site, float(since_ts)),
+                )
+                return [
+                    SiteOutcome(
+                        row["device"],
+                        bool(row["ok"]),
+                        bool(row["captcha"]),
+                        float(row["ts"]),
+                    )
+                    for row in cur.fetchall()
+                ]
+        except Exception:
+            log.exception("ошибка получения недавних исходов сайта %s", site)
+            return []
 
     def record_results(
         self,

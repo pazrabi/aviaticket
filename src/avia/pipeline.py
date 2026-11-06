@@ -9,9 +9,11 @@ from pathlib import Path
 import re
 import time
 from typing import Awaitable, Callable
+import uuid
 
 from .collector import fetch_snapshot, Snapshot
 from .config import Settings, SiteConfig
+from .dispatcher import check_site_fuse, _get_metrics, _FUSE_STATE
 from .droidhub import (
     DroidhubError,
     PreferenceList,
@@ -35,6 +37,39 @@ guard = SearchGuard()
 
 # Пауза перед повторной попыткой при 0 вариантов (ParserEmptyError)
 EMPTY_RETRY_DELAY: float = 3.0
+
+
+def _record_attempt_helper(
+    settings: Settings,
+    site_name: str,
+    device: str | None,
+    priority: int,
+    outcome: str,
+    offers: int,
+    fetch_seconds: float | None,
+    queue_wait: float | None,
+    search_id: str | None,
+    attempt_tracker: list[int] | None = None,
+) -> None:
+    role = "primary"
+    if attempt_tracker is not None:
+        if attempt_tracker[0] > 0:
+            role = "retry"
+        attempt_tracker[0] += 1
+    metrics = _get_metrics(settings)
+    if metrics is not None:
+        source = "user" if priority == 0 else ("sub" if priority == 1 else "bg")
+        metrics.record_attempt(
+            site=site_name,
+            device=device,
+            source=source,
+            role=role,
+            outcome=outcome,
+            offers=offers,
+            fetch_seconds=fetch_seconds,
+            queue_wait=queue_wait,
+            search_id=search_id,
+        )
 
 
 def _hit_time_cap(priority: int, cur_stats: dict[str, Any], wait_seconds: Any) -> bool:
@@ -183,7 +218,20 @@ async def _process_snapshot(
     if site.parser and parser is None:
         raise RuntimeError(f"парсер {site.parser!r} не зарегистрирован")
     if parser:
-        offers = parser(snap, q)
+        timeout = float(getattr(settings, "parser_timeout_seconds", 5.0) or 0)
+        if timeout > 0:
+            try:
+                if inspect.iscoroutinefunction(parser):
+                    offers = await asyncio.wait_for(parser(snap, q), timeout=timeout)
+                else:
+                    offers = await asyncio.wait_for(asyncio.to_thread(parser, snap, q), timeout=timeout)
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                raise TimeoutError("разбор не уложился в таймаут") from exc
+        else:
+            if inspect.iscoroutinefunction(parser):
+                offers = await parser(snap, q)
+            else:
+                offers = parser(snap, q)
         for o in offers:
             o.site = site.name
         checker = getattr(parser, "results_complete", None)
@@ -243,7 +291,11 @@ async def _from_browser(
     stats: dict | None = None,
     exclude_devices: set[str] | None = None,
     device_order: list[str] | None = None,
+    search_id: str | None = None,
+    attempt_tracker: list[int] | None = None,
 ) -> tuple[list[Offer], str | None, bool]:
+    if attempt_tracker is None:
+        attempt_tracker = [0]
     extra = await resolve_extra(site, q)
     url = build_url(site, q, extra=extra)
 
@@ -341,6 +393,24 @@ async def _from_browser(
                 last_exc = exc
                 if stats is not None:
                     stats.update(cur_stats)
+                dev = cur_stats.get("device")
+                outcome = "502" if "502" in str(exc) else (
+                    "timeout" if ("таймаут" in str(exc).lower() or isinstance(exc, (asyncio.TimeoutError, TimeoutError))) else (
+                        "captcha" if ("капч" in str(exc).lower() or "блокировк" in str(exc).lower()) else "error"
+                    )
+                )
+                _record_attempt_helper(
+                    settings=settings,
+                    site_name=site.name,
+                    device=dev,
+                    priority=priority,
+                    outcome=outcome,
+                    offers=0,
+                    fetch_seconds=cur_stats.get("fetch_seconds"),
+                    queue_wait=cur_stats.get("queue_wait"),
+                    search_id=search_id,
+                    attempt_tracker=attempt_tracker,
+                )
                 raise
 
             cur_stats["finished"] = bool(finished)
@@ -358,6 +428,18 @@ async def _from_browser(
                 remaining_cands.pop(0)
 
             if snap.blocked:
+                _record_attempt_helper(
+                    settings=settings,
+                    site_name=site.name,
+                    device=used_dev,
+                    priority=priority,
+                    outcome="captcha",
+                    offers=0,
+                    fetch_seconds=cur_stats.get("fetch_seconds"),
+                    queue_wait=cur_stats.get("queue_wait"),
+                    search_id=search_id,
+                    attempt_tracker=attempt_tracker,
+                )
                 if remaining_cands:
                     try:
                         from .droidhub import _record_failure
@@ -381,6 +463,20 @@ async def _from_browser(
             try:
                 offers, page_url, partial = await _process_snapshot(site, snap, q, settings, partial=partial)
             except ParserEmptyError as exc:
+                exc_str = str(exc).lower()
+                outcome = "wrong_dates" if ("другие даты" in exc_str or getattr(exc, "tag", None) == "wrongdates") else "empty"
+                _record_attempt_helper(
+                    settings=settings,
+                    site_name=site.name,
+                    device=used_dev,
+                    priority=priority,
+                    outcome=outcome,
+                    offers=0,
+                    fetch_seconds=cur_stats.get("fetch_seconds"),
+                    queue_wait=cur_stats.get("queue_wait"),
+                    search_id=search_id,
+                    attempt_tracker=attempt_tracker,
+                )
                 if remaining_cands and not _hit_time_cap(priority, cur_stats, wait_seconds):
                     try:
                         from .droidhub import _record_failure
@@ -410,9 +506,51 @@ async def _from_browser(
                     )
                     continue
                 raise
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                _record_attempt_helper(
+                    settings=settings,
+                    site_name=site.name,
+                    device=used_dev,
+                    priority=priority,
+                    outcome="timeout",
+                    offers=0,
+                    fetch_seconds=cur_stats.get("fetch_seconds"),
+                    queue_wait=cur_stats.get("queue_wait"),
+                    search_id=search_id,
+                    attempt_tracker=attempt_tracker,
+                )
+                raise
+            except Exception as exc:
+                exc_str = str(exc).lower()
+                outcome = "captcha" if ("капч" in exc_str or "блокировк" in exc_str) else "error"
+                _record_attempt_helper(
+                    settings=settings,
+                    site_name=site.name,
+                    device=used_dev,
+                    priority=priority,
+                    outcome=outcome,
+                    offers=0,
+                    fetch_seconds=cur_stats.get("fetch_seconds"),
+                    queue_wait=cur_stats.get("queue_wait"),
+                    search_id=search_id,
+                    attempt_tracker=attempt_tracker,
+                )
+                raise
 
             # Проверка: неполная выдача без офферов
             if partial and not offers:
+                _record_attempt_helper(
+                    settings=settings,
+                    site_name=site.name,
+                    device=used_dev,
+                    priority=priority,
+                    outcome="empty",
+                    offers=0,
+                    fetch_seconds=cur_stats.get("fetch_seconds"),
+                    queue_wait=cur_stats.get("queue_wait"),
+                    search_id=search_id,
+                    attempt_tracker=attempt_tracker,
+                )
                 if remaining_cands and not _hit_time_cap(priority, cur_stats, wait_seconds):
                     try:
                         from .droidhub import _record_failure
@@ -433,6 +571,24 @@ async def _from_browser(
                     continue
                 return offers, page_url, partial
 
+            outcome = "partial" if partial else "ok"
+            _record_attempt_helper(
+                settings=settings,
+                site_name=site.name,
+                device=used_dev,
+                priority=priority,
+                outcome=outcome,
+                offers=len(offers),
+                fetch_seconds=cur_stats.get("fetch_seconds"),
+                queue_wait=cur_stats.get("queue_wait"),
+                search_id=search_id,
+                attempt_tracker=attempt_tracker,
+            )
+            try:
+                if site.name in _FUSE_STATE and offers:
+                    _FUSE_STATE[site.name]["degraded"] = False
+            except Exception:
+                pass
             return offers, page_url, partial
 
         if last_exc:
@@ -469,8 +625,11 @@ async def _run_site(
     settings: Settings,
     *,
     priority: int = 0,
+    weight: int = 0,
     guard: SearchGuard | None = None,
     device_order: list[str] | None = None,
+    search_id: str | None = None,
+    now: float | None = None,
 ) -> SiteResult:
     if q.return_date and not site.url_template_rt:
         return SiteResult(
@@ -479,9 +638,22 @@ async def _run_site(
             offers=[],
             error="для этого сайта обратные билеты пока не поддерживаются",
         )
+    if priority == 0:
+        is_fused, had_captcha = check_site_fuse(site.name, settings, now=now, consume_probe=True)
+        if is_fused:
+            return SiteResult(
+                site=site.name,
+                ok=False,
+                offers=[],
+                error="сайт временно недоступен",
+                captcha=had_captcha,
+                elapsed=0.0,
+                priority=priority,
+            )
     t0 = time.monotonic()
     g = guard if guard is not None else globals()["guard"]
     stats: dict[str, Any] = {}
+    attempt_tracker: list[int] = [0]
     if priority > 0 and getattr(site, "phone_full_wait_seconds", None) is not None:
         actual_wait_sec = site.phone_full_wait_seconds
     else:
@@ -500,6 +672,8 @@ async def _run_site(
                     stats=stats,
                     exclude_devices=exclude,
                     device_order=device_order,
+                    search_id=search_id,
+                    attempt_tracker=attempt_tracker,
                 )
             return await _from_browser(
                 site,
@@ -509,6 +683,8 @@ async def _run_site(
                 weight=weight,
                 stats=stats,
                 device_order=device_order,
+                search_id=search_id,
+                attempt_tracker=attempt_tracker,
             )
         except TypeError:
             try:
@@ -612,7 +788,12 @@ async def _run_site(
         )
     except Exception as e:
         log.exception("Ошибка при поиске на сайте %s: %s", site.name, e)
-        err_msg = str(e) if "TP_TOKEN" in str(e) else friendly_error(e)
+        if "разбор не уложился в таймаут" in str(e):
+            err_msg = "разбор не уложился в таймаут"
+        elif "TP_TOKEN" in str(e):
+            err_msg = str(e)
+        else:
+            err_msg = friendly_error(e)
         is_captcha = "капч" in str(e).lower() or "блокировк" in str(e).lower() or "капч" in err_msg.lower()
         return SiteResult(
             site=site.name,
@@ -638,7 +819,11 @@ async def search(
     priority: int = 0,
     guard: SearchGuard | None = None,
     on_site_done: Callable[[SiteResult], Awaitable[None] | None] | None = None,
+    search_id: str | None = None,
+    now: float | None = None,
 ) -> list[SiteResult]:
+    if search_id is None:
+        search_id = uuid.uuid4().hex[:8]
     sites = [s for s in settings.sites if s.enabled]
     # живой поиск идёт всеми сайтами сразу (телефоны сами делят работу через очередь хаба);
     # подписки и фон остаются осторожными: не больше 2 сайтов разом
@@ -651,7 +836,7 @@ async def search(
         try:
             from .dispatcher import plan_live_assignment
 
-            device_assignments = plan_live_assignment(settings, sites)
+            device_assignments = plan_live_assignment(settings, sites, now=now)
         except Exception as e:
             log.warning("Ошибка при расчёте live assignment: %s", e)
             device_assignments = {}
@@ -664,10 +849,28 @@ async def search(
                 offers=[],
                 error="для этого сайта обратные билеты пока не поддерживаются",
             )
+        elif priority == 0 and check_site_fuse(s.name, settings, now=now, consume_probe=False)[0]:
+            is_fused, had_captcha = check_site_fuse(s.name, settings, now=now, consume_probe=True)
+            res = SiteResult(
+                site=s.name,
+                ok=False,
+                offers=[],
+                error="сайт временно недоступен",
+                captcha=had_captcha,
+            )
         else:
             dev_order = device_assignments.get(s.name)
             async with sem:
-                res = await _run_site(s, q, settings, priority=priority, guard=g, device_order=dev_order)
+                res = await _run_site(
+                    s,
+                    q,
+                    settings,
+                    priority=priority,
+                    guard=g,
+                    device_order=dev_order,
+                    search_id=search_id,
+                    now=now,
+                )
 
         if on_site_done is not None:
             try:
@@ -679,3 +882,24 @@ async def search(
         return res
 
     return await asyncio.gather(*(guarded(s) for s in sites))
+
+
+# Добавляем распознавание «временно недоступен» в formatting.is_unavailable
+try:
+    from . import formatting as _fmt
+
+    if hasattr(_fmt, "is_unavailable") and not getattr(_fmt.is_unavailable, "_fuse_patched", False):
+        _orig_is_unavail = _fmt.is_unavailable
+
+        def _fuse_is_unavailable(r: Any) -> bool:
+            if r.ok:
+                return False
+            err = (getattr(r, "error", "") or "").lower()
+            if "временно недоступен" in err:
+                return True
+            return _orig_is_unavail(r)
+
+        _fuse_is_unavailable._fuse_patched = True  # type: ignore[attr-defined]
+        _fmt.is_unavailable = _fuse_is_unavailable
+except Exception:
+    pass
