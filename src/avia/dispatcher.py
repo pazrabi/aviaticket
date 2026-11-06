@@ -3,11 +3,105 @@ from __future__ import annotations
 
 from collections import defaultdict
 import logging
+from pathlib import Path
+import time
 from typing import Any, Callable, Sequence
 
 from .config import Settings, SiteConfig
 
 logger = logging.getLogger("avia.dispatcher")
+
+_FUSE_STATE: dict[str, dict[str, Any]] = {}
+
+
+def reset_fuse_state() -> None:
+    """Сброс состояния предохранителя сайтов (для тестов)."""
+    _FUSE_STATE.clear()
+
+
+def _get_metrics(settings: Settings) -> Any | None:
+    metrics = getattr(settings, "metrics", None)
+    if metrics is None:
+        storage_dir = getattr(settings, "storage_dir", None)
+        if storage_dir is not None:
+            metrics_path = Path(storage_dir) / "metrics.sqlite"
+            if metrics_path.exists():
+                from .metrics import MetricsStore
+
+                metrics = MetricsStore(metrics_path)
+    return metrics
+
+
+def check_site_fuse(
+    site_name: str,
+    settings: Settings,
+    now: float | None = None,
+    consume_probe: bool = False,
+) -> tuple[bool, bool]:
+    """Проверяет, деградировал ли сайт в живом поиске.
+
+    Возвращает (is_fused, had_captcha).
+    Если сайт деградировал и не наступило время пробной попытки — возвращает (True, had_captcha).
+    Если наступило время пробной попытки — возвращает (False, False), а при consume_probe=True
+    фиксирует запуск пробной попытки.
+    """
+    if not getattr(settings, "site_fuse_enabled", True):
+        return False, False
+    metrics = _get_metrics(settings)
+    if metrics is None:
+        return False, False
+
+    cur_now = time.time() if now is None else float(now)
+    window_seconds = float(getattr(settings, "site_fuse_window_seconds", 300))
+    probe_seconds = float(getattr(settings, "site_fuse_probe_seconds", 600))
+    min_phones = int(getattr(settings, "site_fuse_min_phones", 2))
+
+    state = _FUSE_STATE.get(site_name)
+    if state and state.get("degraded", False):
+        last_fail = state.get("last_failure_ts", cur_now - window_seconds)
+        outcomes = metrics.site_recent_outcomes(site_name, last_fail)
+        if any(ok for _, ok in outcomes):
+            state["degraded"] = False
+            return False, False
+
+        last_probe = state.get("last_probe_ts", last_fail)
+        if cur_now - last_probe >= probe_seconds:
+            if consume_probe:
+                state["last_probe_ts"] = cur_now
+            return False, False
+        return True, bool(state.get("had_captcha", False))
+
+    since_ts = cur_now - window_seconds
+    outcomes = metrics.site_recent_outcomes(site_name, since_ts)
+    if not outcomes:
+        return False, False
+
+    if any(ok for _, ok in outcomes):
+        return False, False
+
+    failed_phones = {dev for dev, ok in outcomes if not ok and dev}
+    if len(failed_phones) < min_phones:
+        return False, False
+
+    had_captcha = any(
+        (item[2] if len(item) > 2 else getattr(item, "captcha", False))
+        for item in outcomes
+    )
+    max_fail_ts = max((getattr(o, "ts", since_ts) for o in outcomes), default=cur_now)
+
+    _FUSE_STATE[site_name] = {
+        "degraded": True,
+        "last_failure_ts": max_fail_ts,
+        "last_probe_ts": max_fail_ts,
+        "had_captcha": had_captcha,
+    }
+
+    if cur_now - max_fail_ts >= probe_seconds:
+        if consume_probe:
+            _FUSE_STATE[site_name]["last_probe_ts"] = cur_now
+        return False, False
+
+    return True, had_captcha
 
 
 def _get_default_screen_state(settings: Settings) -> dict[str, bool | None]:
@@ -269,6 +363,9 @@ def plan_live_assignment(
         if getattr(s, "source", "browser") != "browser":
             continue
         if not (getattr(s, "phone", "") or "").strip():
+            continue
+        is_fused, _ = check_site_fuse(s.name, settings, now=now, consume_probe=False)
+        if is_fused:
             continue
         eligible_sites.append(s)
 
