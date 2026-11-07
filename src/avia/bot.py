@@ -256,6 +256,7 @@ class Bot:
         self._last_samples_check: float = 0.0
         self._last_soft_allow: float = 0.0
         self._last_trial_check: float = 0.0
+        self._last_stop_calibrate: float = 0.0
         self._trial_notified: dict[str, float] = {}
         try:
             from .samples import install_sample_hook
@@ -1984,6 +1985,27 @@ class Bot:
                             asyncio.create_task(_run_trial_check())
                         except Exception:
                             log.exception("ошибка запуска фоновой проверки trial-сайтов")
+
+                if getattr(self.s, "stop_calibrate", True) and self.metrics is not None:
+                    if time.time() - getattr(self, "_last_stop_calibrate", 0.0) >= 86400:
+                        self._last_stop_calibrate = time.time()
+                        try:
+                            from .stop_calibrate import calibrate_all, write_rules
+
+                            def _do_stop_calibrate() -> None:
+                                res = calibrate_all(self.metrics, days=7)
+                                if res:
+                                    write_rules(self.s.storage_dir / "stop_rules.json", res)
+
+                            async def _run_stop_calibrate() -> None:
+                                try:
+                                    await asyncio.to_thread(_do_stop_calibrate)
+                                except Exception:
+                                    log.exception("ошибка фоновой калибровки правил остановки")
+
+                            asyncio.create_task(_run_stop_calibrate())
+                        except Exception:
+                            log.exception("ошибка запуска фонового пересчёта stop_calibrate")
 
                 if time.time() - self._last_samples_check >= 7 * 86400:
                     try:

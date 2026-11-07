@@ -29,6 +29,31 @@ def main():
         code = run_parser_check_cli(target_dir)
         sys.exit(code)
 
+    if len(sys.argv) > 1 and sys.argv[1] == "stop-calibrate":
+        from .metrics import MetricsStore
+        from .stop_calibrate import calibrate_all, write_rules
+        s = load_settings()
+        metrics = MetricsStore(s.storage_dir / "metrics.sqlite")
+        dry_run = "--dry-run" in sys.argv
+        results = calibrate_all(metrics, days=7)
+        if not results:
+            print("Нет данных для калибровки (недостаточно выборок за 7 дней)")
+            return
+        print(f"{'Сайт':<16} {'N (сек)':<10} {'Выборок':<10} {'Доля промахов':<15}")
+        print("-" * 55)
+        for site, info in sorted(results.items()):
+            n_val = info.get("stable_seconds", 0.0)
+            n_str = f"{n_val:.1f}" if isinstance(n_val, (int, float)) else str(n_val)
+            s_val = info.get("samples", 0)
+            m_val = info.get("miss_share", 0.0)
+            m_str = f"{m_val * 100.0:.1f}%" if isinstance(m_val, (int, float)) else str(m_val)
+            print(f"{site:<16} {n_str:<10} {s_val:<10} {m_str:<15}")
+        if not dry_run:
+            out_path = s.storage_dir / "stop_rules.json"
+            write_rules(out_path, results)
+            print(f"\nСохранено в {out_path}")
+        return
+
     try:
         q = parse_query(" ".join(a for a in sys.argv[1:] if not a.startswith("--")))
     except ParseError as e:

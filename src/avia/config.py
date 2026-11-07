@@ -150,6 +150,7 @@ class Settings:
     price_timeline: bool = True
     fast_stop: bool = True
     stop_stable_seconds: float = 8.0
+    stop_calibrate: bool = True
     preempt: bool = True
     hedge: bool = True
     hedge_fail_share: float = 0.15
@@ -333,6 +334,9 @@ def load_settings(path: Path | None = None) -> Settings:
     except ValueError:
         stop_stable_seconds = 8.0
 
+    stop_calibrate_env = os.getenv("STOP_CALIBRATE", "1").strip().lower()
+    stop_calibrate = stop_calibrate_env not in ("0", "false", "False", "no", "off")
+
     preempt_env = os.getenv("PREEMPT", "1").strip().lower()
     preempt = preempt_env not in ("0", "false", "False", "no", "off")
 
@@ -452,6 +456,7 @@ def load_settings(path: Path | None = None) -> Settings:
         price_timeline=price_timeline,
         fast_stop=fast_stop,
         stop_stable_seconds=stop_stable_seconds,
+        stop_calibrate=stop_calibrate,
         preempt=preempt,
         hedge=hedge,
         hedge_fail_share=hedge_fail_share,
