@@ -1,16 +1,61 @@
 """Хранилище метрик парсинга авиабилетов в SQLite."""
 from __future__ import annotations
 
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import contextvars
+import functools
 import json
 import logging
+import os
 from pathlib import Path
 import sqlite3
+import threading
 import time
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence, TypeVar
 
 from .models import SiteResult
 
 log = logging.getLogger("avia.metrics")
+
+# Схема уже проверена в этом процессе: абсолютный путь → (st_dev, st_ino) файла базы.
+# Предохранитель, хеджи и запись попыток создают MetricsStore на каждый вызов; без этого кэша
+# каждый такой вызов заново гонял executescript(SCHEMA) и PRAGMA table_info.
+# Файл заменили или пересоздали пустым — проверяем схему снова.
+_SCHEMA_READY: dict[str, tuple[int, int]] = {}
+_SCHEMA_LOCK = threading.Lock()
+
+
+def _db_file_identity(path: Path) -> tuple[int, int] | None:
+    """(st_dev, st_ino) непустого файла базы; None — файла нет или он пустой."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if st.st_size <= 0:
+        return None
+    return st.st_dev, st.st_ino
+
+
+# Запросы к метрикам с пути живого поиска (предохранитель, раскладка, хеджи, запись попыток)
+# идут в своём небольшом пуле потоков, а не в общем пуле asyncio.to_thread:
+# - 20 поисков разом дают сотни коротких запросов; в общем пуле за ними в очереди стояли
+#   разборы страниц (тоже asyncio.to_thread) и не укладывались в PARSER_TIMEOUT_SECONDS;
+# - десяток потоков с циклами по строкам SQLite отнимает GIL у цикла событий, два — нет.
+# Замер (tests/test_loop_responsive.py, 20 поисков на базе в 100 тыс. строк): общий пул —
+# 33 таймаута разбора из 133 попыток и ~10 с на прогон; свой пул из 2 потоков — 0 и ~2 с.
+METRICS_IO_WORKERS = 2
+_METRICS_IO_POOL = ThreadPoolExecutor(max_workers=METRICS_IO_WORKERS, thread_name_prefix="avia-metrics")
+
+T = TypeVar("T")
+
+
+async def run_metrics_io(func: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+    """Как asyncio.to_thread, но в пуле запросов к метрикам: цикл событий не ждёт SQLite."""
+    loop = asyncio.get_running_loop()
+    call = functools.partial(contextvars.copy_context().run, func, *args, **kwargs)
+    return await loop.run_in_executor(_METRICS_IO_POOL, call)
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS site_runs (
@@ -127,8 +172,26 @@ class MetricsStore:
     def _ensure_schema(self) -> None:
         if self._initialized:
             return
-        if str(self.path) != ":memory:":
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+        if str(self.path) == ":memory:":
+            self._apply_schema()
+            self._initialized = True
+            return
+        key = os.path.abspath(self.path)
+        ident = _db_file_identity(self.path)
+        if ident is not None and _SCHEMA_READY.get(key) == ident:
+            self._initialized = True
+            return
+        with _SCHEMA_LOCK:
+            ident = _db_file_identity(self.path)
+            if ident is None or _SCHEMA_READY.get(key) != ident:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._apply_schema()
+                ident = _db_file_identity(self.path)
+                if ident is not None:
+                    _SCHEMA_READY[key] = ident
+        self._initialized = True
+
+    def _apply_schema(self) -> None:
         with sqlite3.connect(self.path, timeout=10) as conn:
             conn.executescript(SCHEMA)
             # Миграция: проверяем и добавляем недостающие колонки (идемпотентно)
@@ -157,7 +220,6 @@ class MetricsStore:
             cols_srch = {row[1] for row in conn.execute("PRAGMA table_info(searches)").fetchall()}
             if "cls" not in cols_srch:
                 conn.execute("ALTER TABLE searches ADD COLUMN cls TEXT")
-        self._initialized = True
 
     def _connect(self) -> sqlite3.Connection:
         self._ensure_schema()

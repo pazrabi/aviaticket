@@ -902,10 +902,13 @@ class PriceHistory:
         now_ts = time.time() if now is None else float(now)
         since_ts = now_ts - days * 86400.0
 
+        # Замер (поиск) считается в SQLite: одна строка на search_id, а для старых строк без него —
+        # на observed_at. В Python приходят тысячи строк, а не все цены окна (100 тыс. и больше)
         with self._connect() as db:
             rows = db.execute(
-                "SELECT origin, destination, search_id, observed_at FROM price_history "
-                "WHERE observed_at >= ? AND observed_at <= ?",
+                "SELECT origin, destination, NULLIF(search_id, ''), MIN(observed_at) FROM price_history "
+                "WHERE observed_at >= ? AND observed_at <= ? "
+                "GROUP BY origin, destination, COALESCE(NULLIF(search_id, ''), observed_at)",
                 (since_ts, now_ts),
             ).fetchall()
 
@@ -941,12 +944,17 @@ class PriceHistory:
         now_ts = time.time() if now is None else float(now)
         since_ts = now_ts - days * 86400.0
 
+        # Строки одного замера с теми же observed_at и days_to_departure сворачиваются в SQLite
+        # до лучшей цены (MIN): ниже от цен замера берётся только минимум, остальные поля у них
+        # совпадают. В Python приходит строка на замер, а не на каждую цену окна
         with self._connect() as db:
             rows = db.execute(
                 "SELECT origin, destination, depart, COALESCE(return_date, ''), adults, "
-                "price, search_id, observed_at, days_to_departure "
+                "MIN(price), NULLIF(search_id, ''), observed_at, days_to_departure "
                 "FROM price_history "
                 "WHERE observed_at >= ? AND observed_at <= ? "
+                "GROUP BY origin, destination, depart, COALESCE(return_date, ''), adults, "
+                "NULLIF(search_id, ''), observed_at, days_to_departure "
                 "ORDER BY observed_at ASC",
                 (since_ts, now_ts),
             ).fetchall()

@@ -77,6 +77,8 @@ class SpeedTable:
             self.metrics_path = Path("state") / "metrics.sqlite"
 
         self._lock = threading.RLock()
+        # пересчёт из SQLite идёт в одном потоке за раз; остальные ждут его и берут свежую таблицу
+        self._refresh_lock = threading.Lock()
         self._stats: dict[tuple[str, str, str], SpeedStats] = {}
         self._pairs: dict[tuple[str, str], PairStatus] = {}
         self._site_medians: dict[tuple[str, str], float] = {}
@@ -430,9 +432,13 @@ class SpeedTable:
 
     def _ensure_fresh(self, now: float | None = None) -> None:
         refresh_sec = getattr(self.settings, "speed_refresh_seconds", 300) if self.settings else 300
-        mono = time.monotonic()
-        if (mono - self._last_refresh) >= refresh_sec:
-            self.refresh(now=now)
+        if (time.monotonic() - self._last_refresh) < refresh_sec:
+            return
+        # раскладка живого поиска идёт в потоках (pipeline → run_metrics_io): 20 поисков разом без
+        # замка пересчитывали одну и ту же таблицу по 7 дням site_runs по нескольку раз параллельно
+        with self._refresh_lock:
+            if (time.monotonic() - self._last_refresh) >= refresh_sec:
+                self.refresh(now=now)
 
     def get_stats(
         self,

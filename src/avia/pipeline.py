@@ -13,7 +13,7 @@ import uuid
 
 from .collector import fetch_snapshot, Snapshot
 from .config import Settings, SiteConfig
-from .dispatcher import check_site_fuse, _get_metrics, _FUSE_STATE
+from .dispatcher import check_site_fuse_async, _get_metrics, _FUSE_STATE
 from .droidhub import (
     DroidhubError,
     PreemptedError,
@@ -25,6 +25,7 @@ from .droidhub import (
 from .extract import extract_offers
 from .fresh_cache import FreshCache
 from .guard import SearchGuard, friendly_error
+from .metrics import run_metrics_io
 from .models import Offer, Query, SiteResult
 from .parsers import PARSERS
 from .parsers.kupibilet import build_ticket_url
@@ -86,6 +87,15 @@ def _record_attempt_helper(
             t_first_offer=t_first_offer,
             t_last_improve=t_last_improve,
         )
+
+
+async def _record_attempt(**kwargs: Any) -> None:
+    """_record_attempt_helper из асинхронного кода: запись в SQLite идёт в потоке.
+
+    Запись ждёт замок базы, пока её читают предохранитель, хеджи и таблица скоростей (они теперь
+    в потоках), и в цикле событий это ожидание стопорило бы все поиски.
+    """
+    await run_metrics_io(_record_attempt_helper, **kwargs)
 
 
 def _hit_time_cap(priority: int, cur_stats: dict[str, Any], wait_seconds: Any) -> bool:
@@ -637,7 +647,7 @@ async def _from_browser(
                         "captcha" if ("капч" in str(exc).lower() or "блокировк" in str(exc).lower()) else "error"
                     )
                 )
-                _record_attempt_helper(
+                await _record_attempt(
                     settings=settings,
                     site_name=site.name,
                     device=dev,
@@ -670,7 +680,7 @@ async def _from_browser(
                 remaining_cands.pop(0)
 
             if snap.blocked:
-                _record_attempt_helper(
+                await _record_attempt(
                     settings=settings,
                     site_name=site.name,
                     device=used_dev,
@@ -714,7 +724,7 @@ async def _from_browser(
             except ParserEmptyError as exc:
                 exc_str = str(exc).lower()
                 outcome = "wrong_dates" if ("другие даты" in exc_str or getattr(exc, "tag", None) == "wrongdates") else "empty"
-                _record_attempt_helper(
+                await _record_attempt(
                     settings=settings,
                     site_name=site.name,
                     device=used_dev,
@@ -770,7 +780,7 @@ async def _from_browser(
                     continue
                 raise
             except (asyncio.TimeoutError, TimeoutError) as exc:
-                _record_attempt_helper(
+                await _record_attempt(
                     settings=settings,
                     site_name=site.name,
                     device=used_dev,
@@ -790,7 +800,7 @@ async def _from_browser(
             except Exception as exc:
                 exc_str = str(exc).lower()
                 outcome = "captcha" if ("капч" in exc_str or "блокировк" in exc_str) else "error"
-                _record_attempt_helper(
+                await _record_attempt(
                     settings=settings,
                     site_name=site.name,
                     device=used_dev,
@@ -810,7 +820,7 @@ async def _from_browser(
 
             # Проверка: неполная выдача без офферов
             if partial and not offers:
-                _record_attempt_helper(
+                await _record_attempt(
                     settings=settings,
                     site_name=site.name,
                     device=used_dev,
@@ -857,7 +867,7 @@ async def _from_browser(
                 return offers, page_url, partial
 
             outcome = "partial" if partial else "ok"
-            _record_attempt_helper(
+            await _record_attempt(
                 settings=settings,
                 site_name=site.name,
                 device=used_dev,
@@ -955,7 +965,8 @@ async def _run_site(
             error="для этого сайта обратные билеты пока не поддерживаются",
         )
     if priority == 0:
-        is_fused, had_captcha = check_site_fuse(site.name, settings, now=now, consume_probe=True)
+        # запрос к SQLite — в потоке: предохранитель зовётся на старте каждого сайта каждого поиска
+        is_fused, had_captcha = await check_site_fuse_async(site.name, settings, now=now, consume_probe=True)
         if is_fused:
             return SiteResult(
                 site=site.name,
@@ -996,8 +1007,13 @@ async def _run_site(
                 cands = candidates(settings, site, priority=0)
                 primary_dev = (device_order[0] if device_order else (cands[0] if cands else None))
 
-                if primary_dev and len(cands) >= 2 and hedge_risky(site.name, primary_dev, settings, now=now):
-                    stats_info = get_hedge_stats(site.name, primary_dev, settings, now=now)
+                # попытки пары за 7 дней читаются из SQLite — в потоке, чтобы старт сайта не держал цикл
+                if (
+                    primary_dev
+                    and len(cands) >= 2
+                    and await run_metrics_io(hedge_risky, site.name, primary_dev, settings, now=now)
+                ):
+                    stats_info = await run_metrics_io(get_hedge_stats, site.name, primary_dev, settings, now=now)
                     if stats_info.get("is_fail_risky"):
                         delay = float(getattr(settings, "hedge_delay_seconds", 0.0))
                     else:
@@ -1350,7 +1366,8 @@ async def search(
         try:
             from .dispatcher import plan_live_assignment
 
-            device_assignments = plan_live_assignment(settings, sites, now=now)
+            # раскладка читает предохранитель и таблицу скоростей из SQLite — в потоке
+            device_assignments = await run_metrics_io(plan_live_assignment, settings, sites, now=now)
         except Exception as e:
             log.warning("Ошибка при расчёте live assignment: %s", e)
             device_assignments = {}
@@ -1382,8 +1399,8 @@ async def search(
                 offers=[],
                 error="для этого сайта обратные билеты пока не поддерживаются",
             )
-        elif priority == 0 and check_site_fuse(s.name, settings, now=now, consume_probe=False)[0]:
-            is_fused, had_captcha = check_site_fuse(s.name, settings, now=now, consume_probe=True)
+        elif priority == 0 and (await check_site_fuse_async(s.name, settings, now=now, consume_probe=False))[0]:
+            is_fused, had_captcha = await check_site_fuse_async(s.name, settings, now=now, consume_probe=True)
             res = SiteResult(
                 site=s.name,
                 ok=False,

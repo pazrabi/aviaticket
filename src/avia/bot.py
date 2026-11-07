@@ -1135,104 +1135,110 @@ class Bot:
         actions = self.dialog.on_text(chat_id, text)
         await self._process_actions(chat_id, actions)
 
+    def _stats_text(self) -> str:
+        """Текст /stats. Синхронный: читает users, историю цен и подписки из SQLite."""
+        st = self.users.stats()
+        lines = [
+            f"Людей: {st['users']} (заблокировано {st['blocked']})",
+            f"Поисков сегодня: {st['today']}, всего: {st['searches']}",
+            "",
+            "Последние:",
+        ]
+        for u in self.users.recent(10):
+            name = f"@{u.username}" if u.username else (u.first_name or "—")
+            mark = " 🚫" if u.blocked else ""
+            lines.append(f"{u.tg_id} {escape(name)} · поисков {u.total_searches}{mark}")
+
+        # Дополнительные блоки аналитики
+        # 1. Популярные маршруты (7 дней)
+        try:
+            if self.history is not None:
+                routes = self.history.popular_routes(5, 7)
+                lines.append("")
+                lines.append("Популярные маршруты (7 дней):")
+                if routes:
+                    for orig, dest, count in routes:
+                        lines.append(f"{escape(city_name(orig))} → {escape(city_name(dest))}: {count}")
+                else:
+                    lines.append("—")
+        except Exception:
+            log.exception("stats: popular_routes failed")
+
+        # 2. Уведомления по причинам (7 дней)
+        try:
+            if self.subs is not None:
+                since_ts = time.time() - 7 * 86400.0
+                reasons_dict = self.subs.notification_reason_counts(since_ts)
+                lines.append("")
+                lines.append("Уведомления по причинам (7 дней):")
+                if reasons_dict:
+                    for r_name, r_cnt in reasons_dict.items():
+                        lines.append(f"{escape(r_name)}: {r_cnt}")
+                else:
+                    lines.append("—")
+        except Exception:
+            log.exception("stats: notification_reason_counts failed")
+
+        # 3. Очередь проверок
+        try:
+            if self.subs is not None:
+                now_ts = time.time()
+                today_d = (
+                    self.dialog.today()
+                    if hasattr(self, "dialog") and hasattr(self.dialog, "today") and callable(self.dialog.today)
+                    else date.today()
+                )
+                ov = self.subs.overdue_stats(now_ts, today_d)
+                lines.append("")
+                lines.append("Очередь проверок:")
+                lines.append(
+                    f"Подписок {ov.get('total', 0)}, просрочено {ov.get('overdue', 0)}, максимум отстаёт на {ov.get('max_lag_minutes', 0)} мин"
+                )
+        except Exception:
+            log.exception("stats: overdue_stats failed")
+
+        # 4. Мак работал сегодня
+        try:
+            if self.history is not None:
+                now_ts = time.time()
+                now_dt = datetime.fromtimestamp(now_ts)
+                start_of_day = datetime(now_dt.year, now_dt.month, now_dt.day).timestamp()
+                cov = self.history.coverage(start_of_day, now_ts)
+                covered_s = cov.get("covered_seconds", 0.0)
+                gaps = cov.get("gaps", [])
+                worked_h = int(round(covered_s / 3600.0))
+                total_h = int(round(max(0.0, now_ts - start_of_day) / 3600.0))
+                lines.append("")
+                lines.append("Мак работал сегодня:")
+                lines.append(f"Работал {worked_h} ч из {total_h}, пропусков {len(gaps)}")
+        except Exception:
+            log.exception("stats: coverage failed")
+
+        # 5. Фоновый сбор цен
+        try:
+            lines.append("")
+            if self.s.bg_collect:
+                n = self.bg_collector.done_today if self.bg_collector is not None else 0
+                m = self.s.bg_collect_max_per_day
+                lines.append(f"Фоновый сбор: сегодня {n} из {m}")
+            else:
+                lines.append("Фоновый сбор: выключен")
+        except Exception:
+            log.exception("stats: bg_collect failed")
+
+        lines.append("")
+        lines.append("Подробнее: /admin")
+
+        return "\n".join(lines)
+
     async def _admin_command(self, chat_id: int, text: str) -> None:
         """/stats — сводка и последние люди; /block <id>, /unblock <id> — закрыть или вернуть доступ."""
         cmd, _, arg = text.partition(" ")
         cmd = cmd.split("@")[0]
         if cmd == "/stats":
-            st = self.users.stats()
-            lines = [
-                f"Людей: {st['users']} (заблокировано {st['blocked']})",
-                f"Поисков сегодня: {st['today']}, всего: {st['searches']}",
-                "",
-                "Последние:",
-            ]
-            for u in self.users.recent(10):
-                name = f"@{u.username}" if u.username else (u.first_name or "—")
-                mark = " 🚫" if u.blocked else ""
-                lines.append(f"{u.tg_id} {escape(name)} · поисков {u.total_searches}{mark}")
-
-            # Дополнительные блоки аналитики
-            # 1. Популярные маршруты (7 дней)
-            try:
-                if self.history is not None:
-                    routes = self.history.popular_routes(5, 7)
-                    lines.append("")
-                    lines.append("Популярные маршруты (7 дней):")
-                    if routes:
-                        for orig, dest, count in routes:
-                            lines.append(f"{escape(city_name(orig))} → {escape(city_name(dest))}: {count}")
-                    else:
-                        lines.append("—")
-            except Exception:
-                log.exception("stats: popular_routes failed")
-
-            # 2. Уведомления по причинам (7 дней)
-            try:
-                if self.subs is not None:
-                    since_ts = time.time() - 7 * 86400.0
-                    reasons_dict = self.subs.notification_reason_counts(since_ts)
-                    lines.append("")
-                    lines.append("Уведомления по причинам (7 дней):")
-                    if reasons_dict:
-                        for r_name, r_cnt in reasons_dict.items():
-                            lines.append(f"{escape(r_name)}: {r_cnt}")
-                    else:
-                        lines.append("—")
-            except Exception:
-                log.exception("stats: notification_reason_counts failed")
-
-            # 3. Очередь проверок
-            try:
-                if self.subs is not None:
-                    now_ts = time.time()
-                    today_d = (
-                        self.dialog.today()
-                        if hasattr(self, "dialog") and hasattr(self.dialog, "today") and callable(self.dialog.today)
-                        else date.today()
-                    )
-                    ov = self.subs.overdue_stats(now_ts, today_d)
-                    lines.append("")
-                    lines.append("Очередь проверок:")
-                    lines.append(
-                        f"Подписок {ov.get('total', 0)}, просрочено {ov.get('overdue', 0)}, максимум отстаёт на {ov.get('max_lag_minutes', 0)} мин"
-                    )
-            except Exception:
-                log.exception("stats: overdue_stats failed")
-
-            # 4. Мак работал сегодня
-            try:
-                if self.history is not None:
-                    now_ts = time.time()
-                    now_dt = datetime.fromtimestamp(now_ts)
-                    start_of_day = datetime(now_dt.year, now_dt.month, now_dt.day).timestamp()
-                    cov = self.history.coverage(start_of_day, now_ts)
-                    covered_s = cov.get("covered_seconds", 0.0)
-                    gaps = cov.get("gaps", [])
-                    worked_h = int(round(covered_s / 3600.0))
-                    total_h = int(round(max(0.0, now_ts - start_of_day) / 3600.0))
-                    lines.append("")
-                    lines.append("Мак работал сегодня:")
-                    lines.append(f"Работал {worked_h} ч из {total_h}, пропусков {len(gaps)}")
-            except Exception:
-                log.exception("stats: coverage failed")
-
-            # 5. Фоновый сбор цен
-            try:
-                lines.append("")
-                if self.s.bg_collect:
-                    n = self.bg_collector.done_today if self.bg_collector is not None else 0
-                    m = self.s.bg_collect_max_per_day
-                    lines.append(f"Фоновый сбор: сегодня {n} из {m}")
-                else:
-                    lines.append("Фоновый сбор: выключен")
-            except Exception:
-                log.exception("stats: bg_collect failed")
-
-            lines.append("")
-            lines.append("Подробнее: /admin")
-
-            await self.send(chat_id, "\n".join(lines))
+            # сводка читает историю цен, подписки и людей из SQLite — в потоке, цикл событий не ждёт
+            stats_text = await asyncio.to_thread(self._stats_text)
+            await self.send(chat_id, stats_text)
             return
         arg = arg.strip()
         if not arg.lstrip("-").isdigit():
