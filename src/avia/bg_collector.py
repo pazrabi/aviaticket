@@ -114,7 +114,8 @@ class BackgroundCollector:
                 seed_routes=self.s.bg_collect_seed_routes,
                 horizons_days=self.s.bg_collect_horizons_days,
                 slots=self._slots,
-                last_checked=self._last_attempt_at,
+                # копия: выбор идёт в потоке, а цикл событий тем временем дописывает попытки
+                last_checked=dict(self._last_attempt_at),
             )
 
         return self.history.collect_candidates(
@@ -137,7 +138,10 @@ class BackgroundCollector:
 
         now = self._clock()
         try:
-            candidates = self.get_candidates(limit=1)
+            # выбор кандидатов читает историю цен (популярные маршруты, последние замеры) — в потоке
+            candidates = await asyncio.to_thread(self.get_candidates, limit=1)
+        except asyncio.CancelledError:
+            raise
         except Exception:
             log.exception("ошибка получения кандидатов фонового сбора")
             return False
@@ -150,7 +154,9 @@ class BackgroundCollector:
         self._last_attempt_at[(q.origin.upper(), q.destination.upper(), q.depart)] = now
         if hasattr(self.history, "mark_bg_slot_checked"):
             try:
-                self.history.mark_bg_slot_checked(q.origin, q.destination, q.depart, now)
+                await asyncio.to_thread(self.history.mark_bg_slot_checked, q.origin, q.destination, q.depart, now)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 pass
 

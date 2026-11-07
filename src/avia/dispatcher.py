@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import defaultdict
 import logging
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable, Sequence
 
@@ -12,11 +13,17 @@ from .config import Settings, SiteConfig
 logger = logging.getLogger("avia.dispatcher")
 
 _FUSE_STATE: dict[str, dict[str, Any]] = {}
+# Предохранитель проверяют из нескольких потоков сразу (check_site_fuse_async, раскладка в пуле
+# метрик) и синхронно: решение и правка _FUSE_STATE — под замком, запрос к SQLite — вне замка.
+_FUSE_LOCK = threading.Lock()
+# Сколько раз перечитать исходы, если состояние сайта сменилось, пока шёл запрос
+_FUSE_READ_ATTEMPTS = 3
 
 
 def reset_fuse_state() -> None:
     """Сброс состояния предохранителя сайтов (для тестов)."""
-    _FUSE_STATE.clear()
+    with _FUSE_LOCK:
+        _FUSE_STATE.clear()
 
 
 def _get_metrics(settings: Settings) -> Any | None:
@@ -32,47 +39,45 @@ def _get_metrics(settings: Settings) -> Any | None:
     return metrics
 
 
-def check_site_fuse(
-    site_name: str,
-    settings: Settings,
-    now: float | None = None,
-    consume_probe: bool = False,
-) -> tuple[bool, bool]:
-    """Проверяет, деградировал ли сайт в живом поиске.
-
-    Возвращает (is_fused, had_captcha).
-    Если сайт деградировал и не наступило время пробной попытки — возвращает (True, had_captcha).
-    Если наступило время пробной попытки — возвращает (False, False), а при consume_probe=True
-    фиксирует запуск пробной попытки.
-    """
-    if not getattr(settings, "site_fuse_enabled", True):
-        return False, False
-    metrics = _get_metrics(settings)
-    if metrics is None:
-        return False, False
-
-    cur_now = time.time() if now is None else float(now)
+def _fuse_params(settings: Settings) -> tuple[float, float, int]:
     window_seconds = float(getattr(settings, "site_fuse_window_seconds", 300))
     probe_seconds = float(getattr(settings, "site_fuse_probe_seconds", 600))
     min_phones = int(getattr(settings, "site_fuse_min_phones", 2))
+    return window_seconds, probe_seconds, min_phones
 
+
+def _fuse_query_since(site_name: str, cur_now: float, window_seconds: float) -> tuple[bool, float]:
+    """С какого момента нужны исходы сайта: (сайт уже деградировал, since_ts). Вызывать под _FUSE_LOCK."""
     state = _FUSE_STATE.get(site_name)
     if state and state.get("degraded", False):
-        last_fail = state.get("last_failure_ts", cur_now - window_seconds)
-        outcomes = metrics.site_recent_outcomes(site_name, last_fail)
+        return True, state.get("last_failure_ts", cur_now - window_seconds)
+    return False, cur_now - window_seconds
+
+
+def _fuse_decide(
+    site_name: str,
+    outcomes: Sequence[Any],
+    degraded: bool,
+    since_ts: float,
+    cur_now: float,
+    probe_seconds: float,
+    min_phones: int,
+    consume_probe: bool,
+) -> tuple[bool, bool]:
+    """Решение предохранителя по исходам сайта начиная с since_ts. Вызывать под _FUSE_LOCK."""
+    if degraded:
+        state = _FUSE_STATE[site_name]
         if any(ok for _, ok in outcomes):
             state["degraded"] = False
             return False, False
 
-        last_probe = state.get("last_probe_ts", last_fail)
+        last_probe = state.get("last_probe_ts", since_ts)
         if cur_now - last_probe >= probe_seconds:
             if consume_probe:
                 state["last_probe_ts"] = cur_now
             return False, False
         return True, bool(state.get("had_captcha", False))
 
-    since_ts = cur_now - window_seconds
-    outcomes = metrics.site_recent_outcomes(site_name, since_ts)
     if not outcomes:
         return False, False
 
@@ -102,6 +107,69 @@ def check_site_fuse(
         return False, False
 
     return True, had_captcha
+
+
+def check_site_fuse(
+    site_name: str,
+    settings: Settings,
+    now: float | None = None,
+    consume_probe: bool = False,
+) -> tuple[bool, bool]:
+    """Проверяет, деградировал ли сайт в живом поиске.
+
+    Возвращает (is_fused, had_captcha).
+    Если сайт деградировал и не наступило время пробной попытки — возвращает (True, had_captcha).
+    Если наступило время пробной попытки — возвращает (False, False), а при consume_probe=True
+    фиксирует запуск пробной попытки.
+
+    Синхронная: ходит в SQLite. Из асинхронного кода — check_site_fuse_async.
+    Можно звать из нескольких потоков: исходы читаются вне замка, а решение принимается
+    под замком и только если состояние сайта не сменилось за время чтения.
+    """
+    if not getattr(settings, "site_fuse_enabled", True):
+        return False, False
+    metrics = _get_metrics(settings)
+    if metrics is None:
+        return False, False
+
+    cur_now = time.time() if now is None else float(now)
+    window_seconds, probe_seconds, min_phones = _fuse_params(settings)
+
+    for _ in range(_FUSE_READ_ATTEMPTS):
+        with _FUSE_LOCK:
+            degraded, since_ts = _fuse_query_since(site_name, cur_now, window_seconds)
+        outcomes = metrics.site_recent_outcomes(site_name, since_ts)
+        with _FUSE_LOCK:
+            if _fuse_query_since(site_name, cur_now, window_seconds) == (degraded, since_ts):
+                return _fuse_decide(
+                    site_name, outcomes, degraded, since_ts, cur_now, probe_seconds, min_phones, consume_probe
+                )
+
+    # состояние сайта менялось на каждом чтении: последнее чтение и решение — под одним замком
+    with _FUSE_LOCK:
+        degraded, since_ts = _fuse_query_since(site_name, cur_now, window_seconds)
+        outcomes = metrics.site_recent_outcomes(site_name, since_ts)
+        return _fuse_decide(
+            site_name, outcomes, degraded, since_ts, cur_now, probe_seconds, min_phones, consume_probe
+        )
+
+
+async def check_site_fuse_async(
+    site_name: str,
+    settings: Settings,
+    now: float | None = None,
+    consume_probe: bool = False,
+) -> tuple[bool, bool]:
+    """check_site_fuse для асинхронного кода: запрос к SQLite идёт в потоке, цикл событий не стоит.
+
+    Живой поиск зовёт предохранитель на старте каждого сайта: синхронно 100 поисков разом
+    (500 стартов сайтов) держали цикл несколько секунд.
+    """
+    if not getattr(settings, "site_fuse_enabled", True):
+        return False, False
+    from .metrics import run_metrics_io
+
+    return await run_metrics_io(check_site_fuse, site_name, settings, now, consume_probe)
 
 
 def _get_default_screen_state(settings: Settings) -> dict[str, bool | None]:
