@@ -400,6 +400,21 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
     else:
         lines.append("—")
 
+    try:
+        storage_dir = getattr(settings, "storage_dir", None)
+        rules_path = Path(storage_dir) / "stop_rules.json" if storage_dir else Path("state/stop_rules.json")
+        if rules_path.is_file():
+            import json
+            from .stop_calibrate import format_report as format_stop_report
+            data = json.loads(rules_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                report_str = format_stop_report(data)
+                if report_str:
+                    lines.append("")
+                    lines.append(report_str)
+    except Exception as e:
+        log.warning("Ошибка чтения stop_rules.json в build_parse: %s", e)
+
     return truncate_text("\n".join(lines))
 
 
