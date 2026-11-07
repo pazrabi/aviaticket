@@ -400,6 +400,7 @@ def offer_card(
     baggage_mode: str = "any",
     cheapest: Offer | None = None,
     settings: Any = None,
+    history_hint: str | None = None,
 ) -> list[str]:
     """Карточка билета: заголовок, цена и авиакомпания, плечи в цитате, ссылка."""
     display_title = title
@@ -423,6 +424,8 @@ def offer_card(
     if airline:
         price_row += f"  ·  {airline}"
     lines = [head, price_row]
+    if history_hint:
+        lines.append(history_hint)
     body = offer_body(o, q, baggage_mode)
     if body:
         lines.append("<blockquote>" + "\n".join(body) + "</blockquote>")
@@ -482,6 +485,7 @@ def build_report(
     dropped: int = 0,
     settings: Any = None,
     title: str | None = None,
+    history_hint: str | None = None,
 ) -> tuple[list[str], list[Offer]]:
     """Полный список по сайтам (каждая часть ≤ 4000 символов) и плоский список показанных билетов."""
     header_lines = ([title] if title else []) + _trip_head(q)
@@ -493,6 +497,8 @@ def build_report(
         header_lines.append(
             f"🏆 Дешевле всего: <b>{money(best.price, best.currency)}</b> · {escape(site_label(best.site))}"
         )
+        if history_hint:
+            header_lines.append(history_hint)
     header_lines.append("")
 
     chunks: list[str] = []
@@ -628,6 +634,7 @@ def format_report(
     baggage_mode: str = "any",
     dropped: int = 0,
     settings: Any = None,
+    history_hint: str | None = None,
 ) -> str:
     """Формирует текстовый отчёт со сквозной нумерацией вариантов."""
     parts, _ = build_report(
@@ -637,6 +644,7 @@ def format_report(
         baggage_mode=baggage_mode,
         dropped=dropped,
         settings=settings,
+        history_hint=history_hint,
     )
     return "\n".join(parts)
 
@@ -731,6 +739,7 @@ def build_compact_report(
     dropped_baggage: int = 0,
     dropped_criteria: int = 0,
     settings: Any = None,
+    history_hint: str | None = None,
 ) -> tuple[list[str], list[Offer], list[Offer]]:
     """Сводка с карточками (pick_cards), плоским списком (flat) и пулом билетов (pool)."""
     unique_offers: list[Offer] = []
@@ -780,6 +789,7 @@ def build_compact_report(
     cheapest_offer = next((o for t, o in cards if t == "Самый дешёвый"), None)
     card_blocks: list[list[str]] = []
     for counter, (title, o) in enumerate(cards, start=1):
+        hint = history_hint if counter == 1 else None
         card = offer_card(
             o,
             q,
@@ -788,6 +798,7 @@ def build_compact_report(
             baggage_mode=baggage_mode,
             cheapest=cheapest_offer,
             settings=settings,
+            history_hint=hint,
         )
         card.append("")
         card_blocks.append(card)

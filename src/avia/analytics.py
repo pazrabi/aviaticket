@@ -2,6 +2,14 @@
 from __future__ import annotations
 
 import html
+import logging
+import statistics
+
+log = logging.getLogger("avia.analytics")
+
+HINT_MIN_POINTS: int = 10
+HINT_PCT: int = 8
+HINT_WINDOW_DAYS: int = 30
 
 SITE_NAMES: dict[str, str] = {
     "aviasales": "Aviasales",
@@ -122,3 +130,30 @@ def summary_lines(
     if best:
         lines.append(best)
     return lines
+
+
+def history_hint_line(best_price: int, route_prices: list[int]) -> str | None:
+    """Строка положения цены относительно типичной цены маршрута по истории замеров."""
+    if not route_prices or len(route_prices) < HINT_MIN_POINTS or best_price <= 0:
+        return None
+    try:
+        m = float(statistics.median(route_prices))
+        if m <= 0:
+            return None
+        lower_bound = m * (1.0 - HINT_PCT / 100.0)
+        upper_bound = m * (1.0 + HINT_PCT / 100.0)
+        n = len(route_prices)
+
+        if best_price <= lower_bound + 1e-9:
+            diff = m - best_price
+            x = int(round((diff / m) * 100.0))
+            return f"💚 Ниже обычного: на {x}% дешевле типичной цены маршрута (по {n} замерам)"
+        elif best_price >= upper_bound - 1e-9:
+            diff = best_price - m
+            x = int(round((diff / m) * 100.0))
+            return f"🔺 Выше обычного: на {x}% дороже типичной цены маршрута (по {n} замерам)"
+        return None
+    except Exception as exc:
+        log.warning("Ошибка при вычислении history_hint_line: %s", exc)
+        return None
+
