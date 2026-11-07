@@ -320,6 +320,8 @@ class MetricsStore:
             batch_ts = time.time() if ts is None else float(ts)
             rows = []
             for r in results:
+                if getattr(r, "cached_age", None) is not None:
+                    continue
                 is_captcha = bool(getattr(r, "captcha", False))
                 if not is_captcha and r.error:
                     if "капч" in r.error.lower():

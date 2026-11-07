@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from html import escape
+import logging
+import math
 from typing import Sequence
+
+log = logging.getLogger("avia.formatting")
 
 from .criteria import SearchCriteria
 from .filters import (
@@ -76,6 +80,18 @@ def _ago(ts: float, now: float | None = None) -> str:
     if sec < 86400:
         return f"{int(sec // 3600)} ч назад"
     return f"{int(sec // 86400)} дн назад"
+
+
+def format_cached_age_note(age: float) -> str:
+    """Форматирует пометку о свежести данных из кеша.
+
+    Меньше 1 мин -> '🕒 данные только что'
+    Иначе -> '🕒 данные N мин назад' (N округляется вверх, минимум 1).
+    """
+    if age < 60:
+        return "🕒 данные только что"
+    n = max(1, math.ceil(age / 60.0))
+    return f"🕒 данные {n} мин назад"
 
 
 def price_change_short(o: Offer) -> str:
@@ -401,6 +417,7 @@ def offer_card(
     cheapest: Offer | None = None,
     settings: Any = None,
     history_hint: str | None = None,
+    cached_age: float | None = None,
 ) -> list[str]:
     """Карточка билета: заголовок, цена и авиакомпания, плечи в цитате, ссылка."""
     display_title = title
@@ -431,6 +448,12 @@ def offer_card(
         lines.append("<blockquote>" + "\n".join(body) + "</blockquote>")
     link = offer_link_html(o)
     src = f"<i>{escape(site_label(o.site))}</i>"
+    eff_age = cached_age if cached_age is not None else getattr(o, "cached_age", None)
+    if eff_age is not None:
+        try:
+            src = f"{src} · {format_cached_age_note(float(eff_age))}"
+        except Exception as e:
+            log.warning("Ошибка форматирования cached_age в offer_card: %s", e)
     lines.append(f"🔗 {link}  ·  {src}" if link else src)
     if o.alts:
         alt_items: list[str] = []
@@ -529,6 +552,11 @@ def build_report(
             notes.append("неполная выдача: сайт ещё догружал варианты")
         if r.cached:
             notes.append("из кэша, цены могли измениться")
+        if getattr(r, "cached_age", None) is not None:
+            try:
+                notes.append(format_cached_age_note(float(r.cached_age)))
+            except Exception as e:
+                log.warning("Ошибка форматирования cached_age в build_report: %s", e)
         site_head = [f"<b>{escape(site_label(r.site))}</b>  <i>{r.elapsed:.0f} с</i>"]
         site_head += [f"<i>{escape(n)}</i>" for n in notes]
 
@@ -614,9 +642,14 @@ def build_report(
             flush()
         current.extend(block)
 
-    footer = _ozon_footer(q, results) + [
-        "<i>Цены сняты сейчас, при покупке могут измениться.</i>",
-    ]
+    footer: list[str] = []
+    ok_results = [r for r in results if r.ok]
+    if ok_results and all(getattr(r, "cached_age", None) is not None for r in ok_results):
+        footer.append(
+            "🕒 Показаны свежие данные (не старше 10 минут). Для нового запроса нажмите «🔎 Глубокий поиск»"
+        )
+    footer.extend(_ozon_footer(q, results))
+    footer.append("<i>Цены сняты сейчас, при покупке могут измениться.</i>")
     if flat:
         footer.append("💬 Напишите номер билета, чтобы увидеть подробности.")
     if not fits(footer):
@@ -787,9 +820,17 @@ def build_compact_report(
     header_lines.append("")
 
     cheapest_offer = next((o for t, o in cards if t == "Самый дешёвый"), None)
+    cached_ages: dict[str, float] = {}
+    for r in results:
+        if getattr(r, "cached_age", None) is not None:
+            cached_ages[r.site] = float(r.cached_age)
+
     card_blocks: list[list[str]] = []
     for counter, (title, o) in enumerate(cards, start=1):
         hint = history_hint if counter == 1 else None
+        c_age = getattr(o, "cached_age", None)
+        if c_age is None:
+            c_age = cached_ages.get(o.site)
         card = offer_card(
             o,
             q,
@@ -799,6 +840,7 @@ def build_compact_report(
             cheapest=cheapest_offer,
             settings=settings,
             history_hint=hint,
+            cached_age=c_age,
         )
         card.append("")
         card_blocks.append(card)
@@ -815,9 +857,15 @@ def build_compact_report(
             empty_lines.append("Попробуйте ослабить фильтры.")
         empty_lines.append("")
 
-    footer_lines = _ozon_footer(q, results) + [
-        "<i>Цены сняты сейчас, при покупке могут измениться.</i>",
-    ]
+    ok_results = [r for r in results if r.ok]
+    all_cached = bool(ok_results) and all(getattr(r, "cached_age", None) is not None for r in ok_results)
+    footer_lines: list[str] = []
+    if all_cached:
+        footer_lines.append(
+            "🕒 Показаны свежие данные (не старше 10 минут). Для нового запроса нажмите «🔎 Глубокий поиск»"
+        )
+    footer_lines.extend(_ozon_footer(q, results))
+    footer_lines.append("<i>Цены сняты сейчас, при покупке могут измениться.</i>")
     if flat:
         footer_lines.append("💬 Напишите номер билета, чтобы увидеть подробности.")
 
@@ -911,7 +959,14 @@ def format_details(o: Offer, q: Query) -> str:
     lines.append("")
     lines.append(f"🧳 Багаж: {escape(o.baggage) if o.baggage else 'не указано'}")
     lines.append(f"🎒 Ручная кладь: {escape(o.carry_on) if o.carry_on else 'не указано'}")
-    lines.append(f"🏷 Сайт: {escape(site_label(o.site))}")
+    site_note = ""
+    eff_age = getattr(o, "cached_age", None)
+    if eff_age is not None:
+        try:
+            site_note = f" · {format_cached_age_note(float(eff_age))}"
+        except Exception as e:
+            log.warning("Ошибка форматирования cached_age в format_details: %s", e)
+    lines.append(f"🏷 Сайт: {escape(site_label(o.site))}{site_note}")
 
     link = offer_link_html(o)
     if link:

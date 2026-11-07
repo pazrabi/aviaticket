@@ -277,7 +277,7 @@ class PriceHistory:
         to_record_ids: set[int] = set()
         by_site: dict[str, list[Offer]] = {}
         for r in res_list:
-            if not r.ok:
+            if not r.ok or getattr(r, "cached_age", None) is not None:
                 continue
             site_offers = [o for o in r.offers if o.offer_id]
             if site_offers:
@@ -311,8 +311,8 @@ class PriceHistory:
                     o.prev_price, o.prev_at = int(last[0]), float(last[1])
                     o.min_price = int(low[0]) if low and low[0] is not None else None
 
-                # В историю пишем только самые дешёвые варианты сайта в этом поиске
-                if id(o) not in to_record_ids:
+                # В историю пишем только самые дешёвые варианты сайта в этом поиске (и не пишем из кеша)
+                if id(o) not in to_record_ids or getattr(o, "cached_age", None) is not None:
                     continue
 
                 fresh_same = last is not None and int(last[0]) == o.price and now - float(last[1]) < SAME_PRICE_TTL

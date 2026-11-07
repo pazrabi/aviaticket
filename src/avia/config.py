@@ -159,6 +159,7 @@ class Settings:
     live_reserve: bool = True
     trial_stage: bool = True
     history_hint: bool = True
+    fresh_max_age_seconds: float = 600.0
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -362,6 +363,11 @@ def load_settings(path: Path | None = None) -> Settings:
     history_hint_env = os.getenv("HISTORY_HINT", "1").strip().lower()
     history_hint = history_hint_env not in ("0", "false", "False", "no", "off")
 
+    try:
+        fresh_max_age_seconds = float(os.getenv("FRESH_MAX_AGE_SECONDS", "600"))
+    except ValueError:
+        fresh_max_age_seconds = 600.0
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -452,6 +458,7 @@ def load_settings(path: Path | None = None) -> Settings:
         live_reserve=live_reserve,
         trial_stage=trial_stage,
         history_hint=history_hint,
+        fresh_max_age_seconds=fresh_max_age_seconds,
     )
 
 

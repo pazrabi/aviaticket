@@ -23,6 +23,7 @@ from .droidhub import (
     phone_enabled,
 )
 from .extract import extract_offers
+from .fresh_cache import FreshCache
 from .guard import SearchGuard, friendly_error
 from .models import Offer, Query, SiteResult
 from .parsers import PARSERS
@@ -1292,6 +1293,8 @@ async def search(
     search_id: str | None = None,
     now: float | None = None,
     deep: bool = False,
+    fresh_cache: FreshCache | None = None,
+    fresh_max_age: float = 0,
 ) -> list[SiteResult]:
     if search_id is None:
         search_id = uuid.uuid4().hex[:8]
@@ -1339,7 +1342,17 @@ async def search(
             log.warning("Ошибка инициализации HedgeTracker: %s", e)
 
     async def guarded(s: SiteConfig) -> SiteResult:
-        if q.return_date and not s.url_template_rt:
+        cached_item = None
+        if priority == 0 and not deep and fresh_cache is not None and fresh_max_age > 0:
+            try:
+                cached_item = fresh_cache.get(q, s.name, fresh_max_age)
+            except Exception as e:
+                log.warning("Ошибка чтения fresh_cache для сайта %s: %s", s.name, e)
+                cached_item = None
+
+        if cached_item is not None:
+            res, _ = cached_item
+        elif q.return_date and not s.url_template_rt:
             res = SiteResult(
                 site=s.name,
                 ok=False,
@@ -1377,6 +1390,12 @@ async def search(
                         log.info("Сайт %s вытеснен живым поиском (пропуск без ошибки)", s.name)
                         return None
                     raise
+
+            if fresh_cache is not None and res is not None:
+                try:
+                    fresh_cache.put(q, s.name, res)
+                except Exception as e:
+                    log.warning("Ошибка записи fresh_cache для сайта %s: %s", s.name, e)
 
         if on_site_done is not None and res is not None:
             try:

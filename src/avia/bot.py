@@ -19,6 +19,7 @@ from .backup import backup_all, list_backups
 from .bg_collector import BackgroundCollector
 from .config import Settings, load_settings
 from .deep_cache import DeepCache
+from .fresh_cache import FreshCache
 from .dialog import (
     HELP,
     DeepSearchRequest,
@@ -77,6 +78,9 @@ async def _search_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
                 raise
             kwargs.pop("on_site_done", None)
             kwargs.pop("priority", None)
+            kwargs.pop("deep", None)
+            kwargs.pop("fresh_cache", None)
+            kwargs.pop("fresh_max_age", None)
             return await fn(*args, **kwargs)
 
 
@@ -226,6 +230,11 @@ class Bot:
             self.store = store if store is not None else ResultStore()
             self.dialog = Dialog(store=self.store, subs=self.subs)
         self.deep_cache = DeepCache(ttl_seconds=getattr(settings, "deep_cache_ttl_seconds", 900))
+        try:
+            self.fresh_cache = FreshCache()
+        except Exception as e:
+            log.warning("Ошибка инициализации FreshCache: %s", e)
+            self.fresh_cache = None
         self._backup_in_progress: bool = False
         self._last_manual_backup_at: float = 0.0
         self._last_parser_watch: float = 0.0
@@ -501,6 +510,8 @@ class Bot:
                         priority=0,
                         samples_dir=self.s.storage_dir / "samples",
                         on_site_done=updater.on_site_done,
+                        fresh_cache=getattr(self, "fresh_cache", None),
+                        fresh_max_age=float(getattr(self.s, "fresh_max_age_seconds", 600.0)),
                     )
                 )
                 if self.s.live_safety_seconds > 0:
@@ -767,6 +778,8 @@ class Bot:
                         deep=True,
                         samples_dir=self.s.storage_dir / "samples",
                         on_site_done=updater.on_site_done,
+                        fresh_cache=getattr(self, "fresh_cache", None),
+                        fresh_max_age=0.0,
                     )
                 )
                 deep_timeout = getattr(self.s, "deep_safety_seconds", 150.0)
@@ -1706,6 +1719,8 @@ class Bot:
                 self.s,
                 priority=2,
                 samples_dir=self.s.storage_dir / "samples",
+                fresh_cache=getattr(self, "fresh_cache", None),
+                fresh_max_age=0.0,
             )
         self._record_metrics("bg", results)
         return results
@@ -1721,6 +1736,8 @@ class Bot:
                     self.s,
                     priority=1,
                     samples_dir=self.s.storage_dir / "samples",
+                    fresh_cache=getattr(self, "fresh_cache", None),
+                    fresh_max_age=0.0,
                 )
         finally:
             self._active_searches -= 1
