@@ -6,6 +6,7 @@ from datetime import date, datetime
 from html import escape
 import inspect
 import logging
+import math
 import secrets
 from pathlib import Path
 import shutil
@@ -57,6 +58,15 @@ from .users import UserStore
 
 log = logging.getLogger("avia.bot")
 API = "https://api.telegram.org/bot{token}/{method}"
+SEARCH_BUDGET_WINDOW_SECONDS = 3600.0  # окно бюджета поисков на бота (SEARCH_BUDGET_PER_HOUR)
+NEW_PEOPLE_FULL_TEXT = (
+    "🙏 Сегодня бот уже принял всех новых людей, сколько может. Загляните завтра, будем рады помочь."
+)
+
+
+def _local_day_start(ts: float) -> float:
+    """Начало местных суток, в которые попадает ts (как search_day в users.try_use_search)."""
+    return datetime.fromtimestamp(ts).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
 async def _search_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -202,6 +212,7 @@ class Bot:
         self.started_at: float = time.time()
         self.http = httpx.AsyncClient(timeout=70)
         self.busy: set[int] = set()
+        self._budget_times: list[float] = []  # старты поисков людей за последний час (SEARCH_BUDGET_PER_HOUR)
         self.users = UserStore(settings.storage_dir / "users.sqlite")
         if getattr(settings, "phones", None) is not None:
             self.phones = settings.phones
@@ -476,9 +487,48 @@ class Bot:
             log.exception("history chart failed")
             await self.send(chat_id, "Не удалось построить график")
 
+    def _search_budget_wait(self, chat_id: int, now: float | None = None) -> float:
+        """Секунды до свободного места в часовом бюджете поисков бота; 0 — искать можно.
+
+        Бюджет выключен (SEARCH_BUDGET_PER_HOUR=0) или это админ — всегда 0.
+        """
+        budget = getattr(self.s, "search_budget_per_hour", 0)
+        if budget <= 0 or chat_id in self.s.tg_allowed_ids:
+            return 0.0
+        ts = time.time() if now is None else now
+        cutoff = ts - SEARCH_BUDGET_WINDOW_SECONDS
+        self._budget_times = [t for t in self._budget_times if t > cutoff]
+        if len(self._budget_times) < budget:
+            return 0.0
+        return self._budget_times[len(self._budget_times) - budget] + SEARCH_BUDGET_WINDOW_SECONDS - ts
+
+    def _note_search_budget(self, chat_id: int, now: float | None = None) -> None:
+        """Засчитывает старт поиска человека в часовой бюджет бота (админы не в счёт)."""
+        if getattr(self.s, "search_budget_per_hour", 0) <= 0 or chat_id in self.s.tg_allowed_ids:
+            return
+        ts = time.time() if now is None else now
+        self._budget_times = [*self._budget_times, ts]
+
+    async def _refuse_over_budget(self, chat_id: int, wait_seconds: float) -> None:
+        """Вежливый отказ сверх бюджета: лимит человека не трогаем, диалог не оставляем в SEARCHING."""
+        log.info("бюджет поисков на бота исчерпан, отказ chat=%s, ждать %.0f с", chat_id, wait_seconds)
+        session = self.dialog.sessions.get(chat_id)
+        if session is not None and session.step == Step.SEARCHING:
+            session.step = Step.DONE
+        minutes = max(1, math.ceil(wait_seconds / 60))
+        await self.send(
+            chat_id,
+            f"🙏 Сейчас слишком много поисков, бот не успевает. Попробуйте через {minutes} мин, "
+            "ваш дневной лимит не списан.",
+        )
+
     async def _run_search(self, chat_id: int, req: SearchRequest):
         if chat_id in self.busy:
             await self.send(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите.")
+            return
+        budget_wait = self._search_budget_wait(chat_id)
+        if budget_wait > 0:
+            await self._refuse_over_budget(chat_id, budget_wait)
             return
         if (
             chat_id not in self.s.tg_allowed_ids
@@ -490,6 +540,7 @@ class Bot:
                 "отслеживания продолжают работать.",
             )
             return
+        self._note_search_budget(chat_id)
         self.busy.add(chat_id)
         q = req.query
         baggage_mode = req.baggage_mode
@@ -747,7 +798,13 @@ class Bot:
             await self.send(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите.")
             return
 
-        # 3. Проверяем и списываем дневной лимит поиска
+        # 3. Бюджет поисков на бота: сверх него отказ до списания лимита человека
+        budget_wait = self._search_budget_wait(chat_id)
+        if budget_wait > 0:
+            await self._refuse_over_budget(chat_id, budget_wait)
+            return
+
+        # 4. Проверяем и списываем дневной лимит поиска
         if (
             chat_id not in self.s.tg_allowed_ids
             and not self.users.try_use_search(chat_id, self.s.daily_search_limit)
@@ -759,6 +816,7 @@ class Bot:
             )
             return
 
+        self._note_search_budget(chat_id)
         self.busy.add(chat_id)
         wait_msg_id = None
         updater = None
@@ -934,6 +992,27 @@ class Bot:
                     except Exception:
                         pass
 
+    def _new_person_over_limit(self, user: dict, chat: dict | None) -> bool:
+        """TG_OPEN=1 и NEW_USERS_PER_DAY: новый человек сверх лимита на сегодня (известных и админов пускаем)."""
+        limit = getattr(self.s, "new_users_per_day", 0)
+        if limit <= 0 or not self.s.tg_open:
+            return False
+        user_id = user.get("id")
+        if not isinstance(user_id, int) or user.get("is_bot") or user_id in self.s.tg_allowed_ids:
+            return False
+        if chat is not None and chat.get("type", "private") != "private":
+            return False  # группы _admit отклоняет молча, как раньше
+        try:
+            if self.users.get(user_id) is not None:
+                return False
+            over = self.users.count_since_created(_local_day_start(time.time())) >= limit
+        except Exception:
+            log.exception("не удалось проверить лимит новых людей")
+            return False
+        if over:
+            log.info("лимит новых людей на сегодня (%s) исчерпан, отказ user=%s", limit, user_id)
+        return over
+
     def _admit(self, user: dict, chat: dict | None) -> bool:
         """Пускает администраторов и (в открытом режиме) любого человека из личного чата; регистрирует в users."""
         user_id = user.get("id")
@@ -955,6 +1034,9 @@ class Bot:
 
     async def handle(self, msg: dict):
         chat_id = msg["chat"]["id"]
+        if self._new_person_over_limit(msg.get("from", {}), msg.get("chat")):
+            await self.send(chat_id, NEW_PEOPLE_FULL_TEXT)
+            return
         if not self._admit(msg.get("from", {}), msg.get("chat")):
             return
         text = (msg.get("text") or "").strip()
@@ -1661,6 +1743,10 @@ class Bot:
             return
 
         msg = cq.get("message") or {}
+        if self._new_person_over_limit(cq.get("from", {}), msg.get("chat")):
+            if cq_id:
+                await self.call("answerCallbackQuery", callback_query_id=cq_id, text=NEW_PEOPLE_FULL_TEXT)
+            return
         if not self._admit(cq.get("from", {}), msg.get("chat")):
             return
         chat_id = msg.get("chat", {}).get("id")

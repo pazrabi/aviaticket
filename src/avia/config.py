@@ -96,6 +96,8 @@ class Settings:
     tg_allowed_ids: set[int] = field(default_factory=set)   # администраторы; без лимитов поисков
     tg_open: bool = False          # True: бот отвечает всем, пользователи регистрируются в users.sqlite
     daily_search_limit: int = 40   # поисков в сутки на человека (0 = без лимита)
+    search_budget_per_hour: int = 0  # поисков на весь бот за скользящий час, админы не в счёт (0 = выключено)
+    new_users_per_day: int = 0     # новых людей в сутки при TG_OPEN=1, админы не в счёт (0 = выключено)
     search_parallel_live: int = 6  # сайтов одного живого поиска одновременно
     search_parallel_bg: int = 2  # сайтов одного фонового/подписочного поиска одновременно
     max_parallel_searches: int = 2  # одновременных поисков во всём боте (телефоны одни на всех)
@@ -375,6 +377,15 @@ def load_settings(path: Path | None = None) -> Settings:
     kupibilet_ticket_link_env = os.getenv("KUPIBILET_TICKET_LINK", "1").strip().lower()
     kupibilet_ticket_link = kupibilet_ticket_link_env not in ("0", "false", "False", "no", "off")
 
+    try:
+        search_budget_per_hour = max(0, int(os.getenv("SEARCH_BUDGET_PER_HOUR", "0")))
+    except ValueError:
+        search_budget_per_hour = 0
+    try:
+        new_users_per_day = max(0, int(os.getenv("NEW_USERS_PER_DAY", "0")))
+    except ValueError:
+        new_users_per_day = 0
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -407,6 +418,8 @@ def load_settings(path: Path | None = None) -> Settings:
         tg_allowed_ids=allowed,
         tg_open=os.getenv("TG_OPEN", "0") == "1",
         daily_search_limit=int(os.getenv("DAILY_SEARCH_LIMIT", "40")),
+        search_budget_per_hour=search_budget_per_hour,
+        new_users_per_day=new_users_per_day,
         search_parallel_live=max(1, int(os.getenv("SEARCH_PARALLEL_LIVE", "6"))),
         search_parallel_bg=max(1, int(os.getenv("SEARCH_PARALLEL_BG", "2"))),
         max_parallel_searches=max(1, int(os.getenv("MAX_PARALLEL_SEARCHES", "2"))),
