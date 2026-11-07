@@ -53,10 +53,27 @@ from .pipeline import search
 from .scheduler import Scheduler
 from .store import ResultStore
 from .subscriptions import SubscriptionStore
+from .tg_text import html_to_plain, split_html
 from .users import UserStore
 
 log = logging.getLogger("avia.bot")
 API = "https://api.telegram.org/bot{token}/{method}"
+# 429 от Telegram: повторяем после retry_after, но не дольше минуты на попытку и не больше 3 раз
+TG_MAX_RETRIES = 3
+TG_MAX_RETRY_AFTER = 60.0
+# ответ на нажатие кнопки не повторяем: пауза задержала бы само действие, а старый запрос Telegram всё равно отвергнет
+TG_NO_RETRY_METHODS = frozenset({"answerCallbackQuery"})
+
+
+def _retry_after(data: dict) -> float | None:
+    """Пауза из ответа 429 (не дольше TG_MAX_RETRY_AFTER); None — ответ не 429 или без retry_after."""
+    if data.get("error_code") != 429:
+        return None
+    value = (data.get("parameters") or {}).get("retry_after")
+    try:
+        return min(max(float(value), 0.0), TG_MAX_RETRY_AFTER)
+    except (TypeError, ValueError):
+        return None
 
 
 async def _search_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
@@ -158,8 +175,10 @@ class WaitMessageUpdater:
             return
         self.last_edit_time = now
         try:
+            # без повторов на 429: правка косметическая, а пауза держала бы on_site_done и весь поиск
             await self.bot.call(
                 "editMessageText",
+                retries=0,
                 chat_id=self.chat_id,
                 message_id=self.message_id,
                 text=text,
@@ -201,6 +220,7 @@ class Bot:
         self.s = settings
         self.started_at: float = time.time()
         self.http = httpx.AsyncClient(timeout=70)
+        self._sleep = asyncio.sleep
         self.busy: set[int] = set()
         self.users = UserStore(settings.storage_dir / "users.sqlite")
         if getattr(settings, "phones", None) is not None:
@@ -264,46 +284,43 @@ class Bot:
         except Exception:
             log.exception("ошибка установки перехватчика образцов")
 
-    async def call(self, method: str, **params):
+    def _api_url(self, method: str) -> str:
+        base = (getattr(self.s, "tg_api_base", "") or "").strip().rstrip("/")
+        if base:
+            return f"{base}/bot{self.s.tg_token}/{method}"
+        return API.format(token=self.s.tg_token, method=method)
+
+    async def call(self, method: str, *, retries: int | None = None, **params):
+        """Запрос к Bot API. На 429 ждёт retry_after и повторяет, не больше retries раз (retries >= 0).
+
+        retries=None: TG_MAX_RETRIES, а для методов из TG_NO_RETRY_METHODS — 0.
+        """
+        if retries is None:
+            retries = 0 if method in TG_NO_RETRY_METHODS else TG_MAX_RETRIES
         payload = {k: v for k, v in params.items() if v is not None}
-        r = await self.http.post(API.format(token=self.s.tg_token, method=method), json=payload)
-        data = r.json()
-        if not data.get("ok"):
-            raise RuntimeError(f"telegram {method}: {data}")
-        return data["result"]
+        url = self._api_url(method)
+        for attempt in range(retries + 1):
+            r = await self.http.post(url, json=payload)
+            data = r.json()
+            if data.get("ok"):
+                return data["result"]
+            pause = _retry_after(data)
+            if pause is None:
+                break
+            if attempt == retries:
+                if retries:
+                    log.error("telegram %s: 429 и после %d повторов, чат %s — не доставлено",
+                              method, retries, payload.get("chat_id"))
+                break
+            log.warning("telegram %s: 429, повтор %d из %d через %g с", method, attempt + 1, retries, pause)
+            await self._sleep(pause)
+        raise RuntimeError(f"telegram {method}: {data}")
 
     async def send(self, chat_id: int, text: str, reply_markup: dict | None = None):
-        if len(text) <= 4096:
-            params: dict = {
-                "chat_id": chat_id,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
-            }
-            if reply_markup is not None:
-                params["reply_markup"] = reply_markup
-            return await self.call("sendMessage", **params)
-
-        chunks: list[str] = []
-        current: list[str] = []
-        current_len = 0
-        for line in text.splitlines(keepends=True):
-            if current_len + len(line) > 4096:
-                if current:
-                    chunks.append("".join(current))
-                    current = []
-                    current_len = 0
-                while len(line) > 4096:
-                    chunks.append(line[:4096])
-                    line = line[4096:]
-            current.append(line)
-            current_len += len(line)
-        if current:
-            chunks.append("".join(current))
-
+        chunks = split_html(text)
         last_res = None
         for i, chunk in enumerate(chunks):
-            params = {
+            params: dict = {
                 "chat_id": chat_id,
                 "text": chunk,
                 "parse_mode": "HTML",
@@ -311,7 +328,15 @@ class Bot:
             }
             if i == len(chunks) - 1 and reply_markup is not None:
                 params["reply_markup"] = reply_markup
-            last_res = await self.call("sendMessage", **params)
+            try:
+                last_res = await self.call("sendMessage", **params)
+            except RuntimeError as e:
+                if "can't parse entities" not in str(e):
+                    raise
+                # разметка сломана (например, неэкранированный текст сайта): лучше без форматирования, чем ничего
+                log.warning("telegram отверг HTML, отправляю текстом: %s", e)
+                plain = {k: v for k, v in params.items() if k != "parse_mode"}
+                last_res = await self.call("sendMessage", **{**plain, "text": html_to_plain(chunk)})
         return last_res
 
     async def send_photo(
@@ -327,7 +352,7 @@ class Bot:
         files = {"photo": ("chart.png", png_bytes, "image/png")}
         try:
             r = await self.http.post(
-                API.format(token=self.s.tg_token, method="sendPhoto"),
+                self._api_url("sendPhoto"),
                 data=data,
                 files=files,
             )
@@ -687,11 +712,14 @@ class Bot:
         finally:
             self.busy.discard(chat_id)
             if wait_msg_id is not None:
+                # без повторов на 429: уборка сообщения ожидания не должна держать конец поиска
                 try:
-                    await self.call("deleteMessage", chat_id=chat_id, message_id=wait_msg_id)
+                    await self.call("deleteMessage", retries=0, chat_id=chat_id, message_id=wait_msg_id)
                 except Exception:
                     try:
-                        await self.call("editMessageText", chat_id=chat_id, message_id=wait_msg_id, text="Готово")
+                        await self.call(
+                            "editMessageText", retries=0, chat_id=chat_id, message_id=wait_msg_id, text="Готово"
+                        )
                     except Exception:
                         pass
 
@@ -940,11 +968,14 @@ class Bot:
         finally:
             self.busy.discard(chat_id)
             if wait_msg_id is not None:
+                # без повторов на 429: уборка сообщения ожидания не должна держать конец поиска
                 try:
-                    await self.call("deleteMessage", chat_id=chat_id, message_id=wait_msg_id)
+                    await self.call("deleteMessage", retries=0, chat_id=chat_id, message_id=wait_msg_id)
                 except Exception:
                     try:
-                        await self.call("editMessageText", chat_id=chat_id, message_id=wait_msg_id, text="Готово")
+                        await self.call(
+                            "editMessageText", retries=0, chat_id=chat_id, message_id=wait_msg_id, text="Готово"
+                        )
                     except Exception:
                         pass
 
@@ -1698,11 +1729,15 @@ class Bot:
                     answer_text = item.answer
                     break
 
-            if answer_text:
-                await self.call("answerCallbackQuery", callback_query_id=cq_id, text=answer_text)
-            else:
-                await self.call("answerCallbackQuery", callback_query_id=cq_id)
-            answered = True
+            try:
+                if answer_text:
+                    await self.call("answerCallbackQuery", callback_query_id=cq_id, text=answer_text)
+                else:
+                    await self.call("answerCallbackQuery", callback_query_id=cq_id)
+            except Exception as e:
+                # без ответа кнопка погаснет сама, а действие важнее: «Искать» уже выставил SEARCHING
+                log.warning("answerCallbackQuery не прошёл, выполняю действие без ответа: %s", e)
+            answered = True  # попытка ответа была, повторять в finally незачем
 
             await self._process_actions(chat_id, actions, message_id=message_id)
         finally:

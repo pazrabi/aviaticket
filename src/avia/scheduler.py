@@ -15,6 +15,7 @@ from .models import Offer, Query, SiteResult
 from .offers import assign_ids, filter_by_baggage
 from .parsing import city_name
 from .subscriptions import NotifyRules, Subscription, SubscriptionStore, evaluate
+from .tg_text import TG_LIMIT, split_html
 
 log = logging.getLogger("avia.scheduler")
 
@@ -59,8 +60,9 @@ def build_notification(
         lines.append("Если планируете лететь, возможно, стоит не откладывать покупку.")
 
     text = "\n".join(lines)
-    if len(text) > 4096:
-        text = text[:4096]
+    if len(text) > TG_LIMIT:
+        # обрезка по символам могла разрезать тег, и Telegram отверг бы уведомление целиком
+        text = split_html(text, TG_LIMIT)[0]
     return text
 
 
