@@ -61,6 +61,8 @@ API = "https://api.telegram.org/bot{token}/{method}"
 # 429 от Telegram: повторяем после retry_after, но не дольше минуты на попытку и не больше 3 раз
 TG_MAX_RETRIES = 3
 TG_MAX_RETRY_AFTER = 60.0
+# ответ на нажатие кнопки не повторяем: пауза задержала бы само действие, а старый запрос Telegram всё равно отвергнет
+TG_NO_RETRY_METHODS = frozenset({"answerCallbackQuery"})
 
 
 def _retry_after(data: dict) -> float | None:
@@ -288,8 +290,13 @@ class Bot:
             return f"{base}/bot{self.s.tg_token}/{method}"
         return API.format(token=self.s.tg_token, method=method)
 
-    async def call(self, method: str, *, retries: int = TG_MAX_RETRIES, **params):
-        """Запрос к Bot API. На 429 ждёт retry_after и повторяет, не больше retries раз (retries >= 0)."""
+    async def call(self, method: str, *, retries: int | None = None, **params):
+        """Запрос к Bot API. На 429 ждёт retry_after и повторяет, не больше retries раз (retries >= 0).
+
+        retries=None: TG_MAX_RETRIES, а для методов из TG_NO_RETRY_METHODS — 0.
+        """
+        if retries is None:
+            retries = 0 if method in TG_NO_RETRY_METHODS else TG_MAX_RETRIES
         payload = {k: v for k, v in params.items() if v is not None}
         url = self._api_url(method)
         for attempt in range(retries + 1):
@@ -691,11 +698,14 @@ class Bot:
         finally:
             self.busy.discard(chat_id)
             if wait_msg_id is not None:
+                # без повторов на 429: уборка сообщения ожидания не должна держать конец поиска
                 try:
-                    await self.call("deleteMessage", chat_id=chat_id, message_id=wait_msg_id)
+                    await self.call("deleteMessage", retries=0, chat_id=chat_id, message_id=wait_msg_id)
                 except Exception:
                     try:
-                        await self.call("editMessageText", chat_id=chat_id, message_id=wait_msg_id, text="Готово")
+                        await self.call(
+                            "editMessageText", retries=0, chat_id=chat_id, message_id=wait_msg_id, text="Готово"
+                        )
                     except Exception:
                         pass
 
@@ -944,11 +954,14 @@ class Bot:
         finally:
             self.busy.discard(chat_id)
             if wait_msg_id is not None:
+                # без повторов на 429: уборка сообщения ожидания не должна держать конец поиска
                 try:
-                    await self.call("deleteMessage", chat_id=chat_id, message_id=wait_msg_id)
+                    await self.call("deleteMessage", retries=0, chat_id=chat_id, message_id=wait_msg_id)
                 except Exception:
                     try:
-                        await self.call("editMessageText", chat_id=chat_id, message_id=wait_msg_id, text="Готово")
+                        await self.call(
+                            "editMessageText", retries=0, chat_id=chat_id, message_id=wait_msg_id, text="Готово"
+                        )
                     except Exception:
                         pass
 
@@ -1702,11 +1715,15 @@ class Bot:
                     answer_text = item.answer
                     break
 
-            if answer_text:
-                await self.call("answerCallbackQuery", callback_query_id=cq_id, text=answer_text)
-            else:
-                await self.call("answerCallbackQuery", callback_query_id=cq_id)
-            answered = True
+            try:
+                if answer_text:
+                    await self.call("answerCallbackQuery", callback_query_id=cq_id, text=answer_text)
+                else:
+                    await self.call("answerCallbackQuery", callback_query_id=cq_id)
+            except Exception as e:
+                # без ответа кнопка погаснет сама, а действие важнее: «Искать» уже выставил SEARCHING
+                log.warning("answerCallbackQuery не прошёл, выполняю действие без ответа: %s", e)
+            answered = True  # попытка ответа была, повторять в finally незачем
 
             await self._process_actions(chat_id, actions, message_id=message_id)
         finally:

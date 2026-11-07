@@ -13,7 +13,7 @@ import pytest
 from avia.bot import Bot, WaitMessageUpdater
 from avia.config import Settings
 from avia.criteria import SearchCriteria
-from avia.dialog import Reply, SearchRequest
+from avia.dialog import DeepSearchRequest, Reply, SearchRequest, Session, Step
 from avia.models import Offer, Query, SiteResult
 from avia.scheduler import build_notification
 from avia.subscriptions import Subscription
@@ -120,7 +120,7 @@ async def test_retry_after_is_capped(tmp_path):
         return tg_ok(True)
 
     bot, slept = make_bot(handler, tmp_path)
-    await bot.call("answerCallbackQuery", callback_query_id="x")
+    await bot.call("sendMessage", chat_id=1, text="hi")
     assert slept == [60.0]
 
 
@@ -207,6 +207,84 @@ async def test_wait_message_progress_edit_does_not_wait_out_429(tmp_path):
     await asyncio.wait_for(updater.on_site_done(SiteResult("aviasales", True, [Offer("aviasales", 5000)])), timeout=5)
     assert slept == []
     assert methods == ["editMessageText"]
+
+
+async def _pause_forbidden(sec: float) -> None:
+    """Пауза retry_after здесь запрещена. Падаем сразу: «вечная» пауза в finally после отмены вешает тест."""
+    raise AssertionError(f"пауза retry_after {sec} с там, где её быть не должно")
+
+
+def _patch_search(monkeypatch) -> None:
+    async def mock_search(q, s, **kwargs):
+        return [SiteResult("aviasales", True, [Offer("aviasales", 5000)])]
+
+    monkeypatch.setattr("avia.bot.search", mock_search)
+    monkeypatch.setattr("avia.bot.build_compact_report",
+                        lambda q, res, criteria, **kw: ([f"КАРТОЧКА {q.origin}"], [], []))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("deep", [False, True], ids=["live", "deep"])
+async def test_wait_message_cleanup_429_does_not_pause_search_end(tmp_path, monkeypatch, deep):
+    """deleteMessage и «Готово» в finally поиска: на 429 без паузы, поиск завершается и чат свободен."""
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        method, body = method_of(req), json.loads(req.content)
+        seen.append((method, body.get("text")))
+        if method in ("deleteMessage", "editMessageText"):
+            return tg_429(30)
+        if method == "sendMessage":
+            return tg_ok({"message_id": len(seen)})
+        return tg_ok(True)
+
+    _patch_search(monkeypatch)
+    bot, slept = make_bot(handler, tmp_path, sleep=_pause_forbidden)
+    q = Query(origin="MOW", destination="LED", depart=date(2026, 12, 10))
+    offers = [Offer("aviasales", 6000, offer_id="id_quick")]
+    bot.store.put(SLOW_CHAT, q, [SiteResult("aviasales", True, offers)], "any", offers)
+    bot.dialog.sessions[SLOW_CHAT] = Session(step=Step.SEARCHING, dialog_id="ab12",
+                                             origin="MOW", destination="LED", depart=date(2026, 12, 10))
+    if deep:
+        run = bot._run_deep_search(SLOW_CHAT, DeepSearchRequest(query=q))
+    else:
+        run = bot._run_search(SLOW_CHAT, SearchRequest(query=q, baggage_mode="any", criteria=SearchCriteria()))
+
+    await asyncio.wait_for(run, timeout=2)
+    assert slept == []
+    assert ("deleteMessage", None) in seen
+    assert ("editMessageText", "Готово") in seen
+    assert SLOW_CHAT not in bot.busy
+    assert bot.dialog.sessions[SLOW_CHAT].step != Step.SEARCHING
+
+
+@pytest.mark.asyncio
+async def test_answer_callback_429_does_not_pause_and_search_runs(tmp_path, monkeypatch):
+    """Кнопка «Искать»: 429 на answerCallbackQuery без паузы, поиск всё равно идёт до карточки."""
+    seen: list[tuple[str, str | None]] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        method, body = method_of(req), json.loads(req.content)
+        seen.append((method, body.get("text")))
+        if method == "answerCallbackQuery":
+            return tg_429(30)
+        if method == "sendMessage":
+            return tg_ok({"message_id": len(seen)})
+        return tg_ok(True)
+
+    _patch_search(monkeypatch)
+    bot, slept = make_bot(handler, tmp_path, sleep=_pause_forbidden)
+    bot.dialog.sessions[SLOW_CHAT] = Session(step=Step.BAGGAGE, dialog_id="ab12",
+                                             origin="MOW", destination="LED", depart=date(2026, 12, 10))
+    cq = {"id": "cq1", "from": {"id": SLOW_CHAT}, "data": "go:ab12",
+          "message": {"chat": {"id": SLOW_CHAT}, "message_id": 50}}
+
+    await asyncio.wait_for(bot.handle_callback(cq), timeout=2)
+    assert slept == []
+    assert ("answerCallbackQuery", None) in seen
+    assert ("sendMessage", "КАРТОЧКА MOW") in seen
+    assert SLOW_CHAT not in bot.busy
+    assert bot.dialog.sessions[SLOW_CHAT].step != Step.SEARCHING
 
 
 @pytest.mark.asyncio
