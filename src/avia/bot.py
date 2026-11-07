@@ -480,7 +480,7 @@ class Bot:
         """SEARCHING → DONE; другой шаг (успех уже поставил DONE, человек начал новый диалог) не трогаем.
 
         Диалог ставит SEARCHING до поиска. Снимает его тот, кто держит busy, в finally рядом
-        с busy.discard (живой и глубокий поиск), а отказ до busy.add — сразу. Иначе на любой
+        с busy.discard (живой и глубокий поиск), а отказ или исключение до busy.add — сразу. Иначе на любой
         текст человек получает «⏳ Поиск ещё идёт» навсегда.
         """
         session = self.dialog.sessions.get(chat_id)
@@ -492,10 +492,17 @@ class Bot:
             # Поиск этого человека уже идёт: шаг не трогаем, SEARCHING снимет его finally
             await self.send(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите.")
             return
-        if (
-            chat_id not in self.s.tg_allowed_ids
-            and not self.users.try_use_search(chat_id, self.s.daily_search_limit)
-        ):
+        try:
+            within_limit = chat_id in self.s.tg_allowed_ids or self.users.try_use_search(
+                chat_id, self.s.daily_search_limit
+            )
+        except Exception:
+            # SQLite (database is locked и т.п.) до busy.add: снять SEARCHING некому, кроме нас
+            log.exception("не получилось начать поиск, chat_id=%s", chat_id)
+            self._leave_searching(chat_id)
+            await self.send(chat_id, "⚠️ Не получилось начать поиск, попробуйте ещё раз.")
+            return
+        if not within_limit:
             self._leave_searching(chat_id)
             await self.send(
                 chat_id,
