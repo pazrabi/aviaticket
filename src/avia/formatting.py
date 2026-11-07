@@ -463,7 +463,7 @@ def offer_card(
                 label = f'<a href="{escape(alt.url, quote=True)}">{label}</a>'
             alt_items.append(f"{label} {money(alt.price, alt.currency)}")
         if alt_items:
-            lines.append(f"💰 такое же: {' · '.join(alt_items)}")
+            lines.append(f"💰 такой же: {' · '.join(alt_items)}")
     return lines
 
 
