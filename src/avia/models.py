@@ -80,3 +80,4 @@ class SiteResult:
     queue_wait: float | None = None
     fetch_seconds: float | None = None
     priority: int | None = None
+    cached_age: float | None = None
