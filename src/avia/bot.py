@@ -477,6 +477,20 @@ class Bot:
             await self.send(chat_id, "Не удалось построить график")
 
     async def _run_search(self, chat_id: int, req: SearchRequest):
+        # Диалог ставит SEARCHING до поиска. Снимаем его на любом выходе: отказ «занят»,
+        # лимит, исключение, отмена. Иначе на любой текст человек получает «⏳ Поиск ещё идёт».
+        try:
+            await self._run_search_body(chat_id, req)
+        finally:
+            self._leave_searching(chat_id)
+
+    def _leave_searching(self, chat_id: int) -> None:
+        """SEARCHING → DONE; другой шаг (успех уже поставил DONE, человек начал новый диалог) не трогаем."""
+        session = self.dialog.sessions.get(chat_id)
+        if session is not None and session.step == Step.SEARCHING:
+            session.step = Step.DONE
+
+    async def _run_search_body(self, chat_id: int, req: SearchRequest):
         if chat_id in self.busy:
             await self.send(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите.")
             return
