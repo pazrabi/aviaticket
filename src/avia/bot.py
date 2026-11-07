@@ -552,22 +552,20 @@ class Bot:
             "ваш дневной лимит не списан.",
         )
 
-    async def _run_search(self, chat_id: int, req: SearchRequest):
-        # Диалог ставит SEARCHING до поиска. Снимаем его на любом выходе: отказ «занят»,
-        # лимит, исключение, отмена. Иначе на любой текст человек получает «⏳ Поиск ещё идёт».
-        try:
-            await self._run_search_body(chat_id, req)
-        finally:
-            self._leave_searching(chat_id)
-
     def _leave_searching(self, chat_id: int) -> None:
-        """SEARCHING → DONE; другой шаг (успех уже поставил DONE, человек начал новый диалог) не трогаем."""
+        """SEARCHING → DONE; другой шаг (успех уже поставил DONE, человек начал новый диалог) не трогаем.
+
+        Диалог ставит SEARCHING до поиска. Снимает его тот, кто держит busy, в finally рядом
+        с busy.discard (живой и глубокий поиск), а отказ до busy.add — сразу. Иначе на любой
+        текст человек получает «⏳ Поиск ещё идёт» навсегда.
+        """
         session = self.dialog.sessions.get(chat_id)
         if session is not None and session.step == Step.SEARCHING:
             session.step = Step.DONE
 
-    async def _run_search_body(self, chat_id: int, req: SearchRequest):
+    async def _run_search(self, chat_id: int, req: SearchRequest):
         if chat_id in self.busy:
+            # Поиск этого человека уже идёт: шаг не трогаем, SEARCHING снимет его finally
             await self.send(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите.")
             return
         budget_wait = self._search_budget_wait(chat_id)
@@ -578,6 +576,7 @@ class Bot:
             chat_id not in self.s.tg_allowed_ids
             and not self.users.try_use_search(chat_id, self.s.daily_search_limit)
         ):
+            self._leave_searching(chat_id)
             await self.send(
                 chat_id,
                 f"😴 На сегодня лимит поисков исчерпан ({self.s.daily_search_limit}). Завтра можно снова, "
@@ -766,7 +765,9 @@ class Bot:
             log.exception("search failed")
             await self.send(chat_id, f"⚠️ {escape(friendly_error(e))}")
         finally:
+            # Без await между ними: иначе новый поиск успеет взять busy, а мы снимем его SEARCHING
             self.busy.discard(chat_id)
+            self._leave_searching(chat_id)
             if wait_msg_id is not None:
                 # без повторов на 429: уборка сообщения ожидания не должна держать конец поиска
                 try:
@@ -1029,7 +1030,9 @@ class Bot:
             log.exception("deep search failed")
             await self.send(chat_id, f"⚠️ {escape(friendly_error(e))}")
         finally:
+            # Пока шёл глубокий поиск, человек мог нажать «Искать»: отказ «занят» оставил SEARCHING
             self.busy.discard(chat_id)
+            self._leave_searching(chat_id)
             if wait_msg_id is not None:
                 # без повторов на 429: уборка сообщения ожидания не должна держать конец поиска
                 try:
