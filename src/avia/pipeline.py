@@ -27,6 +27,7 @@ from .fresh_cache import FreshCache
 from .guard import SearchGuard, friendly_error
 from .models import Offer, Query, SiteResult
 from .parsers import PARSERS
+from .parsers.kupibilet import build_ticket_url
 from .parsers.travelpayouts import fetch_travelpayouts, search_url
 from .sites import build_url
 from .tutu_ids import resolve_city
@@ -357,6 +358,17 @@ async def _process_snapshot(
         )
 
     for o in offers:
+        if (
+            not o.url
+            and (o.site == "kupibilet" or getattr(site, "name", None) == "kupibilet")
+            and getattr(o, "ticket_hash", None)
+            and getattr(settings, "kupibilet_ticket_link", True)
+            and snap.url
+        ):
+            try:
+                o.url = build_ticket_url(snap.url, o.ticket_hash)
+            except Exception as e:
+                log.warning("Ошибка построения ссылки на билет Купибилет: %s", e)
         o.url_is_direct = bool(o.url and o.url != snap.url)
         o.url = o.url or snap.url
     return sorted(offers, key=lambda o: o.price), snap.url, partial

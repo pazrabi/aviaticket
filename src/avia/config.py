@@ -160,6 +160,7 @@ class Settings:
     trial_stage: bool = True
     history_hint: bool = True
     fresh_max_age_seconds: float = 600.0
+    kupibilet_ticket_link: bool = True
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -367,6 +368,8 @@ def load_settings(path: Path | None = None) -> Settings:
         fresh_max_age_seconds = float(os.getenv("FRESH_MAX_AGE_SECONDS", "600"))
     except ValueError:
         fresh_max_age_seconds = 600.0
+    kupibilet_ticket_link_env = os.getenv("KUPIBILET_TICKET_LINK", "1").strip().lower()
+    kupibilet_ticket_link = kupibilet_ticket_link_env not in ("0", "false", "False", "no", "off")
 
     return Settings(
         sites=sites,
@@ -459,6 +462,7 @@ def load_settings(path: Path | None = None) -> Settings:
         trial_stage=trial_stage,
         history_hint=history_hint,
         fresh_max_age_seconds=fresh_max_age_seconds,
+        kupibilet_ticket_link=kupibilet_ticket_link,
     )
 
 
