@@ -133,7 +133,7 @@ def compact_keyboard(dialog_id: str, *, has_more: bool) -> list[list[tuple[str, 
         rows.append([("➕ Показать ещё", f"more:{dialog_id}")])
     rows.append([
         ("⚙️ Фильтры", f"filters:{dialog_id}"),
-        ("🔎 Глубокий поиск", f"deep:{dialog_id}"),
+        ("🔬 Глубокий поиск", f"deep:{dialog_id}"),
     ])
     rows.append([("📊 История", f"hist:{dialog_id}")])
     rows.append([

@@ -172,6 +172,21 @@ class WaitMessageUpdater:
                 log.warning("Сбой editMessageText сообщения ожидания: %s", e)
 
 
+HISTORY_CHART_MIN_POINTS = 4
+HISTORY_CHART_MIN_SPAN_SECONDS = 12 * 3600.0
+
+
+def _history_is_enough(series: list[tuple[float, int]] | None) -> bool:
+    """Достаточно ли замеров для осмысленного графика: не меньше 4 точек и разброс по времени от 12 часов."""
+    try:
+        if not series or len(series) < HISTORY_CHART_MIN_POINTS:
+            return False
+        times = [float(t) for t, _ in series]
+        return (max(times) - min(times)) >= HISTORY_CHART_MIN_SPAN_SECONDS
+    except Exception:
+        return False
+
+
 class Bot:
     def __init__(
         self,
@@ -418,7 +433,9 @@ class Bot:
                 median = stats["median"] if stats else None
                 now_price = stats["last_price"] if stats else None
 
-                png = charts.render_price_chart(series, median, title, now_price=now_price)
+                png = None
+                if _history_is_enough(series):
+                    png = charts.render_price_chart(series, median, title, now_price=now_price)
                 return stats, series, site_stats, png, adv
 
             stats, series, site_stats, png, adv = await asyncio.to_thread(_load_data_and_render)
@@ -443,8 +460,15 @@ class Bot:
 
             if png is not None:
                 await self.send_photo(chat_id, png, caption=caption)
-            elif stats is not None:
-                await self.send(chat_id, caption)
+            elif stats is not None or series:
+                note = (
+                    "Истории по этому билету пока мало: график появится, когда накопятся замеры "
+                    "за несколько дней. Включите «🔔 Следить за ценой», и бот будет их собирать."
+                )
+                if _history_is_enough(series):
+                    await self.send(chat_id, caption)
+                else:
+                    await self.send(chat_id, "📊 <b>История цены</b>\n" + note)
             else:
                 await self.send(chat_id, "Пока мало данных по этому маршруту, загляните позже")
         except Exception:
@@ -677,7 +701,7 @@ class Bot:
                 filtered,
                 baggage_mode=baggage_mode,
                 dropped=dropped_baggage,
-                title=f"🔎 Глубокий поиск: полная выдача\n<i>из кеша, возраст {age_min} мин</i>",
+                title=f"🔬 Глубокий поиск: полная выдача\n<i>из кеша, возраст {age_min} мин</i>",
             )
             session = self.dialog.sessions.get(chat_id)
             if session is None or not session.dialog_id:
@@ -856,7 +880,7 @@ class Bot:
                 filtered,
                 baggage_mode=baggage_mode,
                 dropped=dropped_baggage,
-                title="🔎 Глубокий поиск: полная выдача",
+                title="🔬 Глубокий поиск: полная выдача",
             )
 
             session = self.dialog.sessions.get(chat_id)

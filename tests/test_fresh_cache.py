@@ -335,7 +335,7 @@ def test_formatting_card_notes_and_header_footer():
     full_text = "\n".join(chunks)
     assert "🕒 данные только что" in full_text
     assert "🕒 данные 3 мин назад" in full_text
-    assert "🕒 Показаны свежие данные (не старше 10 минут). Для нового запроса нажмите «🔎 Глубокий поиск»" in full_text
+    assert "🕒 Показаны свежие данные (не старше 10 минут). Для нового запроса нажмите «🔬 Глубокий поиск»" in full_text
 
     # 5. Смешанный ответ (один живой, один из кеша) -> общей строки нет
     res_live = SiteResult(site="yandex", ok=True, offers=[o2], cached_age=None)

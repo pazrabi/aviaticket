@@ -153,6 +153,7 @@ async def test_bot_process_history_request_with_png(tmp_path, monkeypatch):
 
     # Подменяем charts.render_price_chart
     monkeypatch.setattr("avia.charts.render_price_chart", lambda series, median, title, now_price: b"fake_png_data")
+    monkeypatch.setattr("avia.bot._history_is_enough", lambda s: True)
 
     await bot._process_actions(100, [HistoryRequest(query=q)])
 
@@ -351,6 +352,7 @@ async def test_bot_history_request_advice_inclusion_and_resilience(tmp_path, mon
     # Имитируем сбой в price_curve — не должен ломать построение истории
     monkeypatch.setattr(bot.history, "price_curve", MagicMock(side_effect=RuntimeError("curve failed")))
     monkeypatch.setattr("avia.charts.render_price_chart", lambda series, median, title, now_price: b"fake_png")
+    monkeypatch.setattr("avia.bot._history_is_enough", lambda s: True)
 
     await bot._process_actions(100, [HistoryRequest(query=q)])
 

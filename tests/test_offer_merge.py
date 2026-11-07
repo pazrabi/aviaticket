@@ -318,8 +318,8 @@ def test_build_compact_report_pool_no_dups_and_card_text():
 
     # В тексте отчёта есть строка с альтернативными ценами
     full_text = "\n".join(chunks)
-    assert "также" in full_text
-    assert "💰 также:" in full_text
+    assert "такое же" in full_text
+    assert "💰 такое же:" in full_text
     assert "Яндекс" in full_text
     assert "Aviasales" in full_text
     assert "2 176" in full_text.replace("\xa0", " ")
@@ -424,7 +424,7 @@ def test_offer_card_alts_formatting():
     )
     card_single = offer_card(o_single, q, number=1)
     card_text_single = "\n".join(card_single)
-    assert "также" not in card_text_single
+    assert "такое же" not in card_text_single
 
     # Билет с 4 alts -> показываются только первые 3, со ссылками
     o_with_alts = Offer(
@@ -441,7 +441,7 @@ def test_offer_card_alts_formatting():
     )
     card = offer_card(o_with_alts, q, number=1)
     card_text = "\n".join(card)
-    assert "💰 также:" in card_text
+    assert "💰 такое же:" in card_text
     assert '<a href="https://tutu.ru/ticket">Туту</a> 2 100 ₽' in card_text.replace("\xa0", " ")
     assert "Яндекс Путешествия 2 150 ₽" in card_text.replace("\xa0", " ")
     assert '<a href="https://kupi.ru/t">Купибилет</a> 2 200 ₽' in card_text.replace("\xa0", " ")

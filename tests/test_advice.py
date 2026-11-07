@@ -514,6 +514,8 @@ async def test_bot_history_request_includes_advice(tmp_path, monkeypatch):
 
     monkeypatch.setattr("avia.charts.render_price_chart", lambda series, median, title, now_price: b"fake_png")
 
+    monkeypatch.setattr("avia.bot._history_is_enough", lambda s: True)
+
     await bot._process_actions(100, [HistoryRequest(query=q)])
 
     assert len(bot.photos) == 1
@@ -550,6 +552,7 @@ async def test_bot_history_request_truncates_disclaimer_if_too_long(tmp_path, mo
     long_line = "Строка аналитики: " + "X" * 900
     monkeypatch.setattr("avia.analytics.summary_lines", lambda stats, site_stats: [long_line])
     monkeypatch.setattr("avia.charts.render_price_chart", lambda series, median, title, now_price: b"fake_png")
+    monkeypatch.setattr("avia.bot._history_is_enough", lambda s: True)
 
     await bot._process_actions(100, [HistoryRequest(query=q)])
 

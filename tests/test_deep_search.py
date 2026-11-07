@@ -3,10 +3,10 @@
 Проверяют:
 (а) DeepCache: put/get, ttl, вытеснение при > 100;
 (б) pipeline.search(deep=True) в _from_browser не передаёт evaluate;
-(в) обработчик кнопки «🔎 Глубокий поиск»:
+(в) обработчик кнопки «🔬 Глубокий поиск»:
     - без snapshot -> «Сначала запустите обычный поиск»;
     - с snapshot -> вызывает search(deep=True), метрика cls='deep',
-      отчёт с первой строкой «🔎 Глубокий поиск: полная выдача»;
+      отчёт с первой строкой «🔬 Глубокий поиск: полная выдача»;
     - повторное нажатие в течение ttl берёт кеш, не вызывает search и не списывает лимит;
 (г) миграция searches добавляет cls в старую базу.
 """
@@ -140,7 +140,7 @@ async def test_pipeline_search_deep_does_not_pass_evaluate(monkeypatch):
     assert calls[0]["priority"] == 0
 
 
-# (в) Тесты обработчика кнопки «🔎 Глубокий поиск»
+# (в) Тесты обработчика кнопки «🔬 Глубокий поиск»
 class DeepFakeBot(Bot):
     """Тестовый бот для перехвата вызовов API Telegram."""
 
@@ -234,7 +234,7 @@ async def test_button_handler_with_snapshot_and_cache(tmp_path, monkeypatch):
 
     monkeypatch.setattr("avia.bot.search", mock_search)
 
-    # Первое нажатие «🔎 Глубокий поиск»
+    # Первое нажатие «🔬 Глубокий поиск»
     cq1 = {
         "id": "cq_deep_1",
         "from": {"id": chat_id},
@@ -255,11 +255,11 @@ async def test_button_handler_with_snapshot_and_cache(tmp_path, monkeypatch):
     assert row["source"] == "user"
     assert row["cls"] == "deep"
 
-    # 3. Отчёт содержит первую строку «🔎 Глубокий поиск: полная выдача»
+    # 3. Отчёт содержит первую строку «🔬 Глубокий поиск: полная выдача»
     send_calls = [p for m, p in bot.calls if m == "sendMessage" and "Глубокий поиск" in p.get("text", "")]
     assert len(send_calls) >= 1
     report_text = send_calls[-1]["text"]
-    assert report_text.splitlines()[0] == "🔎 Глубокий поиск: полная выдача"
+    assert report_text.splitlines()[0] == "🔬 Глубокий поиск: полная выдача"
 
     # 4. Проверяем, что 1 поиск списался из дневного лимита
     user_info = bot.users.get(chat_id)
@@ -289,7 +289,7 @@ async def test_button_handler_with_snapshot_and_cache(tmp_path, monkeypatch):
     cached_sends = [p for m, p in bot.calls if m == "sendMessage" and "Глубокий поиск" in p.get("text", "")]
     assert len(cached_sends) >= 1
     cached_report = cached_sends[-1]["text"]
-    assert cached_report.splitlines()[0] == "🔎 Глубокий поиск: полная выдача"
+    assert cached_report.splitlines()[0] == "🔬 Глубокий поиск: полная выдача"
     assert "из кеша, возраст" in cached_report
 
 

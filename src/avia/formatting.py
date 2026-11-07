@@ -463,7 +463,7 @@ def offer_card(
                 label = f'<a href="{escape(alt.url, quote=True)}">{label}</a>'
             alt_items.append(f"{label} {money(alt.price, alt.currency)}")
         if alt_items:
-            lines.append(f"💰 также: {' · '.join(alt_items)}")
+            lines.append(f"💰 такое же: {' · '.join(alt_items)}")
     return lines
 
 
@@ -646,7 +646,7 @@ def build_report(
     ok_results = [r for r in results if r.ok]
     if ok_results and all(getattr(r, "cached_age", None) is not None for r in ok_results):
         footer.append(
-            "🕒 Показаны свежие данные (не старше 10 минут). Для нового запроса нажмите «🔎 Глубокий поиск»"
+            "🕒 Показаны свежие данные (не старше 10 минут). Для нового запроса нажмите «🔬 Глубокий поиск»"
         )
     footer.extend(_ozon_footer(q, results))
     footer.append("<i>Цены сняты сейчас, при покупке могут измениться.</i>")
@@ -862,7 +862,7 @@ def build_compact_report(
     footer_lines: list[str] = []
     if all_cached:
         footer_lines.append(
-            "🕒 Показаны свежие данные (не старше 10 минут). Для нового запроса нажмите «🔎 Глубокий поиск»"
+            "🕒 Показаны свежие данные (не старше 10 минут). Для нового запроса нажмите «🔬 Глубокий поиск»"
         )
     footer_lines.extend(_ozon_footer(q, results))
     footer_lines.append("<i>Цены сняты сейчас, при покупке могут измениться.</i>")
