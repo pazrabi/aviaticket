@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import contextvars
 import functools
 import json
@@ -37,7 +37,7 @@ def _db_file_identity(path: Path) -> tuple[int, int] | None:
     return st.st_dev, st.st_ino
 
 
-# Запросы к метрикам с пути живого поиска (предохранитель, раскладка, хеджи, запись попыток)
+# Чтения метрик с пути живого поиска (предохранитель, раскладка, хеджи)
 # идут в своём небольшом пуле потоков, а не в общем пуле asyncio.to_thread:
 # - 20 поисков разом дают сотни коротких запросов; в общем пуле за ними в очереди стояли
 #   разборы страниц (тоже asyncio.to_thread) и не укладывались в PARSER_TIMEOUT_SECONDS;
@@ -55,6 +55,42 @@ async def run_metrics_io(func: Callable[..., T], /, *args: Any, **kwargs: Any) -
     loop = asyncio.get_running_loop()
     call = functools.partial(contextvars.copy_context().run, func, *args, **kwargs)
     return await loop.run_in_executor(_METRICS_IO_POOL, call)
+
+
+# Записи без ожидания (попытки сайтов): готовые цены сайта не ждут, пока запись дойдёт до SQLite.
+# Свой поток, один: записи не стоят в очереди за чтениями пула выше, а порядок записей
+# (id в attempts) остаётся порядком попыток, как при синхронной записи.
+_METRICS_WRITE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="avia-metrics-write")
+# Ссылки на записи в полёте: future не собирается сборщиком мусора, wait_metrics_io видит, что осталось
+_METRICS_WRITES: set[Future] = set()
+_METRICS_WRITES_IDLE = threading.Condition()
+
+
+def _metrics_write_done(fut: Future) -> None:
+    try:
+        exc = None if fut.cancelled() else fut.exception()
+        if exc is not None:
+            log.error("ошибка фоновой записи метрик", exc_info=exc)
+    finally:
+        with _METRICS_WRITES_IDLE:
+            _METRICS_WRITES.discard(fut)
+            _METRICS_WRITES_IDLE.notify_all()
+
+
+def submit_metrics_write(func: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Future:
+    """Отдаёт запись в метрики потоку записи и не ждёт её; исключение записи уходит в лог."""
+    call = functools.partial(contextvars.copy_context().run, func, *args, **kwargs)
+    fut = _METRICS_WRITE_POOL.submit(call)
+    with _METRICS_WRITES_IDLE:
+        _METRICS_WRITES.add(fut)
+    fut.add_done_callback(_metrics_write_done)
+    return fut
+
+
+def wait_metrics_io(timeout: float | None = 10.0) -> bool:
+    """Ждёт, пока допишутся все записи, отданные без ожидания (для тестов). True — всё дописано."""
+    with _METRICS_WRITES_IDLE:
+        return _METRICS_WRITES_IDLE.wait_for(lambda: not _METRICS_WRITES, timeout=timeout)
 
 
 SCHEMA = """

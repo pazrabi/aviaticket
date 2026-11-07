@@ -30,7 +30,7 @@ from avia.dialog import HistoryRequest
 from avia.dispatcher import check_site_fuse, reset_fuse_state
 from avia.guard import SearchGuard
 from avia.history import PriceHistory
-from avia.metrics import MetricsStore
+from avia.metrics import MetricsStore, wait_metrics_io
 from avia.models import Offer, Query
 from avia.parsers import PARSERS
 from avia.pipeline import search
@@ -241,6 +241,7 @@ async def test_live_searches_site_start_does_not_stall_loop(data_dir, monkeypatc
             assert len(res) == len(SITES)
             assert all(r.ok for r in res), [(r.site, r.error) for r in res if not r.ok]
         # разборы страниц не ждали в очереди потоков дольше таймаута: каждая попытка — с первого раза
+        assert await asyncio.to_thread(wait_metrics_io, 30.0)  # попытки пишутся без ожидания
         with sqlite3.connect(data_dir / "metrics.sqlite") as db:
             outcomes = dict(db.execute(
                 "SELECT outcome, COUNT(*) FROM attempts WHERE search_id LIKE ? GROUP BY outcome",

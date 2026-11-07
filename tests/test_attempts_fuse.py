@@ -18,7 +18,7 @@ from avia.config import Settings, SiteConfig, load_settings
 from avia.dispatcher import check_site_fuse, plan_live_assignment, reset_fuse_state
 from avia.formatting import is_unavailable
 from avia.guard import SearchGuard
-from avia.metrics import MetricsStore
+from avia.metrics import MetricsStore, wait_metrics_io
 from avia.models import Offer, Query, SiteResult
 from avia.parsers import PARSERS
 from avia.pipeline import _process_snapshot, guard as default_guard, search
@@ -169,6 +169,7 @@ async def test_attempts_recorded_on_success(tmp_path, monkeypatch):
     assert len(results) == 1
     assert results[0].ok is True
 
+    assert wait_metrics_io()  # попытки пишутся без ожидания: дождаться записи
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM attempts WHERE site = 'site1'").fetchall()
@@ -229,6 +230,7 @@ async def test_attempts_recorded_on_captcha_and_retry(tmp_path, monkeypatch):
     assert len(results) == 1
     assert results[0].ok is True
 
+    assert wait_metrics_io()  # попытки пишутся без ожидания: дождаться записи
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM attempts WHERE site = 'site_cap' ORDER BY id ASC").fetchall()

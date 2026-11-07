@@ -22,7 +22,7 @@ from avia.droidhub import (
     reset_jobs_supported,
 )
 import avia.droidhub as droidhub
-from avia.metrics import MetricsStore
+from avia.metrics import MetricsStore, wait_metrics_io
 from avia.models import Offer, Query
 from avia.parsers import PARSERS
 from avia.pipeline import _from_browser, search
@@ -757,6 +757,7 @@ async def test_from_browser_live_search_fast_stop_integration(tmp_path, monkeypa
     assert stats.get("t_last_improve") == 2.0
 
     # Проверяем запись в attempts
+    assert wait_metrics_io()  # попытки пишутся без ожидания: дождаться записи
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM attempts WHERE search_id = 'search_test_1'").fetchall()
