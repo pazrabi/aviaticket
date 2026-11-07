@@ -28,7 +28,7 @@ from avia.droidhub import (
     try_acquire_free,
 )
 from avia.hedge import HedgeTracker, hedge_risky
-from avia.metrics import MetricsStore
+from avia.metrics import MetricsStore, wait_metrics_io
 from avia.models import Offer, Query
 from avia.parsers import PARSERS
 from avia.pipeline import guard as default_guard, search, _run_site
@@ -195,6 +195,7 @@ async def test_hedge_fast_wins_loser_cancelled_phone_freed(tmp_path, monkeypatch
     assert "dev2" not in _busy_devices
 
     # В attempts записана хедж-копия с role='hedge'
+    assert wait_metrics_io()  # попытки пишутся без ожидания: дождаться записи
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("SELECT * FROM attempts WHERE site = 'site1' AND role = 'hedge'").fetchall()
@@ -259,6 +260,7 @@ async def test_hedge_does_not_start_without_free_phone(tmp_path, monkeypatch):
     assert all("dev1" in c for c in calls)
 
     # В attempts нет role='hedge'
+    assert wait_metrics_io()  # попытки пишутся без ожидания: дождаться записи
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         hedge_rows = conn.execute("SELECT * FROM attempts WHERE site = 'site1' AND role = 'hedge'").fetchall()
@@ -382,6 +384,7 @@ async def test_hedge_limits_max_1_per_site_and_2_per_search(tmp_path, monkeypatc
     assert len(results) == 3
 
     # Ровно 2 сайта запустили хедж (лимит HEDGE_MAX_PER_SEARCH=2)
+    assert wait_metrics_io()  # попытки пишутся без ожидания: дождаться записи
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         hedge_rows = conn.execute("SELECT * FROM attempts WHERE role = 'hedge'").fetchall()

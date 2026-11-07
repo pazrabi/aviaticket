@@ -25,7 +25,7 @@ from .droidhub import (
 from .extract import extract_offers
 from .fresh_cache import FreshCache
 from .guard import SearchGuard, friendly_error
-from .metrics import run_metrics_io
+from .metrics import run_metrics_io, submit_metrics_write
 from .models import Offer, Query, SiteResult
 from .parsers import PARSERS
 from .parsers.kupibilet import build_ticket_url
@@ -46,7 +46,19 @@ EMPTY_RETRY_DELAY: float = 3.0
 PARSER_MIN_INTERVAL: float = 1.0
 
 
-def _record_attempt_helper(
+def _attempt_role(role: str | None, attempt_tracker: list[int] | None) -> str:
+    """Роль попытки: hedge как есть, иначе primary для первой попытки сайта и retry для следующих."""
+    eff_role = role or "primary"
+    if eff_role != "hedge":
+        eff_role = "primary"
+        if attempt_tracker is not None:
+            if attempt_tracker[0] > 0:
+                eff_role = "retry"
+            attempt_tracker[0] += 1
+    return eff_role
+
+
+def _record_attempt_nowait(
     settings: Settings,
     site_name: str,
     device: str | None,
@@ -62,40 +74,32 @@ def _record_attempt_helper(
     t_last_improve: float | None = None,
     role: str | None = None,
 ) -> None:
-    eff_role = role or "primary"
-    if eff_role != "hedge":
-        eff_role = "primary"
-        if attempt_tracker is not None:
-            if attempt_tracker[0] > 0:
-                eff_role = "retry"
-            attempt_tracker[0] += 1
-    role = eff_role
-    metrics = _get_metrics(settings)
-    if metrics is not None:
-        source = "user" if priority == 0 else ("sub" if priority == 1 else "bg")
-        metrics.record_attempt(
-            site=site_name,
-            device=device,
-            source=source,
-            role=role,
-            outcome=outcome,
-            offers=offers,
-            fetch_seconds=fetch_seconds,
-            queue_wait=queue_wait,
-            search_id=search_id,
-            stop_reason=stop_reason,
-            t_first_offer=t_first_offer,
-            t_last_improve=t_last_improve,
-        )
+    """Попытка из _from_browser: роль, время и база — сразу, в цикле событий; запись — без ожидания.
 
-
-async def _record_attempt(**kwargs: Any) -> None:
-    """_record_attempt_helper из асинхронного кода: запись в SQLite идёт в потоке.
-
-    Запись ждёт замок базы, пока её читают предохранитель, хеджи и таблица скоростей (они теперь
-    в потоках), и в цикле событий это ожидание стопорило бы все поиски.
+    Готовые цены сайта не ждут очереди к SQLite и не теряются, если поиск отменят, пока запись
+    стоит в очереди. Ошибку записи пишет в лог поток записи метрик.
     """
-    await run_metrics_io(_record_attempt_helper, **kwargs)
+    eff_role = _attempt_role(role, attempt_tracker)
+    metrics = _get_metrics(settings)
+    if metrics is None:
+        return
+    source = "user" if priority == 0 else ("sub" if priority == 1 else "bg")
+    submit_metrics_write(
+        metrics.record_attempt,
+        site=site_name,
+        device=device,
+        source=source,
+        role=eff_role,
+        outcome=outcome,
+        offers=offers,
+        fetch_seconds=fetch_seconds,
+        queue_wait=queue_wait,
+        search_id=search_id,
+        ts=time.time(),
+        stop_reason=stop_reason,
+        t_first_offer=t_first_offer,
+        t_last_improve=t_last_improve,
+    )
 
 
 def _hit_time_cap(priority: int, cur_stats: dict[str, Any], wait_seconds: Any) -> bool:
@@ -647,7 +651,7 @@ async def _from_browser(
                         "captcha" if ("капч" in str(exc).lower() or "блокировк" in str(exc).lower()) else "error"
                     )
                 )
-                await _record_attempt(
+                _record_attempt_nowait(
                     settings=settings,
                     site_name=site.name,
                     device=dev,
@@ -680,7 +684,7 @@ async def _from_browser(
                 remaining_cands.pop(0)
 
             if snap.blocked:
-                await _record_attempt(
+                _record_attempt_nowait(
                     settings=settings,
                     site_name=site.name,
                     device=used_dev,
@@ -724,7 +728,7 @@ async def _from_browser(
             except ParserEmptyError as exc:
                 exc_str = str(exc).lower()
                 outcome = "wrong_dates" if ("другие даты" in exc_str or getattr(exc, "tag", None) == "wrongdates") else "empty"
-                await _record_attempt(
+                _record_attempt_nowait(
                     settings=settings,
                     site_name=site.name,
                     device=used_dev,
@@ -780,7 +784,7 @@ async def _from_browser(
                     continue
                 raise
             except (asyncio.TimeoutError, TimeoutError) as exc:
-                await _record_attempt(
+                _record_attempt_nowait(
                     settings=settings,
                     site_name=site.name,
                     device=used_dev,
@@ -800,7 +804,7 @@ async def _from_browser(
             except Exception as exc:
                 exc_str = str(exc).lower()
                 outcome = "captcha" if ("капч" in exc_str or "блокировк" in exc_str) else "error"
-                await _record_attempt(
+                _record_attempt_nowait(
                     settings=settings,
                     site_name=site.name,
                     device=used_dev,
@@ -820,7 +824,7 @@ async def _from_browser(
 
             # Проверка: неполная выдача без офферов
             if partial and not offers:
-                await _record_attempt(
+                _record_attempt_nowait(
                     settings=settings,
                     site_name=site.name,
                     device=used_dev,
@@ -867,7 +871,7 @@ async def _from_browser(
                 return offers, page_url, partial
 
             outcome = "partial" if partial else "ok"
-            await _record_attempt(
+            _record_attempt_nowait(
                 settings=settings,
                 site_name=site.name,
                 device=used_dev,
