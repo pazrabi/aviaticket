@@ -169,7 +169,7 @@ def test_build_url_ttravel():
     settings = load_settings()
     site = next((s for s in settings.sites if s.name == "ttravel"), None)
     assert site is not None
-    assert site.stage == "trial"
+    assert site.stage == "live"
 
     # В одну сторону
     q_ow = Query(origin="KUF", destination="MOW", depart=date(2026, 12, 10), adults=1)

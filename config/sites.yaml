@@ -102,12 +102,12 @@ sites:
     settle_ms: 30000
     scrolls: 1
 
-  # Т-Путешествия: новый агрегатор (шаг 14 PLAN_SPEED.md), стадия trial (только фон).
+  # Т-Путешествия: новый агрегатор (шаг 14 PLAN_SPEED.md), в боевом режиме с 2026-11-07 по решению владельца.
   - name: ttravel
     source: browser
     parser: ttravel
     enabled: true
-    stage: trial
+    stage: live
     phone: "redmi9t,huawei2,galaxya12"
     phone_patience_seconds: 10
     phone_capture_json: ["startStreaming"]
