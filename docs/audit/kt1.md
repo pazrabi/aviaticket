@@ -1,6 +1,6 @@
 # КТ1. Шесть веток от `367f108` и пробная `kt1-all`
 
-**Задание:** `docs/review/kt1.md` (приёмщик, 2026-11-07, день) с дополнением 2 к корректировке 7 (11:30, пп. 5–8).
+**Задание:** `docs/review/kt1.md` (приёмщик, 2026-11-07, день) с дополнениями к корректировке 7: 2 (11:30, пп. 5–8) и 3 (12:30, пп. 5–8).
 **База:** `upstream/main` на старте — `367f108398b2877c91b219b1bd6451205ce20049`. Все ветки — от неё, каждая в своём worktree `~/avia-scale/kt1-<тема>`. Только локально: без push, PR и влития в `main` и `kt0-upstream`.
 **Пробная ветка:** `kt1-all` (`~/avia-scale/kt1-all`) — все шесть веток вместе, тоже от `367f108`. Нужна, чтобы проверить влитие и полный pytest; в `main` не вливается. Этот отчёт лежит в ней отдельным коммитом.
 
@@ -10,33 +10,42 @@
 |---|---|---|---|---|
 | `kt1-telegram` | `f611764`, `d31c796` | 6 файлов, +609 −48 | 9 failed + ошибка сборки `test_tg_text.py` → 17 passed; доп. 2: 3 failed → 20 passed | `TG_API_BASE` (пусто — `api.telegram.org`) |
 | `kt1-tests` | `dc845e9` | 1 файл, +15 | полный pytest с системным прокси: 86 failed → 0 failed | — |
-| `kt1-p0` | `478491f` | 2 файла, +161 | 3 failed → 3 passed | — |
+| `kt1-p0` | `478491f`, `88f8a4e` | 2 файла, +216 | 3 failed → 3 passed; доп. 3: 3 failed, 2 passed → 5 passed | — |
 | `kt1-typeerror` | `5f36433` | 2 файла, +166 −2 | 3 failed, 2 passed → 5 passed | — |
-| `kt1-loop` | `7e52bb0` | 8 файлов, +807 −144 | 5 failed, 2 passed → 7 passed | — (пул метрик — константа `METRICS_IO_WORKERS = 2`) |
+| `kt1-loop` | `7e52bb0`, `f6b27e9` | 12 файлов, +1065 −172 | 5 failed, 2 passed → 7 passed; доп. 3: 2 failed, 1 passed → 3 passed | — (пулы метрик — константы: чтения 2 потока, записи 1) |
 | `kt1-budget` | `de086d6`, `5c385cd` | 3 файла, +463 −1 | 7 failed, 2 passed → 9 passed; доп. 2: 3 failed → 16 passed | `SEARCH_BUDGET_PER_HOUR`, `NEW_USERS_PER_DAY`, по умолчанию 0 — выключено |
 
-Полный pytest (машина под нагрузкой соседних процессов, очередь КТ0 на паузе, `pgrep -f loadtest.run` пуст):
+Полный pytest — только в паузах очереди КТ0 (`pgrep -f loadtest.run` пуст; 12:00–12:06 и 13:56–13:58), рядом бывали процессы другого проекта на этой машине:
 
 | Код | Без прокси | С системным прокси |
 |---|---|---|
 | `367f108` | 984 passed, 3 skipped | **86 failed**, 898 passed, 3 skipped (на `da0b25b` было 87) |
 | `kt1-tests` `dc845e9` | 984 passed, 3 skipped | 984 passed, 3 skipped |
 | `kt1-p0` `478491f` | 987 passed, 3 skipped | — |
+| `kt1-p0` `88f8a4e` (доп. 3) | 989 passed, 3 skipped | — |
 | `kt1-typeerror` `5f36433` | 989 passed, 3 skipped | — |
 | `kt1-telegram` `d31c796` | 1004 passed, 3 skipped | — |
 | `kt1-budget` `5c385cd` | 1000 passed, 3 skipped | — |
 | `kt1-loop` `7e52bb0` | 991 passed, 3 skipped | — |
-| `kt1-all` `bdafb14` | **1035 passed**, 3 skipped | **1035 passed**, 3 skipped |
+| `kt1-loop` `f6b27e9` (доп. 3) | 994 passed, 3 skipped | — |
+| `kt1-all` `bdafb14` | 1035 passed, 3 skipped | 1035 passed, 3 skipped |
+| `kt1-all` `aba9321` (доп. 3) | **1040 passed**, 3 skipped | **1040 passed**, 3 skipped |
 
-1035 = 984 + 3 (p0) + 5 (typeerror) + 20 (telegram) + 16 (budget) + 7 (loop): тесты веток вместе не мешают друг другу.
+1040 = 984 + 5 (p0) + 5 (typeerror) + 20 (telegram) + 16 (budget) + 10 (loop): тесты веток вместе не мешают друг другу.
+
+`tests/test_loop_responsive.py` в паузе очереди: `kt1-loop` `f6b27e9` — 7 passed (опоздание таймера: живой поиск 24 мс, фон 14 мс, `/stats` 4 мс, история 18 мс); `kt1-all` `aba9321` — 7 passed (24, 13, 7, 32 мс). Порог — 100 мс.
 
 ## Пробная ветка `kt1-all` и порядок влития (доп. 2, п. 5)
 
 Порядок: `kt1-tests` → `kt1-typeerror` → `kt1-p0` → `kt1-telegram` → `kt1-budget` → `kt1-loop`, каждая — `merge --no-ff`. Сначала маленькие и независимые, потом `bot.py` по возрастанию площади правки, `kt1-loop` — последней, она самая широкая.
 
-Конфликт один — `kt1-budget` после `kt1-telegram`, `src/avia/bot.py`, сразу после `API = …`: обе ветки добавили туда свои константы и функции. Разрешение — оба блока подряд, без правки строк: сначала telegram (`TG_MAX_RETRIES`, `TG_MAX_RETRY_AFTER`, `TG_NO_RETRY_METHODS`, `_retry_after`), затем budget (`SEARCH_BUDGET_WINDOW_SECONDS`, `NEW_PEOPLE_FULL_TEXT`, `_local_day_start`). Коммит `56699b7`. Остальные пары `git merge-tree` сливает без конфликтов; `kt1-loop` легла на пять веток чисто (`bdafb14`).
+Правки доп. 3 влиты в `kt1-all` повторно: `kt1-p0` (`88f8a4e`) → `8b70265`, `kt1-loop` (`f6b27e9`) → `aba9321`.
 
-Проверено после разрешения: проверки бюджета (`_search_budget_wait`, `_note_search_budget`) стоят внутри `_run_search_body`, то есть под `finally` из `kt1-p0`, и сброс `SEARCHING` их покрывает. Отказ по лимиту новых людей на кнопке идёт через `answerCallbackQuery` — с `kt1-telegram` он без повтора на 429 (`TG_NO_RETRY_METHODS`).
+**Конфликт 1** — `kt1-budget` после `kt1-telegram`, `src/avia/bot.py`, сразу после `API = …`: обе ветки добавили туда свои константы и функции. Разрешение — оба блока подряд, без правки строк: сначала telegram (`TG_MAX_RETRIES`, `TG_MAX_RETRY_AFTER`, `TG_NO_RETRY_METHODS`, `_retry_after`), затем budget (`SEARCH_BUDGET_WINDOW_SECONDS`, `NEW_PEOPLE_FULL_TEXT`, `_local_day_start`). Коммит `56699b7`. Остальные пары `git merge-tree` сливает без конфликтов; `kt1-loop` легла на пять веток чисто (`bdafb14`).
+
+**Конфликт 2** — повторное влитие `kt1-p0` (`88f8a4e`), `src/avia/bot.py`: `kt1-p0` убрал обёртку `_run_search` / `_run_search_body`, а в `kt1-all` прямо перед ней стояли функции бюджета. Оставлены функции бюджета, старая обёртка убрана. Проверки бюджета стоят в `_run_search` до `busy.add`: отказ бюджета сам ставит `DONE` (`_refuse_over_budget`), как отказ по лимиту; `SEARCHING` снимается в `finally` сразу после `busy.discard`, повторы на 429 там выключены (`kt1-telegram`). Коммит `8b70265`; `kt1-loop` (`f6b27e9`) легла чисто (`aba9321`).
+
+Проверено после разрешения: тесты трёх веток, правивших `bot.py` (`test_searching_reset.py`, `test_bot_budget.py`, `test_bot_telegram_limits.py`) — 35 passed на `aba9321`. Отказ по лимиту новых людей на кнопке идёт через `answerCallbackQuery` — с `kt1-telegram` он без повтора на 429 (`TG_NO_RETRY_METHODS`).
 
 ## 1. `kt1-telegram` — повтор после 429
 
@@ -97,7 +106,11 @@ FAILED test_answer_callback_429_does_not_pause_and_search_runs
 
 ## 3. `kt1-p0` — «⏳ Поиск ещё идёт» навсегда
 
-**Сделано.** `Bot._run_search` стал обёрткой: тело — в `_run_search_body`, в `finally` — `_leave_searching` (сессия в `SEARCHING` → `DONE`). Покрывает отказ «занят», дневной лимит, исключение в поиске и успех.
+**Сделано** (`88f8a4e`, доп. 3, п. 6 — исправление задания: отказ «занят» означает, что у человека уже идёт свой поиск).
+- `_leave_searching(chat_id)` (`bot.py:479–488` на `88f8a4e`): `SEARCHING` → `DONE`, другой шаг не трогает.
+- Отказ «занят» (`bot.py:492`) шаг не трогает: `SEARCHING` снимет `finally` идущего поиска.
+- Отказ по дневному лимиту (до `busy.add`, `:499`) снимает шаг сразу; в `kt1-all` так же — отказ бюджета.
+- `finally` живого (`:687–689`) и глубокого (`:942–944`) поиска: `_leave_searching` сразу после `busy.discard`, без `await` между ними — иначе новый поиск успел бы взять `busy`, а этот `finally` снял бы его `SEARCHING`. Обёртка `_run_search` / `_run_search_body` из `478491f` убрана: у неё был именно этот зазор.
 
 **RED** (`367f108`) → **GREEN** `478491f`, `tests/test_searching_reset.py`:
 ```
@@ -108,12 +121,24 @@ FAILED tests/test_searching_reset.py::test_daily_limit_refusal_resets_searching
 ---
 3 passed in 0.38s
 ```
-После каждого случая `session.step != SEARCHING`, следующий поиск того же человека запускается.
+**Доп. 3, RED** (`478491f`) → **GREEN** `88f8a4e`: `test_busy_refusal_resets_searching` заменён на два —
+второе нажатие во время поиска (текст получает «⏳ Поиск ещё идёт», после конца первого поиска `step == DONE`) и нажатие «Искать» во время глубокого поиска (после его конца `step != SEARCHING`, в двух вариантах — успех и ошибка глубокого поиска).
+```
+FAILED tests/test_searching_reset.py::test_second_press_while_search_running_keeps_searching    (DONE == SEARCHING)
+FAILED tests/test_searching_reset.py::test_press_while_deep_search_running_cleared_by_deep[deep_ok]
+FAILED tests/test_searching_reset.py::test_press_while_deep_search_running_cleared_by_deep[deep_error]
+3 failed, 2 passed in 0.42s
+---
+5 passed in 0.40s
+```
+Каждая новая строка проверена откатом по одной: без `:499` падает тест лимита, без `:689` — тест исключения, без `:944` — `deep_error`.
 
 **Не проверено / замечания.**
-- Двойное нажатие кнопки багажа: если отказ «занят» пришёл от ещё идущего поиска того же человека, шаг сразу становится `DONE`. До конца того поиска текст получает меню вместо «⏳ Поиск ещё идёт», результат всё равно приходит. Это следует из требования «после отказа „занят“ `step != SEARCHING`».
-- На `367f108` симптом был только у свободного текста: `/start`, `/cancel`, «Найти билет» и кнопка багажа работали. Поэтому «следующий поиск запускается» проходит и на старом коде; RED дают проверки шага и ответа «Поиск ещё идёт».
-- `_run_deep_search` в задание не входил: отказ бюджета там ставит `DONE` сам (`kt1-budget`).
+- Гонка нового нажатия: диалог ставит `SEARCHING` до проверки `busy`, между ними `await answerCallbackQuery`. Если первый поиск кончится в этом окне, его `finally` снимет `SEARCHING` нового нажатия; новый поиск идёт с шагом `DONE` — человек не застревает, но до конца поиска текст получает меню.
+- Ошибка SQLite в `users.try_use_search` (до `busy.add`) оставляет `SEARCHING`, как на `367f108`; обёртка `478491f` этот случай закрывала.
+- Готовый результат глубокого поиска из кэша ставит `DONE` текущей сессии, даже если идёт живой поиск, — код владельца, успех, не трогал.
+- На `367f108` симптом был только у свободного текста: `/start`, `/cancel`, «Найти билет» и кнопка багажа работали.
+- `_run_deep_search` получил `_leave_searching` в `finally`; его отказы «занят» и по лимиту не менялись (отказ бюджета там ставит `DONE` сам — `kt1-budget`).
 
 ## 4. `kt1-typeerror` — повторы при `TypeError` в `pipeline.py`
 
@@ -160,6 +185,21 @@ ImportError: cannot import name 'check_site_fuse_async' from 'avia.dispatcher'
 
 **GREEN** `7e52bb0` (load 6,8 от соседних процессов): `7 passed in 6.69s`; опоздание таймера — живой поиск 20 мс, фон 12 мс, `/stats` 23 мс, история 15 мс.
 
+**Доп. 3, п. 5 (`f6b27e9`): готовая цена не ждёт записи попытки.** На `7e52bb0` `_from_browser` делал `await _record_attempt(...)` перед `return offers`: запись стояла в очереди пула за чтениями, и это была новая точка отмены — при отмене поиска в ожидании записи собранные цены сайта пропадали.
+- Роль попытки (`_attempt_role`, `pipeline.py:49` — тот же код, что был в `:68–71`), время попытки и база метрик берутся в цикле событий в месте вызова, запись уходит в поток без ожидания — `_record_attempt_nowait` (`:61`), во всех 7 местах `_from_browser` (`:654, 687, 731, 787, 807, 827, 874`).
+- `metrics.submit_metrics_write` держит ссылку на каждую запись в полёте и пишет её ошибку в лог (`log.error`, с исключением); `metrics.wait_metrics_io(timeout)` ждёт все записи — для тестов, которые читают `attempts` после поиска (`test_attempts_fuse.py`, `test_hedge.py`, `test_fetch_jobs.py`, `test_loop_responsive.py`).
+- **Отступление (флаг):** записи идут не в пул чтений (2 потока), а в свой пул из одного потока `_METRICS_WRITE_POOL`. С двумя потоками записи могли бы закоммититься не по порядку — `id` в `attempts` перестал бы идти порядком попыток (`test_attempts_fuse.py`, `ORDER BY id`), и записи не стоят в очереди за чтениями. Время попытки теперь — время попытки, а не записи (раньше `record_attempt` брал время записи).
+
+**Доп. 3, RED** (`7e52bb0`) → **GREEN** `f6b27e9`, `tests/test_attempt_write_nowait.py` (пул метрик занят задачами по 2 с, настоящий `time.sleep`):
+```
+FAILED tests/test_attempt_write_nowait.py::test_offers_return_while_metrics_pool_is_busy    (assert 1.946 < 0.1)
+FAILED tests/test_attempt_write_nowait.py::test_failed_attempt_write_is_logged_and_offers_kept   (RuntimeError: диск переполнен — цены потеряны)
+2 failed, 1 passed in 4.37s
+---
+3 passed in 4.32s
+```
+Проходит на обоих по замыслу: роли и время попыток (капча на dev1, цены на dev2 при занятом пуле → после слива пула строки `(dev1, captcha, primary)`, `(dev2, ok, retry)`).
+
 **Сверх списка задания (флаги для приёмщика), все — по замерам разработчика:**
 1. Свой пул из 2 потоков вместо общего `asyncio.to_thread` на пути живого поиска. В общем пуле за сотней коротких запросов к метрикам стояли разборы страниц и не укладывались в `PARSER_TIMEOUT_SECONDS`: 33 таймаута разбора из 133 попыток против 0 со своим пулом. С пулом из 4 потоков тест живого поиска падал 2 раза из 3 при load ≈ 10,7 — поэтому 2.
 2. Из цикла ушли ещё статистика хеджа, раскладка и запись попыток: стек-сэмплер показал 16 мс статистики хеджа на старте каждого сайта, а запись в цикле ждала замка SQLite у читателей, которые теперь в потоках.
@@ -169,7 +209,7 @@ ImportError: cannot import name 'check_site_fuse_async' from 'avia.dispatcher'
 **Не сделано / не проверено.**
 - В цикле остались `record_results`/`record_search` в `bot.py` (не тронуты, чтобы не конфликтовать с `kt1-p0` в `_run_search`), запись `droidhub._record_failure`, перестройка таблицы скоростей при вызове `candidates()`/`get_pair_status` на устаревшей таблице после `invalidate()`. WAL для `metrics.sqlite` убрал бы ожидание читателей писателем — решение владельца.
 - Статистика хеджа по-прежнему перебирает 7 дней строк в Python — уже не в цикле.
-- **Для симулятора КТ0:** пул метрик идёт через `loop.run_in_executor`, а не `asyncio.to_thread`. Виртуальные часы `loadtest` считают занятыми только потоки `to_thread` (`vclock._threaded_to_thread`, DECISIONS #50) — пока работает поток пула, часы могут прыгнуть. Перед `gate --profile kt1` симулятору нужно учитывать и этот пул (`loadtest/` в ветках КТ1 не менялся — по заданию).
+- **Для симулятора КТ0 (доп. 3, п. 7, подтверждено приёмщиком по коду):** пул чтений идёт через `loop.run_in_executor` (`metrics.py:57`) мимо счётчика потоков виртуальных часов (`vclock.py:72–83` при `threads_busy == 0` прыгают к следующему таймеру). Пока поток пула читает SQLite, виртуальное время убегает до следующего таймера: 1,5 с тишины, 15 с автоотмены, 90 с предохранителя. Сделать при переносе gate на базу КТ1 (П20, обслуживание), не сейчас: считать потоки в `VirtualLoop.run_in_executor`, причём один раз — `asyncio.to_thread` сам идёт через `loop.run_in_executor`. Тест в `loadtest`: функция через `run_metrics_io` спит 0,2 с по-настоящему, таймер на +60 с → виртуальное время сдвинулось меньше чем на 1 с. Пул записей (`_METRICS_WRITE_POOL.submit`) часы не ждут вовсе: записи никто не ждёт, на виртуальное время они не влияют, но делят GIL с циклом.
 - Очередь из 2 потоков общая на процесс: при 100 поисках разом проверка предохранителя на старте сайта ждёт за записями попыток. Ускорение или замедление старта под нагрузкой покажет только gate.
 
 ## 6. `kt1-budget` — бюджет поисков и лимит новых людей
