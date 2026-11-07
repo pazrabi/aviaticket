@@ -63,6 +63,7 @@ class Offer:
     prev_at: float | None = None    # когда она была снята (epoch)
     min_price: int | None = None    # минимальная цена этого билета за прошлые наблюдения
     alts: list[OfferAlt] | None = None
+    ticket_hash: str | None = None
 
 
 @dataclass

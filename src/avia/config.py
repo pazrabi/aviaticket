@@ -159,6 +159,7 @@ class Settings:
     live_reserve: bool = True
     trial_stage: bool = True
     history_hint: bool = True
+    kupibilet_ticket_link: bool = True
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -362,6 +363,9 @@ def load_settings(path: Path | None = None) -> Settings:
     history_hint_env = os.getenv("HISTORY_HINT", "1").strip().lower()
     history_hint = history_hint_env not in ("0", "false", "False", "no", "off")
 
+    kupibilet_ticket_link_env = os.getenv("KUPIBILET_TICKET_LINK", "1").strip().lower()
+    kupibilet_ticket_link = kupibilet_ticket_link_env not in ("0", "false", "False", "no", "off")
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -452,6 +456,7 @@ def load_settings(path: Path | None = None) -> Settings:
         live_reserve=live_reserve,
         trial_stage=trial_stage,
         history_hint=history_hint,
+        kupibilet_ticket_link=kupibilet_ticket_link,
     )
 
 

@@ -1,14 +1,120 @@
 """Парсер живой выдачи Купибилет по XHR/JSON-ответам /frontend_search."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
+import logging
 from typing import Any
 
 from ..collector import Snapshot
 from ..models import Leg, Offer, Query
 from . import register_parser
 from .travelpayouts import format_duration
+
+log = logging.getLogger("avia.parsers.kupibilet")
+
+
+def _flight_ms(dep_iso: Any) -> int | None:
+    """Вычисляет миллисекунды UTC для локальной полуночи даты вылета с учётом часового пояса.
+
+    ms = Date.UTC(год, месяц-1, день по departure_datetime) минус смещение часового пояса
+    из departure_datetime в миллисекундах (т.е. локальная полночь даты вылета в поясе
+    аэропорта вылета, в мс UTC).
+    Формат смещения: ±HH:MM или ±HHMM; если даты/смещения нет — возвращает None.
+    """
+    if not dep_iso or not isinstance(dep_iso, str):
+        return None
+    cleaned = dep_iso.strip()
+    if not cleaned:
+        return None
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except (ValueError, TypeError) as e:
+        log.warning("Купибилет: ошибка парсинга departure_datetime %r: %s", dep_iso, e)
+        return None
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        log.warning("Купибилет: departure_datetime %r без смещения часового пояса", dep_iso)
+        return None
+    offset_ms = int(dt.utcoffset().total_seconds() * 1000)
+    utc_midnight_ms = int(datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc).timestamp() * 1000)
+    return utc_midnight_ms - offset_ms
+
+
+def ticket_hash(variant: Any, flights_map: Any) -> str | None:
+    """Вычисляет ticket-хеш варианта перелёта Купибилет по рейсам сегментов.
+
+    segmentHash одного рейса = `${ms}-${marketing_carrier}-${number}`.
+    tripHash одного направления = segmentHash всех его рейсов (в порядке полёта) через "_".
+    ticket = tripHash всех направлений через "_" (туда, потом обратно).
+    """
+    if not isinstance(variant, dict) or not isinstance(flights_map, dict):
+        return None
+    segments = variant.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return None
+
+    trip_hashes: list[str] = []
+    for seg_idx, seg in enumerate(segments):
+        if not isinstance(seg, dict):
+            log.warning("Купибилет: неверный формат сегмента %d в варианте", seg_idx)
+            return None
+        flight_ids = seg.get("flights")
+        if not isinstance(flight_ids, list) or not flight_ids:
+            log.warning("Купибилет: пустой список рейсов в сегменте %d", seg_idx)
+            return None
+
+        seg_hashes: list[str] = []
+        for fid in flight_ids:
+            fl = flights_map.get(fid)
+            if not isinstance(fl, dict):
+                log.warning("Купибилет: рейс %r не найден в flights", fid)
+                return None
+
+            dep_iso = fl.get("departure_datetime")
+            ms = _flight_ms(dep_iso)
+            if ms is None:
+                return None
+
+            carrier = fl.get("marketing_carrier")
+            if not carrier or not isinstance(carrier, str):
+                log.warning("Купибилет: отсутствует marketing_carrier в рейсе %r", fid)
+                return None
+            carrier_str = carrier.strip()
+            if not carrier_str:
+                log.warning("Купибилет: пустой marketing_carrier в рейсе %r", fid)
+                return None
+
+            num = fl.get("number")
+            if num is None or num == "":
+                num = fl.get("transport_number")
+            if num is None or num == "":
+                log.warning("Купибилет: отсутствует номер рейса в рейсе %r", fid)
+                return None
+            num_str = str(num).strip()
+            if not num_str:
+                log.warning("Купибилет: пустой номер рейса в рейсе %r", fid)
+                return None
+
+            seg_hashes.append(f"{ms}-{carrier_str}-{num_str}")
+
+        trip_hashes.append("_".join(seg_hashes))
+
+    if not trip_hashes:
+        return None
+    return "_".join(trip_hashes)
+
+
+def build_ticket_url(search_url: str, ticket: str) -> str:
+    """Формирует прямую ссылку на конкретный билет Купибилет."""
+    if not search_url:
+        return ""
+    if not ticket:
+        return search_url
+    params = f"ticket={ticket}&utm_source=direct&utm_medium=search&utm_campaign=tickets&agent=kup747&tag=searchru"
+    if search_url.endswith("?") or search_url.endswith("&"):
+        return f"{search_url}{params}"
+    sep = "&" if "?" in search_url else "?"
+    return f"{search_url}{sep}{params}"
 
 
 def _extract_time(dt_str: Any) -> str | None:
@@ -437,6 +543,7 @@ def parse_kupibilet(snapshot: Snapshot, query: Query) -> list[Offer]:
                 arrive_at=info0["arrive_at"],
                 carry_on=carry_on,
                 back=back_leg,
+                ticket_hash=ticket_hash(variant, flights),
             )
 
             # Дедупликация: учитываем оба плеча (и багаж), сохраняя самый дешёвый вариант.
