@@ -271,9 +271,9 @@ async def test_bot_flow_search_gives_compact_response_with_buttons(monkeypatch):
     # Проверяем кнопки
     # Ряд 1: more (так как в pool 10 билетов, а показано 1-2)
     assert any("Показать ещё" in b["text"] and b["callback_data"].startswith("more:") for b in kb[0])
-    # Ряд 2: filters, full
+    # Ряд 2: filters, deep
     assert any("Фильтры" in b["text"] and b["callback_data"].startswith("filters:") for b in kb[1])
-    assert any("По сайтам" in b["text"] and b["callback_data"].startswith("full:") for b in kb[1])
+    assert any("Глубокий поиск" in b["text"] and b["callback_data"].startswith("deep:") for b in kb[1])
     # Ряд 3: hist
     assert any("История" in b["text"] and b["callback_data"].startswith("hist:") for b in kb[2])
     # Ряд 4: track, new
@@ -565,7 +565,7 @@ async def test_bot_flow_full_to_summary_via_list_compact(monkeypatch):
 
     # Проверяем кнопки компактного вида
     ret_kb = send_calls[-1]["reply_markup"]["inline_keyboard"]
-    assert any("По сайтам" in b["text"] for row in ret_kb for b in row)
+    assert any("Глубокий поиск" in b["text"] for row in ret_kb for b in row)
     assert any("Показать ещё" in b["text"] for row in ret_kb for b in row)
 
     # 4. Проверяем, что номер билета "1" теперь открывает именно карточку из компактного flat
@@ -613,7 +613,7 @@ async def test_bot_flow_details_back_to_compact_and_full(monkeypatch):
     assert snap.view == "compact"
     last_call = [p for m, p in bot.calls if m == "sendMessage"][-1]
     ret_kb = last_call["reply_markup"]["inline_keyboard"]
-    assert any("По сайтам" in b["text"] for row in ret_kb for b in row)
+    assert any("Глубокий поиск" in b["text"] for row in ret_kb for b in row)
 
     # 4. Переходим в полный список
     bot.calls.clear()
