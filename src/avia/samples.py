@@ -170,6 +170,10 @@ def _make_fixture_snapshot_and_query(site: str, path: Path, content: str) -> tup
         url = "https://www.ozon.ru/travel/flight/search"
         q = Query(origin="KUF", destination="EVN", depart=date(2026, 12, 1), adults=1)
         payloads = [("https://www.ozon.ru/api/composer-api.bx/page/json/v2?url=%2Ftravel%2Fflight%2Fsearch", content)]
+    elif site == "ttravel":
+        url = "https://www.tbank-online.com/travel/flights/one-way/KUF-MOW/12-10/?adults=1&children=0&infants=0&cabin=Y&composite=0"
+        q = Query(origin="KUF", destination="MOW", depart=date(2026, 12, 10), adults=1)
+        payloads = [("https://www.tbank-online.com/api/travel/flight/search/startStreaming?sessionId=test", content)]
     else:
         payloads = [(url, content)]
 

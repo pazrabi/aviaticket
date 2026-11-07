@@ -11,6 +11,8 @@ def build_url(site: SiteConfig, q: Query, extra: dict[str, str] | None = None) -
         "date_iso": q.depart.isoformat(),
         "ddmm": q.depart.strftime("%d%m"),
         "ddmmyyyy": q.depart.strftime("%d%m%Y"),
+        "mm_dd": q.depart.strftime("%m-%d"),
+        "MM-DD": q.depart.strftime("%m-%d"),
         "adults": q.adults,
     }
     if q.return_date:
@@ -20,6 +22,8 @@ def build_url(site: SiteConfig, q: Query, extra: dict[str, str] | None = None) -
         params["date_iso_ret"] = q.return_date.isoformat()
         params["ddmm_ret"] = q.return_date.strftime("%d%m")
         params["ddmmyyyy_ret"] = q.return_date.strftime("%d%m%Y")
+        params["mm_dd_ret"] = q.return_date.strftime("%m-%d")
+        params["MM-DD_ret"] = q.return_date.strftime("%m-%d")
     else:
         template = site.url_template
     if extra:
