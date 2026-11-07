@@ -556,7 +556,7 @@ class Bot:
         """SEARCHING → DONE; другой шаг (успех уже поставил DONE, человек начал новый диалог) не трогаем.
 
         Диалог ставит SEARCHING до поиска. Снимает его тот, кто держит busy, в finally рядом
-        с busy.discard (живой и глубокий поиск), а отказ до busy.add — сразу. Иначе на любой
+        с busy.discard (живой и глубокий поиск), а отказ или исключение до busy.add — сразу. Иначе на любой
         текст человек получает «⏳ Поиск ещё идёт» навсегда.
         """
         session = self.dialog.sessions.get(chat_id)
@@ -568,14 +568,25 @@ class Bot:
             # Поиск этого человека уже идёт: шаг не трогаем, SEARCHING снимет его finally
             await self.send(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите.")
             return
-        budget_wait = self._search_budget_wait(chat_id)
+        try:
+            budget_wait = self._search_budget_wait(chat_id)
+            # Сверх бюджета дневной лимит человека не списываем
+            within_limit = budget_wait <= 0 and (
+                chat_id in self.s.tg_allowed_ids
+                or self.users.try_use_search(chat_id, self.s.daily_search_limit)
+            )
+            if within_limit:
+                self._note_search_budget(chat_id)
+        except Exception:
+            # Бюджет или SQLite (database is locked и т.п.) до busy.add: снять SEARCHING некому, кроме нас
+            log.exception("не получилось начать поиск, chat_id=%s", chat_id)
+            self._leave_searching(chat_id)
+            await self.send(chat_id, "⚠️ Не получилось начать поиск, попробуйте ещё раз.")
+            return
         if budget_wait > 0:
             await self._refuse_over_budget(chat_id, budget_wait)
             return
-        if (
-            chat_id not in self.s.tg_allowed_ids
-            and not self.users.try_use_search(chat_id, self.s.daily_search_limit)
-        ):
+        if not within_limit:
             self._leave_searching(chat_id)
             await self.send(
                 chat_id,
@@ -583,7 +594,6 @@ class Bot:
                 "отслеживания продолжают работать.",
             )
             return
-        self._note_search_budget(chat_id)
         self.busy.add(chat_id)
         q = req.query
         baggage_mode = req.baggage_mode

@@ -4,10 +4,15 @@
 бот отказал по дневному лимиту, шаг оставался SEARCHING, и на любой текст человек получал
 «⏳ Поиск ещё идёт». Отказ «занят» значит, что поиск этого человека уже идёт: шаг он не
 трогает, SEARCHING снимает тот, кто держит busy (живой или глубокий поиск), в своём finally.
+Исключение в проверках до busy.add (SQLite «database is locked» в дневном лимите, часовой
+бюджет поисков на бота) тоже снимает шаг: человек получает короткую ошибку, исключение —
+в лог с chat_id.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
+import sqlite3
 from datetime import date, timedelta
 from types import SimpleNamespace
 
@@ -24,6 +29,7 @@ PERSON_ID = 555
 STUCK_TEXT = "⏳ Поиск ещё идёт"
 BUSY_TEXT = "Предыдущий поиск ещё идёт"
 LIMIT_TEXT = "лимит поисков исчерпан"
+START_FAILED_TEXT = "⚠️ Не получилось начать поиск, попробуйте ещё раз."
 DAY_SECONDS = 86400.0
 
 
@@ -197,3 +203,85 @@ async def test_daily_limit_refusal_resets_searching(monkeypatch):
     await search_via_dialog(bot, PERSON_ID)
     assert search.calls == ["live", "live"]
     assert any("TestAir" in t for t in sent_texts(bot, mark))
+
+
+def fail_first_call(monkeypatch, obj, name: str, exc: Exception) -> list[tuple]:
+    """obj.name: первый вызов бросает exc, дальше настоящий метод. Возвращает аргументы вызовов."""
+    real = getattr(obj, name)
+    calls: list[tuple] = []
+
+    def wrapper(*args, **kwargs):
+        calls.append(args)
+        if len(calls) == 1:
+            raise exc
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(obj, name, wrapper)
+    return calls
+
+
+def lock_db_once(monkeypatch, bot: RecordingBot) -> list[tuple]:
+    """users.try_use_search: первый вызов — «database is locked», дальше настоящая база."""
+    return fail_first_call(monkeypatch, bot.users, "try_use_search", sqlite3.OperationalError("database is locked"))
+
+
+def start_failure_records(caplog, exc_type: type[BaseException]) -> list[logging.LogRecord]:
+    return [
+        r
+        for r in caplog.records
+        if r.name == "avia.bot" and r.exc_info is not None and isinstance(r.exc_info[1], exc_type)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_db_error_in_daily_limit_resets_searching(monkeypatch, caplog):
+    """SQLite падает в try_use_search до busy.add: шаг снят, busy пуст, короткая ошибка, лог с chat_id."""
+    search = FakeSearch()
+    monkeypatch.setattr("avia.bot.search", search)
+    bot = make_bot()
+    limit_calls = lock_db_once(monkeypatch, bot)
+    caplog.set_level(logging.ERROR, logger="avia.bot")
+
+    await search_via_dialog(bot, PERSON_ID)
+    assert len(limit_calls) == 1
+    assert search.calls == []
+    assert PERSON_ID not in bot.busy
+    assert START_FAILED_TEXT in sent_texts(bot)
+    records = start_failure_records(caplog, sqlite3.OperationalError)
+    assert len(records) == 1
+    assert str(PERSON_ID) in records[0].getMessage()
+    await assert_not_stuck(bot, PERSON_ID)
+
+    mark = len(bot.calls)
+    await search_via_dialog(bot, PERSON_ID)
+    assert search.calls == ["live"]
+    assert any("TestAir" in t for t in sent_texts(bot, mark))
+    assert step_of(bot, PERSON_ID) == Step.DONE
+
+
+@pytest.mark.asyncio
+async def test_budget_error_resets_searching(monkeypatch, caplog):
+    """Исключение в _search_budget_wait до busy.add: шаг снят, busy пуст, лимит не списан, лог с chat_id."""
+    search = FakeSearch()
+    monkeypatch.setattr("avia.bot.search", search)
+    bot = make_bot(search_budget_per_hour=5)
+    budget_calls = fail_first_call(monkeypatch, bot, "_search_budget_wait", RuntimeError("бюджет сломан"))
+    caplog.set_level(logging.ERROR, logger="avia.bot")
+
+    await search_via_dialog(bot, PERSON_ID)
+    assert len(budget_calls) == 1
+    assert search.calls == []
+    assert bot.users.get(PERSON_ID).total_searches == 0
+    assert PERSON_ID not in bot.busy
+    assert START_FAILED_TEXT in sent_texts(bot)
+    records = start_failure_records(caplog, RuntimeError)
+    assert len(records) == 1
+    assert str(PERSON_ID) in records[0].getMessage()
+    await assert_not_stuck(bot, PERSON_ID)
+
+    mark = len(bot.calls)
+    await search_via_dialog(bot, PERSON_ID)
+    assert search.calls == ["live"]
+    assert bot.users.get(PERSON_ID).total_searches == 1
+    assert any("TestAir" in t for t in sent_texts(bot, mark))
+    assert step_of(bot, PERSON_ID) == Step.DONE
