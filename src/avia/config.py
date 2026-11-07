@@ -158,6 +158,7 @@ class Settings:
     hedge_delay_seconds: float = 0.0
     live_reserve: bool = True
     trial_stage: bool = True
+    history_hint: bool = True
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -358,6 +359,9 @@ def load_settings(path: Path | None = None) -> Settings:
     trial_stage_env = os.getenv("TRIAL_STAGE", "1").strip().lower()
     trial_stage = trial_stage_env not in ("0", "false", "False", "no", "off")
 
+    history_hint_env = os.getenv("HISTORY_HINT", "1").strip().lower()
+    history_hint = history_hint_env not in ("0", "false", "False", "no", "off")
+
     return Settings(
         sites=sites,
         tp_token=os.getenv("TP_TOKEN", ""),
@@ -447,6 +451,7 @@ def load_settings(path: Path | None = None) -> Settings:
         hedge_delay_seconds=hedge_delay_seconds,
         live_reserve=live_reserve,
         trial_stage=trial_stage,
+        history_hint=history_hint,
     )
 
 

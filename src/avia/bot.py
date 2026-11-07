@@ -563,6 +563,24 @@ class Bot:
                 log.exception("история цен недоступна")
             filtered_crit, dropped_criteria = apply_criteria(results, req.criteria)
             filtered, dropped_baggage = filter_by_baggage(filtered_crit, baggage_mode)
+
+            hint_line: str | None = None
+            settings = getattr(self, "settings", self.s)
+            if getattr(settings, "history_hint", True) and self.history is not None:
+                try:
+                    ok_offers = [o for r in filtered if r.ok for o in r.offers]
+                    if ok_offers:
+                        best_price = min(o.price for o in ok_offers)
+                        now = time.time()
+                        since = now - analytics.HINT_WINDOW_DAYS * 86400.0
+                        route_prices = await asyncio.to_thread(
+                            self.history.route_search_minima, q, since, now
+                        )
+                        hint_line = analytics.history_hint_line(best_price, route_prices)
+                except Exception as exc:
+                    log.warning("Ошибка вычисления history_hint_line: %s", exc)
+                    hint_line = None
+
             chunks, flat, pool = build_compact_report(
                 q,
                 filtered,
@@ -570,6 +588,7 @@ class Bot:
                 baggage_mode=baggage_mode,
                 dropped_baggage=dropped_baggage,
                 dropped_criteria=dropped_criteria,
+                history_hint=hint_line,
             )
 
             session = self.dialog.sessions.get(chat_id)
