@@ -8,6 +8,8 @@
 """
 from __future__ import annotations
 
+import asyncio
+import threading
 import time
 
 import pytest
@@ -186,6 +188,123 @@ async def test_new_people_limit_ignored_when_closed_and_in_groups(tmp_path):
     bot.calls.clear()
     await bot.handle(msg(14, chat_type="supergroup"))
     assert not bot.calls and bot.users.get(14) is None
+
+
+# --- лимит новых людей: без синхронного SQLite в цикле событий ---
+
+
+def spy_lookups(bot: RecordingBot, monkeypatch) -> list[tuple[str, int]]:
+    """Подменяет users.get и users.count_since_created: пишет (имя, id потока) каждого вызова."""
+    calls: list[tuple[str, int]] = []
+    for name in ("get", "count_since_created"):
+        orig = getattr(bot.users, name)
+
+        def wrapper(*args, _orig=orig, _name=name, **kwargs):
+            calls.append((_name, threading.get_ident()))
+            return _orig(*args, **kwargs)
+
+        monkeypatch.setattr(bot.users, name, wrapper)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_known_person_looked_up_at_most_once(tmp_path, monkeypatch):
+    bot = make_bot(tmp_path, new_per_day=5)
+    bot.users.register(10, now=time.time() - 2 * 86400)
+    calls = spy_lookups(bot, monkeypatch)
+    for _ in range(5):
+        await bot.handle(msg(10))
+    assert len(calls) <= 1, calls
+
+    # человек, которого только что зарегистрировал _admit, тоже больше не ищется в базе
+    calls.clear()
+    for _ in range(5):
+        await bot.handle(msg(11))
+    lookups = list(calls)  # до проверки ниже: её users.get тоже попал бы в шпиона
+    first_message_lookups = 2  # users.get + счётчик новых людей за сутки
+    assert len(lookups) <= first_message_lookups, lookups
+    assert bot.users.get(11) is not None
+
+
+@pytest.mark.asyncio
+async def test_unknown_person_lookups_run_off_event_loop(tmp_path, monkeypatch):
+    bot = make_bot(tmp_path, new_per_day=1)
+    calls = spy_lookups(bot, monkeypatch)
+    loop_thread = threading.get_ident()
+    await bot.handle(msg(10))
+    await bot.handle(msg(12))  # сверх лимита: отказ
+    await bot.handle_callback(
+        {"id": "cq3", "from": {"id": 13}, "data": "menu:go", "message": {"chat": {"id": 13, "type": "private"}, "message_id": 8}}
+    )
+
+    assert {name for name, _ in calls} == {"get", "count_since_created"}
+    assert all(tid != loop_thread for _, tid in calls), calls
+    assert any(NEW_PEOPLE_PHRASE in t for t in texts_to(bot, 12))
+    assert bot.users.get(12) is None and bot.users.get(13) is None
+
+
+@pytest.mark.asyncio
+async def test_new_people_count_cached_per_day(tmp_path, monkeypatch):
+    bot = make_bot(tmp_path, new_per_day=3)
+    calls = spy_lookups(bot, monkeypatch)
+    for uid in (10, 11, 12, 13, 14):
+        await bot.handle(msg(uid))
+
+    assert [n for n, _ in calls].count("count_since_created") == 1
+    assert all(bot.users.get(uid) for uid in (10, 11, 12))
+    assert bot.users.get(13) is None and bot.users.get(14) is None
+    assert any(NEW_PEOPLE_PHRASE in t for t in texts_to(bot, 13))
+
+
+@pytest.mark.asyncio
+async def test_new_people_count_resets_next_day(tmp_path, monkeypatch):
+    bot = make_bot(tmp_path, new_per_day=1)
+    await bot.handle(msg(10))
+    await bot.handle(msg(11))
+    assert bot.users.get(11) is None
+
+    tomorrow = time.time() + 1  # все уже зарегистрированы «вчера»
+    monkeypatch.setattr("avia.bot._local_day_start", lambda ts: tomorrow)
+    bot.calls.clear()
+    await bot.handle(msg(11))
+    assert bot.users.get(11) is not None
+    assert not any(NEW_PEOPLE_PHRASE in t for t in texts_to(bot, 11))
+
+
+@pytest.mark.asyncio
+async def test_flag_off_check_makes_no_users_lookups(tmp_path, monkeypatch):
+    bot = make_bot(tmp_path)
+    bot.users.register(10)
+    calls = spy_lookups(bot, monkeypatch)
+    for uid in (10, 10, 11, 12, ADMIN):
+        await bot.handle(msg(uid))
+    await bot.handle_callback(
+        {"id": "cq4", "from": {"id": 13}, "data": "menu:go", "message": {"chat": {"id": 13, "type": "private"}, "message_id": 9}}
+    )
+    assert calls == []
+    assert all(bot.users.get(uid) for uid in (10, 11, 12, 13, ADMIN))
+
+
+@pytest.mark.asyncio
+async def test_concurrent_new_people_do_not_overshoot_limit(tmp_path):
+    bot = make_bot(tmp_path, new_per_day=1)
+    await asyncio.gather(*(bot.handle(msg(uid)) for uid in (20, 21, 22)))
+    admitted = [uid for uid in (20, 21, 22) if bot.users.get(uid) is not None]
+    assert len(admitted) == 1, admitted
+    refused = [uid for uid in (20, 21, 22) if any(NEW_PEOPLE_PHRASE in t for t in texts_to(bot, uid))]
+    assert len(refused) == 2
+
+
+@pytest.mark.asyncio
+async def test_same_new_person_concurrent_messages_take_one_place(tmp_path):
+    bot = make_bot(tmp_path, new_per_day=1)
+    await asyncio.gather(bot.handle(msg(30)), bot.handle(msg(30, "/help")))
+    assert bot.users.get(30) is not None
+    assert not any(NEW_PEOPLE_PHRASE in t for t in texts_to(bot, 30))
+
+    await bot.handle(msg(31))
+    assert bot.users.get(31) is None
+    assert any(NEW_PEOPLE_PHRASE in t for t in texts_to(bot, 31))
 
 
 # --- настройки ---

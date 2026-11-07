@@ -213,6 +213,9 @@ class Bot:
         self.http = httpx.AsyncClient(timeout=70)
         self.busy: set[int] = set()
         self._budget_times: list[float] = []  # старты поисков людей за последний час (SEARCH_BUDGET_PER_HOUR)
+        self._known_users: set[int] = set()  # id, которые точно есть в users: лимит новых людей их не ищет
+        self._new_day_start: float | None = None  # местные сутки счётчика новых людей (NEW_USERS_PER_DAY)
+        self._new_day_count: int = 0  # новых людей за эти сутки
         self.users = UserStore(settings.storage_dir / "users.sqlite")
         if getattr(settings, "phones", None) is not None:
             self.phones = settings.phones
@@ -992,8 +995,28 @@ class Bot:
                     except Exception:
                         pass
 
-    def _new_person_over_limit(self, user: dict, chat: dict | None) -> bool:
-        """TG_OPEN=1 и NEW_USERS_PER_DAY: новый человек сверх лимита на сегодня (известных и админов пускаем)."""
+    async def _is_registered(self, user_id: int) -> bool:
+        """Есть ли человек в users; запрос в отдельном потоке, найденного больше не ищем."""
+        if await asyncio.to_thread(self.users.get, user_id) is not None:
+            self._known_users.add(user_id)
+            return True
+        return False
+
+    async def _sync_new_people_day(self, now: float) -> None:
+        """Счётчик новых людей за местные сутки: из базы (в отдельном потоке) раз в сутки, дальше в памяти."""
+        day = _local_day_start(now)
+        if self._new_day_start == day:
+            return
+        count = await asyncio.to_thread(self.users.count_since_created, day)
+        if self._new_day_start != day:  # пока считали, параллельный обработчик мог уже завести счётчик
+            self._new_day_start = day
+            self._new_day_count = count
+
+    async def _new_person_over_limit(self, user: dict, chat: dict | None) -> bool:
+        """TG_OPEN=1 и NEW_USERS_PER_DAY: новый человек сверх лимита на сегодня (известных и админов пускаем).
+
+        Выключено (0) — без обращений к базе. Известные id — из памяти, остальное — не в цикле событий.
+        """
         limit = getattr(self.s, "new_users_per_day", 0)
         if limit <= 0 or not self.s.tg_open:
             return False
@@ -1002,16 +1025,24 @@ class Bot:
             return False
         if chat is not None and chat.get("type", "private") != "private":
             return False  # группы _admit отклоняет молча, как раньше
+        if user_id in self._known_users:
+            return False
         try:
-            if self.users.get(user_id) is not None:
+            if await self._is_registered(user_id):
                 return False
-            over = self.users.count_since_created(_local_day_start(time.time())) >= limit
+            await self._sync_new_people_day(time.time())
         except Exception:
             log.exception("не удалось проверить лимит новых людей")
             return False
-        if over:
+        if user_id in self._known_users:
+            return False  # параллельное сообщение того же человека уже заняло ему место
+        if self._new_day_count >= limit:
             log.info("лимит новых людей на сегодня (%s) исчерпан, отказ user=%s", limit, user_id)
-        return over
+            return True
+        # место занимаем сразу: _admit регистрирует человека следом, без await между ними
+        self._new_day_count += 1
+        self._known_users.add(user_id)
+        return False
 
     def _admit(self, user: dict, chat: dict | None) -> bool:
         """Пускает администраторов и (в открытом режиме) любого человека из личного чата; регистрирует в users."""
@@ -1030,11 +1061,12 @@ class Bot:
         except Exception:
             log.exception("не удалось записать пользователя")
             return is_admin
+        self._known_users.add(user_id)
         return is_admin or not rec.blocked
 
     async def handle(self, msg: dict):
         chat_id = msg["chat"]["id"]
-        if self._new_person_over_limit(msg.get("from", {}), msg.get("chat")):
+        if await self._new_person_over_limit(msg.get("from", {}), msg.get("chat")):
             await self.send(chat_id, NEW_PEOPLE_FULL_TEXT)
             return
         if not self._admit(msg.get("from", {}), msg.get("chat")):
@@ -1743,7 +1775,7 @@ class Bot:
             return
 
         msg = cq.get("message") or {}
-        if self._new_person_over_limit(cq.get("from", {}), msg.get("chat")):
+        if await self._new_person_over_limit(cq.get("from", {}), msg.get("chat")):
             if cq_id:
                 await self.call("answerCallbackQuery", callback_query_id=cq_id, text=NEW_PEOPLE_FULL_TEXT)
             return
