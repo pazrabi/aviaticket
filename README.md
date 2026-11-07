@@ -22,7 +22,7 @@ LLM в основном пути нет: цены разбираются обы�
 ## Как устроено
 
 ```mermaid
-flowchart LR
+flowchart TD
     U[Пользователь в Telegram] -->|/price Москва Алматы 10.12| B[bot.py]
     B --> P[parsing.py<br/>город и дата → Query]
     P --> D[dispatcher + speed routing]
