@@ -1,5 +1,6 @@
 
 
+import os
 from pathlib import Path
 
 import pytest
@@ -66,3 +67,17 @@ def _cwd_in_tmp(tmp_path, monkeypatch):
         orig_init(self, pp)
 
     monkeypatch.setattr(MetricsStore, "__init__", _init)
+
+
+@pytest.fixture(autouse=True)
+def _no_system_proxy(monkeypatch):
+    """Тесты не ходят через прокси машины разработчика.
+
+    httpx берёт прокси из urllib.request.getproxies(): переменные *_proxy в любом регистре
+    (ALL_PROXY=socks5h://... без socksio роняет уже httpx.AsyncClient()), а если их нет —
+    на macOS из системных настроек сети. Поэтому убираем переменные и ставим NO_PROXY=*.
+    """
+    for name in list(os.environ):
+        if name.lower().endswith("_proxy"):
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "*")
