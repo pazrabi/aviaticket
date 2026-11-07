@@ -927,6 +927,11 @@ async def _fallback_url(site: SiteConfig, q: Query, settings: Settings) -> str |
         return None
 
 
+def _is_signature_mismatch(exc: TypeError) -> bool:
+    """TypeError от вызова с лишним именованным аргументом (старая сигнатура), а не ошибка внутри вызова."""
+    return "unexpected keyword argument" in str(exc)
+
+
 async def _run_site(
     site: SiteConfig,
     q: Query,
@@ -1146,7 +1151,11 @@ async def _run_site(
                 now=now,
                 deep=deep,
             )
-        except TypeError:
+        except TypeError as e:
+            # повтор только для старой сигнатуры _from_browser; TypeError из парсера — настоящая ошибка,
+            # повтор собрал бы страницу заново
+            if not _is_signature_mismatch(e):
+                raise
             try:
                 if exclude:
                     return await _from_browser(
@@ -1160,7 +1169,9 @@ async def _run_site(
                     weight=weight,
                     stats=stats,
                 )
-            except TypeError:
+            except TypeError as e2:
+                if not _is_signature_mismatch(e2):
+                    raise
                 return await _from_browser(site, q, settings)
 
     async def _fetch() -> tuple[list[Offer], str | None, bool]:
