@@ -6,7 +6,7 @@
 # phone:           id телефона для droidhub или auto (любой свободный из DROIDHUB_DEVICES в .env);
 #                  если droidhub настроен, сбор идёт через телефон, иначе через Chromium
 #
-# Плейсхолдеры в url_template: {origin} {destination} {date_iso} {ddmm} {ddmmyyyy} {adults}
+# Плейсхолдеры в url_template: {origin} {destination} {date_iso} {ddmm} {ddmmyyyy} {mm_dd} {adults}
 # Коды городов IATA (MOW, ALA, TAS, MSQ, EVN ...).
 
 sites:
@@ -101,3 +101,20 @@ sites:
     url_template_rt: "https://www.ozon.ru/travel/flight/search?Children=0&Dlts={adults}&Infants=0&ServiceClass=ECONOMY&dates=d{date_iso}d{date_iso_ret}&route={origin}{destination}{destination}{origin}"
     settle_ms: 30000
     scrolls: 1
+
+  # Т-Путешествия: новый агрегатор (шаг 14 PLAN_SPEED.md), стадия trial (только фон).
+  - name: ttravel
+    source: browser
+    parser: ttravel
+    enabled: true
+    stage: trial
+    phone: "redmi9t,huawei2,galaxya12"
+    phone_patience_seconds: 10
+    phone_capture_json: ["startStreaming"]
+    phone_wait_seconds: 30
+    phone_wait_for: '"payload":{"offers"'
+    url_template: "https://www.tbank-online.com/travel/flights/one-way/{origin}-{destination}/{mm_dd}/?adults={adults}&children=0&infants=0&cabin=Y&composite=0"
+    url_template_rt: "https://www.tbank-online.com/travel/flights/multi-way/{origin}-{destination}/{mm_dd}/{destination}-{origin}/{mm_dd_ret}/?adults={adults}&children=0&infants=0&cabin=Y&composite=0"
+    settle_ms: 25000
+    scrolls: 2
+
