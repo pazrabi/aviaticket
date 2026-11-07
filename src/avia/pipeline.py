@@ -1214,9 +1214,12 @@ async def _run_site(
     try:
         (offers, page_url, partial), from_cache = await g.run(
             key_site=site.name,
-            key_query=q,
+            # глубокий поиск не делит кэш и «полёт» с быстрым: у него другая полнота
+            key_query=(("deep", q) if deep else q),
             factory=_fetch,
             live=priority == 0,
+            # пустые и неполные ответы не кэшируем: иначе следующий поиск получит «ничего не нашлось из кэша»
+            cache_if=lambda r: bool(r[0]) and not r[2],
         )
         return SiteResult(
             site=site.name,

@@ -87,6 +87,7 @@ class SearchGuard:
         factory: Callable[[], Awaitable[T]],
         retry_delay: float | None = None,
         live: bool = False,
+        cache_if: Callable[[Any], bool] | None = None,
     ) -> tuple[T, bool]:
         """Выполняет поиск через factory с кэшированием, защитой сайта и повтором при сбое."""
         cache_key = (key_site, key_query)
@@ -121,7 +122,8 @@ class SearchGuard:
             if live:
                 # Живой поиск человека не ждёт ни замок сайта, ни паузу: телефоны делят работу через очередь хаба
                 result = await self._run_live(factory, delay)
-                self._cache[cache_key] = (self.clock(), result)
+                if cache_if is None or cache_if(result):
+                    self._cache[cache_key] = (self.clock(), result)
                 flight.result = result
                 flight.event.set()
                 return result, False
@@ -152,7 +154,8 @@ class SearchGuard:
                     result = await factory()
 
                 # Кэшируем только успешный результат (ошибки не кэшируются)
-                self._cache[cache_key] = (self.clock(), result)
+                if cache_if is None or cache_if(result):
+                    self._cache[cache_key] = (self.clock(), result)
                 flight.result = result
                 flight.event.set()
                 return result, False

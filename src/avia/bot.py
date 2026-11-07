@@ -866,7 +866,9 @@ class Bot:
                 )
 
             # Сохраняем в DeepCache
-            self.deep_cache.put(q, results)
+            # кладём в кеш только полную выдачу: пустые, неполные и упавшие сайты оставили бы дыру на 15 минут
+            if results and all(r.ok and r.offers and not r.partial for r in results):
+                self.deep_cache.put(q, results)
 
             results = assign_ids(results)
             try:
