@@ -24,6 +24,8 @@ from .models import Leg, Offer, Query, SiteResult
 from .offers import baggage_state, compute_offer_id, merge_same_flights
 from .parsing import city_name
 
+OZON_GUEST_NOTE = "цены для гостя: с вашим аккаунтом Озона могут быть чуть ниже"
+
 SYMBOLS = {"RUB": "₽", "KZT": "₸", "UZS": "сум", "USD": "$", "EUR": "€"}
 
 
@@ -562,6 +564,8 @@ def build_report(
                 notes.append(format_cached_age_note(float(r.cached_age)))
             except Exception as e:
                 log.warning("Ошибка форматирования cached_age в build_report: %s", e)
+        if r.site == "ozon_travel":
+            notes.append(OZON_GUEST_NOTE)
         site_head = [f"<b>{escape(site_label(r.site))}</b>  <i>{r.elapsed:.0f} с</i>"]
         site_head += [f"<i>{escape(n)}</i>" for n in notes]
 
