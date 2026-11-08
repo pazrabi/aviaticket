@@ -169,6 +169,9 @@ class Settings:
     card_early: bool = False
     card_early_seconds: float = 30.0  # в этот момент карточка уходит, если цены уже есть
     card_early_sites: int = 4  # карточка уходит, как только сайтов с ценами столько
+    # П32: предварительные цены из кэша Aviasales в сообщении ожидания (TP_PREVIEW=1 и TP_TOKEN; по умолчанию выключено)
+    tp_preview: bool = False
+    tp_preview_timeout: float = 3.0  # ответ кэша позже — строки нет
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -396,6 +399,14 @@ def load_settings(path: Path | None = None) -> Settings:
     if card_early_sites < 1:
         card_early_sites = 4
 
+    tp_preview = os.getenv("TP_PREVIEW", "0").strip() == "1"
+    try:
+        tp_preview_timeout = float(os.getenv("TP_PREVIEW_TIMEOUT", "3"))
+    except ValueError:
+        tp_preview_timeout = 3.0
+    if not 0 < tp_preview_timeout < float("inf"):  # ноль, минус, nan и inf — по умолчанию
+        tp_preview_timeout = 3.0
+
     try:
         search_budget_per_hour = max(0, int(os.getenv("SEARCH_BUDGET_PER_HOUR", "0")))
     except ValueError:
@@ -504,6 +515,8 @@ def load_settings(path: Path | None = None) -> Settings:
         card_early=card_early,
         card_early_seconds=card_early_seconds,
         card_early_sites=card_early_sites,
+        tp_preview=tp_preview,
+        tp_preview_timeout=tp_preview_timeout,
     )
 
 

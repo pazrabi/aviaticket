@@ -64,6 +64,7 @@ from .scheduler import Scheduler
 from .store import ResultStore
 from .subscriptions import SubscriptionStore
 from .tg_text import html_to_plain, split_html
+from .tp_preview import missing_token, preview_enabled, preview_metrics, run_preview, stop_preview
 from .users import UserStore
 
 log = logging.getLogger("avia.bot")
@@ -144,13 +145,17 @@ class WaitMessageUpdater:
         self.min_interval = min_interval
         self.site_status: dict[str, str] = {s.name: f"⏳ {escape(s.name)}" for s in sites}
         self.results_by_site: dict[str, SiteResult] = {}
+        self.preview_line: str | None = None  # П32: строка кэша Aviasales под шапкой; None — строки нет
         self.last_edit_time: float = float("-inf")
         self.last_rendered_text: str = self._render()
         self.closed: bool = False
         self._lock = asyncio.Lock()
 
     def _render(self) -> str:
-        lines = [self.header, ""]
+        lines = [self.header]
+        if self.preview_line:
+            lines.append(self.preview_line)
+        lines.append("")
         if self.site_status:
             ordered = sorted(self.sites, key=lambda s: self.site_status.get(s.name, "").startswith("💤"))
             for s in ordered:
@@ -179,6 +184,21 @@ class WaitMessageUpdater:
                 now = time.monotonic()
                 if self.last_edit_time == float("-inf") or (now - self.last_edit_time >= self.min_interval):
                     await self._push_edit(now)
+
+    async def show_preview(self, line: str) -> bool:
+        """П32: строка кэша под шапкой, правка сразу; True — сообщение ожидания её показывает.
+
+        Правка не прошла — строку не держим: иначе она всплывёт с правкой сайта, а метрика скажет «не было».
+        """
+        async with self._lock:
+            if self.closed or self.message_id is None:
+                return False
+            self.preview_line = line
+            await self._push_edit(time.monotonic(), force=True)
+            if self.last_rendered_text == self._render():
+                return True
+            self.preview_line = None
+            return False
 
     async def flush(self) -> None:
         async with self._lock:
@@ -303,6 +323,8 @@ class Bot:
         self._last_trial_check: float = 0.0
         self._last_stop_calibrate: float = 0.0
         self._trial_notified: dict[str, float] = {}
+        if missing_token(settings):
+            log.warning("TP_PREVIEW=1, но TP_TOKEN пуст: предварительных цен из кэша Aviasales не будет")
         try:
             from .samples import install_sample_hook
             install_sample_hook()
@@ -677,6 +699,7 @@ class Bot:
             timed_out = False
             search_task: asyncio.Task | None = None
             early: EarlyCard | None = None
+            preview_task: asyncio.Task | None = None  # П32: строка кэша Aviasales в сообщении ожидания
             try:
                 search_task = asyncio.create_task(
                     _search_call(
@@ -690,6 +713,10 @@ class Bot:
                         fresh_max_age=float(getattr(self.s, "fresh_max_age_seconds", 600.0)),
                     )
                 )
+                if preview_enabled(self.s):
+                    preview_task = asyncio.create_task(
+                        run_preview(updater, q, req.criteria, self.s, t_search0, chat_id)
+                    )
                 if watch is not None:
                     early = await self._early_card_phase(chat_id, req, watch, search_task, t_search0, t_loop0)
                 if self.s.live_safety_seconds > 0:
@@ -714,6 +741,7 @@ class Bot:
                         pass
             finally:
                 self._active_searches -= 1
+                preview = await stop_preview(preview_task)  # кэш не ответил к концу поиска — строки уже не будет
 
             try:
                 await updater.flush()
@@ -752,6 +780,7 @@ class Bot:
                     results,
                     queue_seconds=0.0,
                     **card_metrics(early, total_seconds, results, req.criteria, baggage_mode),
+                    **preview_metrics(preview),
                 )
 
             results = assign_ids(results)

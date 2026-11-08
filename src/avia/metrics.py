@@ -147,7 +147,9 @@ CREATE TABLE IF NOT EXISTS searches (
     card_seconds   REAL,
     card_sites_ok  INTEGER,
     card_min_price REAL,
-    full_min_price REAL
+    full_min_price REAL,
+    preview_seconds   REAL,
+    preview_min_price REAL
 );
 CREATE INDEX IF NOT EXISTS ix_searches_ts ON searches (ts);
 
@@ -208,6 +210,11 @@ SEARCHES_CARD_COLUMNS = (
     ("card_sites_ok", "INTEGER"),
     ("card_min_price", "REAL"),
     ("full_min_price", "REAL"),
+)
+# П32: строка кэша Aviasales в сообщении ожидания — когда показана и минимум в ней (NULL — предпросмотра не было)
+SEARCHES_PREVIEW_COLUMNS = (
+    ("preview_seconds", "REAL"),
+    ("preview_min_price", "REAL"),
 )
 
 
@@ -270,7 +277,7 @@ class MetricsStore:
             if "cls" not in cols_srch:
                 conn.execute("ALTER TABLE searches ADD COLUMN cls TEXT")
             # П31: карточка живого поиска — когда ушла, сайтов с ценами, минимум в карточке и в полной выдаче
-            for col, col_type in SEARCHES_CARD_COLUMNS:
+            for col, col_type in SEARCHES_CARD_COLUMNS + SEARCHES_PREVIEW_COLUMNS:
                 if col not in cols_srch:
                     conn.execute(f"ALTER TABLE searches ADD COLUMN {col} {col_type}")
 
@@ -948,11 +955,14 @@ def _record_search(
     card_sites_ok: int | None = None,
     card_min_price: float | None = None,
     full_min_price: float | None = None,
+    preview_seconds: float | None = None,
+    preview_min_price: float | None = None,
 ) -> None:
     """Итог всего поиска: сколько ждал человек, когда пришла первая цена, сколько сайтов ответило.
 
     card_* и full_min_price — карточка живого поиска (П31): когда ушла, сайтов с ценами в ней, минимум цены
     в карточке и в полной выдаче. Без карточки (фон, подписки, глубокий поиск) — NULL.
+    preview_* — строка кэша Aviasales в сообщении ожидания (П32): когда показана, минимум в ней; не было — NULL.
     """
     try:
         oks = [float(r.elapsed) for r in results if r.ok and r.offers]
@@ -970,12 +980,14 @@ def _record_search(
             int(card_sites_ok) if card_sites_ok is not None else None,
             float(card_min_price) if card_min_price is not None else None,
             float(full_min_price) if full_min_price is not None else None,
+            float(preview_seconds) if preview_seconds is not None else None,
+            float(preview_min_price) if preview_min_price is not None else None,
         )
         with self._connect() as db:
             db.execute(
                 "INSERT INTO searches (ts, source, total_seconds, first_seconds, sites_total, sites_ok, queue_seconds, cls,"
-                " card_seconds, card_sites_ok, card_min_price, full_min_price)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " card_seconds, card_sites_ok, card_min_price, full_min_price, preview_seconds, preview_min_price)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row,
             )
     except Exception:

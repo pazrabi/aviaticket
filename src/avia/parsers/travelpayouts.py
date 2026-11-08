@@ -63,12 +63,10 @@ def parse_prices_for_dates(payload: dict, q: Query, marker: str = "") -> list[Of
     return offers
 
 
-async def fetch_travelpayouts(q: Query, token: str, marker: str = "", limit: int = 10) -> list[Offer]:
-    if not token:
-        raise RuntimeError("не задан TP_TOKEN (токен из кабинета Travelpayouts, раздел API)")
-    import httpx  # лениво: чистый разбор ответа не требует сети и httpx
-
-    params = {
+def query_params(q: Query, limit: int = 10) -> dict[str, str | int]:
+    """Параметры prices_for_dates. Туда-обратно (П32) — return_at и one_way=false: ответ того же вида,
+    его разбирает та же parse_prices_for_dates (цена — за всю поездку). В одну сторону — как было."""
+    params: dict[str, str | int] = {
         "origin": q.origin,
         "destination": q.destination,
         "departure_at": q.depart.isoformat(),
@@ -78,6 +76,17 @@ async def fetch_travelpayouts(q: Query, token: str, marker: str = "", limit: int
         "limit": limit,
         "page": 1,
     }
+    if q.return_date is None:
+        return params
+    return {**params, "one_way": "false", "return_at": q.return_date.isoformat()}
+
+
+async def fetch_travelpayouts(q: Query, token: str, marker: str = "", limit: int = 10) -> list[Offer]:
+    if not token:
+        raise RuntimeError("не задан TP_TOKEN (токен из кабинета Travelpayouts, раздел API)")
+    import httpx  # лениво: чистый разбор ответа не требует сети и httpx
+
+    params = query_params(q, limit)
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.get(ENDPOINT, params=params, headers={"X-Access-Token": token})
     if r.status_code == 401:
