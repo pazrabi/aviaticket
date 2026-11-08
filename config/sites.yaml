@@ -107,7 +107,7 @@ sites:
     source: browser
     parser: ttravel
     enabled: true
-    stage: trial   # 2026-11-07 вернули: хаб перестал отдавать ответ startStreaming (empty на всех телефонах), ждём разбора
+    # 2026-11-09: хаб снова отдаёт startStreaming (проверено на redmi9t), сайт опять в боевом режиме
     phone: "redmi9t,huawei2,galaxya12"
     phone_patience_seconds: 10
     phone_capture_json: ["startStreaming"]
