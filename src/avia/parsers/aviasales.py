@@ -7,7 +7,7 @@ from typing import Any
 
 from ..collector import Snapshot
 from ..models import Leg, Offer, Query
-from . import register_parser
+from . import ParsedOffers, register_parser
 from .travelpayouts import format_duration
 
 
@@ -319,6 +319,7 @@ def parse_aviasales(snapshot: Snapshot, query: Query) -> list[Offer]:
     tickets_by_key: dict[str, tuple[tuple[int, float], Offer]] = {}
     id_to_ticket_key: dict[str, str] = {}
     unkeyed_offers: list[Offer] = []
+    total = made = 0  # билетов в выдаче и сколько из них собрано (кривые пропускаем)
 
     for payload_idx, (url, body) in enumerate(snapshot.json_payloads):
         if "/search/v3.2/results" not in url:
@@ -371,6 +372,7 @@ def parse_aviasales(snapshot: Snapshot, query: Query) -> list[Offer]:
                 if isinstance(val, dict):
                     all_raw_tickets.append(val)
 
+            total += len(all_raw_tickets)
             for t in all_raw_tickets:
                 if not isinstance(t, dict):
                     continue
@@ -551,6 +553,7 @@ def parse_aviasales(snapshot: Snapshot, query: Query) -> list[Offer]:
                             tickets_by_key[ticket_key] = (current_priority, offer)
                     else:
                         unkeyed_offers.append(offer)
+                    made += 1
 
                 except Exception:
                     # Битые билеты пропускаем, не падая
@@ -558,7 +561,7 @@ def parse_aviasales(snapshot: Snapshot, query: Query) -> list[Offer]:
 
     all_offers = [offer for _, offer in tickets_by_key.values()] + unkeyed_offers
     all_offers.sort(key=lambda o: o.price)
-    return all_offers
+    return ParsedOffers(all_offers, total=total, skipped=total - made)
 
 
 # Привязываем results_complete к функции парсера для удобного вызова из pipeline

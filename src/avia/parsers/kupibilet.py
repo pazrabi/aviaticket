@@ -8,7 +8,7 @@ from typing import Any
 
 from ..collector import Snapshot
 from ..models import Leg, Offer, Query
-from . import register_parser
+from . import ParsedOffers, register_parser
 from .travelpayouts import format_duration
 
 log = logging.getLogger("avia.parsers.kupibilet")
@@ -443,6 +443,7 @@ def parse_kupibilet(snapshot: Snapshot, query: Query) -> list[Offer]:
 
     is_roundtrip = query is not None and query.return_date is not None
     offers_by_key: dict[str, Offer] = {}
+    made = 0  # сколько вариантов собрано в билет (кривые пропускаем)
 
     for variant in variants_list:
         if not isinstance(variant, dict):
@@ -569,13 +570,14 @@ def parse_kupibilet(snapshot: Snapshot, query: Query) -> list[Offer]:
                     offers_by_key[dedup_key] = offer
             else:
                 offers_by_key[dedup_key] = offer
+            made += 1
         except Exception:
             # Битые варианты пропускаем, не падая
             continue
 
     offers = list(offers_by_key.values())
     offers.sort(key=lambda o: o.price)
-    return offers
+    return ParsedOffers(offers, total=len(variants_list), skipped=len(variants_list) - made)
 
 
 # Привязываем results_complete к функции парсера для pipeline.py

@@ -75,7 +75,7 @@ from typing import Any
 
 from ..collector import Snapshot
 from ..models import Leg, Offer, Query
-from . import register_parser
+from . import ParsedOffers, register_parser
 from .travelpayouts import format_duration
 
 logger = logging.getLogger(__name__)
@@ -729,12 +729,14 @@ def parse_tutu(snapshot: Snapshot, query: Query) -> list[Offer]:
     is_roundtrip = query is not None and query.return_date is not None
     offers_by_key: dict[tuple[Any, ...], Offer] = {}
     seen_offer_ids: set[str] = set()
+    made = 0  # сколько предложений собрано в билет (кривые пропускаем)
 
     for _offer_id, offer in actual_offers.items():
         if not isinstance(offer, dict):
             continue
         off_id = str(offer.get("id") or _offer_id)
         if off_id in seen_offer_ids:
+            made += 1  # дубль id — не кривой элемент
             continue
         seen_offer_ids.add(off_id)
         try:
@@ -906,13 +908,14 @@ def parse_tutu(snapshot: Snapshot, query: Query) -> list[Offer]:
                     offers_by_key[dedup_key] = offer_obj
             else:
                 offers_by_key[dedup_key] = offer_obj
+            made += 1
         except Exception:
             # Битые предложения пропускать, не падать
             continue
 
     offers = list(offers_by_key.values())
     offers.sort(key=lambda o: o.price)
-    return offers
+    return ParsedOffers(offers, total=len(actual_offers), skipped=len(actual_offers) - made)
 
 
 # Привязываем results_complete к функции парсера для pipeline.py

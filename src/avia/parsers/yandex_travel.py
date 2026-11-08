@@ -64,7 +64,7 @@ from typing import Any
 from ..collector import Snapshot
 from ..models import Leg, Offer, Query
 from ..offers import compute_offer_id
-from . import register_parser
+from . import ParsedOffers, register_parser
 from .travelpayouts import format_duration
 
 logger = logging.getLogger(__name__)
@@ -987,6 +987,7 @@ def parse_yandex_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
 
     is_roundtrip = query.return_date is not None
     offers: list[Offer] = []
+    total = skipped = 0  # тарифов в выдаче и сколько пропущено (кривые)
 
     for data in valid_chunks:
         variants = data.get("variants")
@@ -995,6 +996,8 @@ def parse_yandex_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
         fares = variants.get("fares")
         if not isinstance(fares, list):
             continue
+        total += len(fares)
+        accepted = 0
 
         # Внутри порции дедуплицируем тарифы по ключу route (учитывая оба плеча),
         # сохраняя предложение с наименьшей ценой
@@ -1056,9 +1059,11 @@ def parse_yandex_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
                     or best_price < best_fares_for_chunk[route_key][0]
                 ):
                     best_fares_for_chunk[route_key] = (best_price, best_prop, route_key)
+                accepted += 1
             except Exception:
                 continue
 
+        built_from = len(offers)
         for (price, best_prop, route_key) in best_fares_for_chunk.values():
             try:
                 out_leg = route_key[0]
@@ -1140,10 +1145,12 @@ def parse_yandex_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
                 )
             except Exception:
                 continue
+        # кривые тарифы порции + маршруты, из которых не собрался билет
+        skipped += len(fares) - accepted + len(best_fares_for_chunk) - (len(offers) - built_from)
 
     if offers:
         offers.sort(key=lambda o: o.price)
-        return offers
+        return ParsedOffers(offers, total=total, skipped=skipped)
 
     # Запасной разбор по тексту страницы (snapshot.text),
     # срабатывает ТОЛЬКО когда по JSON не получилось ни одного оффера
@@ -1151,9 +1158,9 @@ def parse_yandex_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
     if text:
         text_offers = _parse_yandex_travel_text(text, query)
         logger.info("yandex: разобрано %d карточек из текста страницы (нет JSON)", len(text_offers))
-        return text_offers
+        return ParsedOffers(text_offers, total=total + len(text_offers), skipped=skipped)
 
-    return []
+    return ParsedOffers(total=total, skipped=skipped)
 
 
 # Привязываем results_complete к функции парсера для pipeline.py

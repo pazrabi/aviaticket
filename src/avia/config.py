@@ -167,6 +167,10 @@ class Settings:
     metrics: Any = None
     price_timeline: bool = True
     fast_stop: bool = True
+    # короткая страница без капчи и без JSON-ответов — неудачный сбор (0 — «0 вариантов», как раньше)
+    short_page_fail: bool = False
+    # сколько отладочных снимков пустой выдачи держать в debug_dir (0 — без предела)
+    debug_snapshots_max: int = 100
     stop_stable_seconds: float = 8.0
     stop_calibrate: bool = True
     preempt: bool = True
@@ -355,6 +359,11 @@ def load_settings(path: Path | None = None) -> Settings:
 
     fast_stop_env = os.getenv("FAST_STOP", "1").strip().lower()
     fast_stop = fast_stop_env not in ("0", "false", "False", "no", "off")
+    short_page_fail = os.getenv("SHORT_PAGE_FAIL", "0").strip().lower() in ("1", "true", "yes", "on")
+    try:
+        debug_snapshots_max = int(os.getenv("DEBUG_SNAPSHOTS_MAX", "100"))
+    except ValueError:
+        debug_snapshots_max = 100
     try:
         stop_stable_seconds = float(os.getenv("STOP_STABLE_SECONDS", "8.0"))
     except ValueError:
@@ -516,6 +525,8 @@ def load_settings(path: Path | None = None) -> Settings:
         soft_allow_max_pairs_per_run=soft_allow_max_pairs,
         price_timeline=price_timeline,
         fast_stop=fast_stop,
+        short_page_fail=short_page_fail,
+        debug_snapshots_max=debug_snapshots_max,
         stop_stable_seconds=stop_stable_seconds,
         stop_calibrate=stop_calibrate,
         preempt=preempt,
