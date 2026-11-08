@@ -2,84 +2,32 @@
 from __future__ import annotations
 
 from datetime import date
-import difflib
 import re
 
 from .models import Query
-
-CITIES = {
-    "москва": "MOW", "санкт-петербург": "LED", "питер": "LED", "спб": "LED",
-    "самара": "KUF", "екатеринбург": "SVX", "казань": "KZN", "сочи": "AER",
-    "новосибирск": "OVB", "уфа": "UFA", "минск": "MSQ", "алматы": "ALA",
-    "астана": "NQZ", "ташкент": "TAS", "самарканд": "SKD", "бишкек": "FRU",
-    "ереван": "EVN", "баку": "GYD", "тбилиси": "TBS", "душанбе": "DYU",
-    "стамбул": "IST", "дубай": "DXB",
-    "санкт петербург": "LED", "ростов": "ROV", "краснодар": "KRR",
-    "нижний новгород": "GOJ", "владивосток": "VVO", "калининград": "KGD",
-    "нур-султан": "NQZ", "алма-ата": "ALA", "шымкент": "CIT", "ош": "OSS",
-    "нукус": "NCU",
-}
-
-CITY_NAMES: dict[str, str] = {
-    "MOW": "Москва", "LED": "Санкт-Петербург", "KUF": "Самара", "SVX": "Екатеринбург",
-    "KZN": "Казань", "AER": "Сочи", "OVB": "Новосибирск", "UFA": "Уфа", "MSQ": "Минск",
-    "ALA": "Алматы", "NQZ": "Астана", "TAS": "Ташкент", "SKD": "Самарканд", "FRU": "Бишкек",
-    "EVN": "Ереван", "GYD": "Баку", "TBS": "Тбилиси", "DYU": "Душанбе", "IST": "Стамбул",
-    "DXB": "Дубай", "ROV": "Ростов", "KRR": "Краснодар", "GOJ": "Нижний Новгород",
-    "VVO": "Владивосток", "KGD": "Калининград", "CIT": "Шымкент", "OSS": "Ош", "NCU": "Нукус",
-}
-
-
-class ParseError(ValueError):
-    pass
-
-
-class UnknownCityError(ParseError):
-    def __init__(self, message: str, suggestions: list[str] | None = None) -> None:
-        super().__init__(message)
-        self.suggestions: list[str] = list(suggestions) if suggestions is not None else []
+from .places import (
+    CITIES,
+    CITY_NAMES,
+    ParseError,
+    Place,
+    UnknownCityError,
+    airports_of,
+    place_name,
+    resolve,
+)
+from .places import suggest_cities as places_suggest_cities
 
 
 def city_name(code: str) -> str:
-    code_upper = code.strip().upper()
-    return CITY_NAMES.get(code_upper, code)
+    return place_name(code)
 
 
 def suggest_cities(word: str, limit: int = 3) -> list[str]:
-    w = re.sub(r"\s+", " ", word.strip()).lower().replace("ё", "е")
-    if not w or limit <= 0:
-        return []
-    matches = difflib.get_close_matches(w, CITIES.keys(), n=len(CITIES), cutoff=0.6)
-    res: list[str] = []
-    seen: set[str] = set()
-    for m in matches:
-        code = CITIES[m]
-        if code not in seen:
-            seen.add(code)
-            res.append(city_name(code))
-            if len(res) == limit:
-                break
-    return res
+    return places_suggest_cities(word, limit=limit)
 
 
 def to_iata(word: str) -> str:
-    raw = word.strip()
-    w = re.sub(r"\s+", " ", raw).lower().replace("ё", "е")
-    if w in CITIES:
-        return CITIES[w]
-    w_hyphen = w.replace(" ", "-")
-    if w_hyphen in CITIES:
-        return CITIES[w_hyphen]
-    w_space = w.replace("-", " ")
-    if w_space in CITIES:
-        return CITIES[w_space]
-    if re.fullmatch(r"[a-zA-Z]{3}", w):
-        return w.upper()
-    suggestions = suggest_cities(w)
-    msg = f"не знаю город «{raw}». Укажите код IATA, например ALA"
-    if suggestions:
-        msg += f". Возможно, вы имели в виду: {', '.join(suggestions)}?"
-    raise UnknownCityError(msg, suggestions=suggestions)
+    return resolve(word).code
 
 
 def _parse_date_parts(s: str) -> tuple[int, int, int | None]:
