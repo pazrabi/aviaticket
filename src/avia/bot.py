@@ -476,14 +476,37 @@ class Bot:
             log.exception("history chart failed")
             await self.send(chat_id, "Не удалось построить график")
 
+    def _try_charge_search(self, chat_id: int) -> tuple[bool, float | None]:
+        """Списывает суточную попытку поиска: (можно искать, момент списания).
+
+        Момент списания нужен возврату (_refund_search): возвращаем за тот день, в который списали.
+        Администратор — (True, None): ему не списываем и не возвращаем. Лимит исчерпан — (False, None).
+        """
+        if chat_id in self.s.tg_allowed_ids:
+            return True, None
+        now = time.time()
+        if not self.users.try_use_search(chat_id, self.s.daily_search_limit, now=now):
+            return False, None
+        return True, now
+
+    def _refund_search(self, chat_id: int, charged_at: float) -> None:
+        """Возвращает попытку, списанную в charged_at: поиск упал или ни один сайт не ответил.
+
+        Ошибка базы здесь не должна ломать ответ человеку: она только в лог.
+        """
+        try:
+            self.users.refund_search(chat_id, charged_at)
+        except Exception:
+            log.exception("не удалось вернуть попытку поиска, chat_id=%s", chat_id)
+            return
+        log.info("попытка поиска возвращена, chat_id=%s", chat_id)
+
     async def _run_search(self, chat_id: int, req: SearchRequest):
         if chat_id in self.busy:
             await self.send(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите.")
             return
-        if (
-            chat_id not in self.s.tg_allowed_ids
-            and not self.users.try_use_search(chat_id, self.s.daily_search_limit)
-        ):
+        within_limit, charged_at = self._try_charge_search(chat_id)
+        if not within_limit:
             await self.send(
                 chat_id,
                 f"😴 На сегодня лимит поисков исчерпан ({self.s.daily_search_limit}). Завтра можно снова, "
@@ -495,6 +518,8 @@ class Bot:
         baggage_mode = req.baggage_mode
         wait_msg_id = None
         updater = None
+        # Попытка остаётся списанной, только если хоть один сайт ответил и поиск дошёл до конца без исключения
+        keep_charge = False
         try:
             enabled_sites = [s for s in self.s.sites if s.enabled]
             header = (
@@ -586,6 +611,7 @@ class Bot:
                     if not any(s.name == name for s in enabled_sites):
                         results.append(res)
 
+            keep_charge = any(r.ok for r in results)
             self._record_metrics("user", results)
             if self.metrics is not None and results:
                 self.metrics.record_search(  # type: ignore[attr-defined]
@@ -668,9 +694,12 @@ class Bot:
                 dropped_criteria=dropped_criteria,
             )
         except Exception as e:
+            keep_charge = False
             log.exception("search failed")
             await self.send(chat_id, f"⚠️ {escape(friendly_error(e))}")
         finally:
+            if charged_at is not None and not keep_charge:
+                self._refund_search(chat_id, charged_at)
             self.busy.discard(chat_id)
             if wait_msg_id is not None:
                 try:
@@ -748,10 +777,8 @@ class Bot:
             return
 
         # 3. Проверяем и списываем дневной лимит поиска
-        if (
-            chat_id not in self.s.tg_allowed_ids
-            and not self.users.try_use_search(chat_id, self.s.daily_search_limit)
-        ):
+        within_limit, charged_at = self._try_charge_search(chat_id)
+        if not within_limit:
             await self.send(
                 chat_id,
                 f"😴 На сегодня лимит поисков исчерпан ({self.s.daily_search_limit}). Завтра можно снова, "
@@ -762,6 +789,8 @@ class Bot:
         self.busy.add(chat_id)
         wait_msg_id = None
         updater = None
+        # Попытка остаётся списанной, только если хоть один сайт ответил и поиск дошёл до конца без исключения
+        keep_charge = False
         try:
             enabled_sites = [s for s in self.s.sites if s.enabled]
             header = (
@@ -855,6 +884,7 @@ class Bot:
                     if not any(s.name == name for s in enabled_sites):
                         results.append(res)
 
+            keep_charge = any(r.ok for r in results)
             self._record_metrics("user", results)
             if self.metrics is not None and results:
                 self.metrics.record_search(  # type: ignore[attr-defined]
@@ -923,9 +953,12 @@ class Bot:
                 dropped_criteria=dropped_criteria,
             )
         except Exception as e:
+            keep_charge = False
             log.exception("deep search failed")
             await self.send(chat_id, f"⚠️ {escape(friendly_error(e))}")
         finally:
+            if charged_at is not None and not keep_charge:
+                self._refund_search(chat_id, charged_at)
             self.busy.discard(chat_id)
             if wait_msg_id is not None:
                 try:
