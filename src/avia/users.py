@@ -109,6 +109,14 @@ class UserStore:
             )
         return True
 
+    def charge_search(self, tg_id: int, daily_limit: int, now: float | None = None) -> float | None:
+        """Списывает попытку, как try_use_search; возвращает момент списания для refund_search.
+
+        None — дневной лимит исчерпан, ничего не списано.
+        """
+        ts = time.time() if now is None else now
+        return ts if self.try_use_search(tg_id, daily_limit, now=ts) else None
+
     def refund_search(self, tg_id: int, charged_at: float) -> None:
         """Возвращает попытку, которую try_use_search списал в момент charged_at.
 
