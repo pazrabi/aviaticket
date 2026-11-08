@@ -31,6 +31,19 @@ SITES = ("site1", "site2")
 LIMIT_TEXT = "лимит поисков исчерпан"
 BUSY_TEXT = "Предыдущий поиск ещё идёт"
 QUERY = Query(origin="MOW", destination="ALA", depart=date(2026, 12, 10))
+DAY_D, DAY_D1 = date(2026, 11, 8), date(2026, 11, 9)
+
+
+def _at(day: date, hh: int, mm: int) -> float:
+    return datetime(day.year, day.month, day.day, hh, mm).timestamp()
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch) -> list[float]:
+    """time.time на полдень дня D: счёт за день не зависит от того, когда идёт прогон."""
+    now = [_at(DAY_D, 12, 0)]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    return now
 
 
 class FlakyBot(RecordingBot):
@@ -79,7 +92,7 @@ def counters(store: UserStore, uid: int) -> tuple[str | None, int, int]:
 
 def today_count(bot: FlakyBot, uid: int = PERSON_ID) -> int:
     day, count, _ = counters(bot.users, uid)
-    return count if day == datetime.now().strftime("%Y-%m-%d") else 0
+    return count if day == datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d") else 0
 
 
 def sent_texts(bot: FlakyBot) -> list[str]:
@@ -130,14 +143,10 @@ def deep(bot: FlakyBot, uid: int = PERSON_ID):
 # --- UserStore.refund_search ---
 
 
-def _at(day: date, hh: int, mm: int) -> float:
-    return datetime(day.year, day.month, day.day, hh, mm).timestamp()
-
-
 def test_refund_returns_attempt_of_the_charge_day(tmp_path):
     store = UserStore(tmp_path / "u.sqlite")
     store.register(PERSON_ID)
-    charged_at = _at(date(2026, 11, 8), 12, 0)
+    charged_at = _at(DAY_D, 12, 0)
     for _ in range(3):
         store.try_use_search(PERSON_ID, DAILY_LIMIT, now=charged_at)
 
@@ -158,7 +167,7 @@ def test_refund_without_user_row_does_nothing(tmp_path):
 def test_refund_never_goes_below_zero(tmp_path):
     store = UserStore(tmp_path / "u.sqlite")
     store.register(PERSON_ID)
-    charged_at = _at(date(2026, 11, 8), 12, 0)
+    charged_at = _at(DAY_D, 12, 0)
     with sqlite3.connect(store.path) as db:
         db.execute("UPDATE users SET search_day = '2026-11-08', search_count = 0, total_searches = 0")
 
@@ -170,10 +179,9 @@ def test_refund_never_goes_below_zero(tmp_path):
 def test_refund_for_previous_day_keeps_new_day_count(tmp_path):
     store = UserStore(tmp_path / "u.sqlite")
     store.register(PERSON_ID)
-    day_d, day_d1 = date(2026, 11, 8), date(2026, 11, 9)
-    charged_at = _at(day_d, 23, 59)
+    charged_at = _at(DAY_D, 23, 59)
     store.try_use_search(PERSON_ID, DAILY_LIMIT, now=charged_at)
-    store.try_use_search(PERSON_ID, DAILY_LIMIT, now=_at(day_d1, 0, 1))
+    store.try_use_search(PERSON_ID, DAILY_LIMIT, now=_at(DAY_D1, 0, 1))
 
     store.refund_search(PERSON_ID, charged_at)
 
@@ -334,25 +342,23 @@ async def test_refund_db_error_keeps_normal_reply(tmp_path, monkeypatch, caplog,
 
 
 @pytest.mark.asyncio
-async def test_refund_across_midnight_keeps_new_day_count(tmp_path, monkeypatch):
+@pytest.mark.parametrize("run", [live, deep], ids=["live", "deep"])
+async def test_refund_across_midnight_keeps_new_day_count(tmp_path, monkeypatch, clock, run):
     """Списали в 23:59 дня D, возврат в 00:01 дня D+1, когда у человека уже есть списание за D+1."""
     bot = make_bot(tmp_path)
-    day_d, day_d1 = date(2026, 11, 8), date(2026, 11, 9)
-    with sqlite3.connect(bot.users.path) as db:
-        db.execute("UPDATE users SET search_day = '2026-11-08', search_count = 3, total_searches = 3 WHERE tg_id = ?",
-                   (PERSON_ID,))
-    clock = [_at(day_d, 23, 59)]
-    monkeypatch.setattr(time, "time", lambda: clock[0])
+    assert counters(bot.users, PERSON_ID) == ("2026-11-08", 3, 3)
+    clock[0] = _at(DAY_D, 23, 59)
 
     def midnight_passes() -> None:
         assert counters(bot.users, PERSON_ID) == ("2026-11-08", 4, 4)  # списали за D
-        clock[0] = _at(day_d1, 0, 1)
+        clock[0] = _at(DAY_D1, 0, 1)
         assert bot.users.try_use_search(PERSON_ID, DAILY_LIMIT)  # списание за D+1
 
     monkeypatch.setattr("avia.bot.search", FakeSearch(error=RuntimeError("хаб не отвечает"), before=midnight_passes))
 
-    await live(bot)
+    await run(bot)
 
+    # счёт дня D+1 не тронут; всего поисков — без возвращённого
     assert counters(bot.users, PERSON_ID) == ("2026-11-09", 1, 4)
 
 
@@ -414,3 +420,46 @@ async def test_one_charge_one_refund_when_reply_send_fails(tmp_path, monkeypatch
     assert today_count(bot) == SPENT_BEFORE
     assert counters(bot.users, PERSON_ID)[2] == SPENT_BEFORE
     assert any(t.startswith("⚠️ ") for t in sent_texts(bot))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run", [live, deep], ids=["live", "deep"])
+async def test_exception_after_site_answered_refunds_once(tmp_path, monkeypatch, run):
+    """Сайты ответили ценами, но выдача не ушла (исключение при отправке): человек получил «⚠️», не цены."""
+    bot = make_bot(tmp_path, fail_send_on=2)  # 1 — сообщение ожидания, 2 — выдача
+    monkeypatch.setattr("avia.bot.search", FakeSearch(with_prices))
+
+    await run(bot)
+
+    assert today_count(bot) == SPENT_BEFORE
+    assert counters(bot.users, PERSON_ID)[2] == SPENT_BEFORE
+    assert any(t.startswith("⚠️ ") for t in sent_texts(bot))
+
+
+# --- отмена ---
+
+
+@pytest.mark.asyncio
+async def test_cancelled_search_refunds_attempt(tmp_path, monkeypatch):
+    """Поиск отменили (остановка бота), пока ни один сайт не ответил: попытка возвращается."""
+    bot = make_bot(tmp_path)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def hanging_search(q, s, **kwargs):
+        started.set()
+        await release.wait()
+        return with_prices()
+
+    monkeypatch.setattr("avia.bot.search", hanging_search)
+    task = asyncio.create_task(live(bot))
+    await started.wait()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    release.set()
+    await asyncio.sleep(0)
+
+    assert today_count(bot) == SPENT_BEFORE
+    assert counters(bot.users, PERSON_ID)[2] == SPENT_BEFORE
+    assert PERSON_ID not in bot.busy
