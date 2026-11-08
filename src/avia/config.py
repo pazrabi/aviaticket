@@ -191,6 +191,10 @@ class Settings:
     # П32: предварительные цены из кэша Aviasales в сообщении ожидания (TP_PREVIEW=1 и TP_TOKEN; по умолчанию выключено)
     tp_preview: bool = False
     tp_preview_timeout: float = 3.0  # ответ кэша позже — строки нет
+    # КТ4, работа 2: предфильтр подписок по кэшу Aviasales (SUB_PREFILTER=1 и TP_TOKEN; по умолчанию выключено)
+    sub_prefilter: bool = False
+    sub_prefilter_pct: float = 5.0  # кэш отличается от последней собранной цены на столько % — собираем
+    sub_prefilter_full_hours: float = 0.0  # страховочный сбор не реже; 0 — 2 интервала опроса подписки
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -432,6 +436,20 @@ def load_settings(path: Path | None = None) -> Settings:
     if not 0 < tp_preview_timeout < float("inf"):  # ноль, минус, nan и inf — по умолчанию
         tp_preview_timeout = 3.0
 
+    sub_prefilter = os.getenv("SUB_PREFILTER", "0").strip() == "1"
+    try:
+        sub_prefilter_pct = float(os.getenv("SUB_PREFILTER_PCT", "5"))
+    except ValueError:
+        sub_prefilter_pct = 5.0
+    if not 0 < sub_prefilter_pct < float("inf"):  # ноль, минус, nan и inf — по умолчанию
+        sub_prefilter_pct = 5.0
+    try:
+        sub_prefilter_full_hours = float(os.getenv("SUB_PREFILTER_FULL_HOURS", "0"))
+    except ValueError:
+        sub_prefilter_full_hours = 0.0
+    if not 0 <= sub_prefilter_full_hours < float("inf"):  # минус, nan и inf — 0: 2 интервала опроса подписки
+        sub_prefilter_full_hours = 0.0
+
     try:
         search_budget_per_hour = max(0, int(os.getenv("SEARCH_BUDGET_PER_HOUR", "0")))
     except ValueError:
@@ -545,6 +563,9 @@ def load_settings(path: Path | None = None) -> Settings:
         card_early_sites=card_early_sites,
         tp_preview=tp_preview,
         tp_preview_timeout=tp_preview_timeout,
+        sub_prefilter=sub_prefilter,
+        sub_prefilter_pct=sub_prefilter_pct,
+        sub_prefilter_full_hours=sub_prefilter_full_hours,
     )
 
 

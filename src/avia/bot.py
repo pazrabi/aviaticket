@@ -67,6 +67,9 @@ from .store import ResultStore
 from .subscriptions import SubscriptionStore
 from .tg_text import html_to_plain, split_html
 from .tp_preview import missing_token, preview_enabled, preview_metrics, run_preview, stop_preview
+from .sub_prefilter import SubPrefilter
+from .sub_prefilter import missing_token as sub_prefilter_missing_token
+from .sub_prefilter import prefilter_enabled as sub_prefilter_enabled
 from .users import UserStore
 
 log = logging.getLogger("avia.bot")
@@ -336,6 +339,12 @@ class Bot:
         self._trial_notified: dict[str, float] = {}
         if missing_token(settings):
             log.warning("TP_PREVIEW=1, но TP_TOKEN пуст: предварительных цен из кэша Aviasales не будет")
+        # КТ4, работа 2: предфильтр подписок по кэшу Aviasales; без флага или токена — None, сбор как сейчас
+        self.sub_prefilter: SubPrefilter | None = None
+        if sub_prefilter_enabled(settings) and self.subs is not None:
+            self.sub_prefilter = SubPrefilter(self.subs, settings)
+        if sub_prefilter_missing_token(settings):
+            log.warning("SUB_PREFILTER=1, но TP_TOKEN пуст: подписки собираются на телефонах каждый раз, как без предфильтра")
         try:
             from .samples import install_sample_hook
             install_sample_hook()
@@ -1918,7 +1927,19 @@ class Bot:
             "site_devices_summary": site_devices_summary,
             "parser_statuses": parser_statuses,
             "settings": self.s,
+            **self._sub_prefilter_ctx(since_ts),
         }
+
+    def _sub_prefilter_ctx(self, since_ts: float) -> dict[str, Any]:
+        """Строка предфильтра подписок для «Парсинга»; без предфильтра — ничего, раздел как был."""
+        pf = getattr(self, "sub_prefilter", None)
+        if pf is None:
+            return {}
+        try:
+            return {"sub_prefilter_line": pf.admin_line(since_ts)}
+        except Exception:
+            log.exception("ошибка строки предфильтра подписок")
+            return {}
 
     def _collect_users_data(self) -> dict[str, Any]:
         now = time.time()
@@ -2517,6 +2538,7 @@ class Bot:
                 self._scheduler_notify,
                 history=self.history,
                 trial_sites=trial_sites,
+                prefilter=getattr(self, "sub_prefilter", None),
             )
             self._scheduler_task = asyncio.create_task(scheduler.run_forever())
         if self.s.bg_collect:
