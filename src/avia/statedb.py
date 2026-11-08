@@ -6,6 +6,8 @@ DB_SINGLE=1 — все сторы открывают avia.sqlite (WAL, busy_time
 Старые файлы открываются только на чтение и остаются как были; повторный старт ничего не переносит.
 Номер версии схемы — PRAGMA user_version, миграции применяются по номеру (MIGRATIONS).
 Откат — export_legacy (python -m avia.cli db-rollback): всё из avia.sqlite обратно в четыре файла.
+Если старый файл изменился после переноса (DB_SINGLE переключили 1 → 0 → 1 без отката), avia.sqlite
+не открывается: MigrationError с тем, что делать, а не тихий старт на устаревших данных.
 """
 from __future__ import annotations
 
@@ -94,6 +96,8 @@ def _migrate(target: Path) -> None:
     conn = connect(target.resolve().as_uri(), uri=True, isolation_level=None)
     try:
         version = _user_version(conn)
+        if version >= 1:
+            _check_legacy_unchanged(conn, target)
         if version == SCHEMA_VERSION:
             return
         if version > SCHEMA_VERSION:
@@ -132,6 +136,44 @@ def _apply(conn: sqlite3.Connection, attached: list[tuple[str, str]]) -> None:
         raise
     if current < SCHEMA_VERSION:
         log.info("avia.sqlite: схема %s → %s за %.1f с", current, SCHEMA_VERSION, time.perf_counter() - t0)
+
+
+def _legacy_fingerprint(state_dir: Path) -> dict[str, list[int]]:
+    """{имя: [размер, счётчик изменений из заголовка SQLite]} старых файлов, что есть на диске.
+
+    Счётчик (байты 24–27) растёт с каждой записью в режиме journal_mode=delete и не зависит от mtime:
+    копия каталога cp без -p не выглядит изменённой.
+    """
+    out: dict[str, list[int]] = {}
+    for name in LEGACY_DBS:
+        path = state_dir / f"{name}.sqlite"
+        try:
+            with open(path, "rb") as f:
+                header = f.read(28)
+            size = path.stat().st_size
+        except FileNotFoundError:
+            continue
+        out[name] = [size, int.from_bytes(header[24:28], "big") if len(header) == 28 else -1]
+    return out
+
+
+def _check_legacy_unchanged(conn: sqlite3.Connection, target: Path) -> None:
+    """Старый файл изменился после переноса — при DB_SINGLE=0 писали мимо avia.sqlite: не стартуем молча.
+
+    Удалённые старые файлы — не ошибка: владелец может убрать их, когда DB_SINGLE=1 прижился.
+    """
+    row = conn.execute("SELECT value FROM db_meta WHERE key = 'legacy_files'").fetchone()
+    if row is None:
+        return
+    before = json.loads(row[0])
+    changed = sorted(n for n, fp in _legacy_fingerprint(target.parent).items() if before.get(n) != fp)
+    if changed:
+        files = ", ".join(f"{n}.sqlite" for n in changed)
+        raise MigrationError(
+            f"{files} изменились после переноса в {target.name}: бот, похоже, работал с DB_SINGLE=0 без "
+            "python -m avia.cli db-rollback, и записи того времени есть только в старых файлах. "
+            f"Либо вернуть DB_SINGLE=0, либо переименовать {target.name} (и -wal, -shm) — следующий старт "
+            "с DB_SINGLE=1 перенесёт файлы заново, а записи, сделанные при DB_SINGLE=1, останутся в отложенной копии.")
 
 
 def _attach_legacy(conn: sqlite3.Connection, state_dir: Path) -> list[tuple[str, str]]:
@@ -207,15 +249,18 @@ def _m1_import_legacy(conn: sqlite3.Connection, attached: list[tuple[str, str]])
     files = {group: _import_group(conn, group, alias) for group, alias in attached}
     conn.execute("INSERT INTO db_meta (key, value) VALUES ('legacy_import', ?)",
                  (json.dumps({"at": time.time(), "files": files}, ensure_ascii=False, sort_keys=True),))
+    state_dir = Path(conn.execute("PRAGMA database_list").fetchone()[2]).parent
+    conn.execute("INSERT INTO db_meta (key, value) VALUES ('legacy_files', ?)",
+                 (json.dumps(_legacy_fingerprint(state_dir), sort_keys=True),))
     log.info("avia.sqlite: перенос из %s", ", ".join(f"{g}.sqlite ({sum(c.values())} строк)"
                                                     for g, c in files.items()) or "— (старых файлов нет)")
 
 
 def _m2_chat_state(conn: sqlite3.Connection, attached: list[tuple[str, str]]) -> None:
-    """Версия 2: сессии диалога и последние выдачи (chat_state.py), одна строка на чат."""
+    """Версия 2: сессии диалога (JSON) и последние выдачи (JSON в zlib) — chat_state.py, одна строка на чат."""
     conn.execute("CREATE TABLE chat_sessions (chat_key TEXT PRIMARY KEY, data TEXT NOT NULL, "
                  "updated_at REAL NOT NULL)")
-    conn.execute("CREATE TABLE chat_snapshots (chat_key TEXT PRIMARY KEY, data TEXT NOT NULL, "
+    conn.execute("CREATE TABLE chat_snapshots (chat_key TEXT PRIMARY KEY, data BLOB NOT NULL, "
                  "created_at REAL NOT NULL, updated_at REAL NOT NULL)")
 
 
@@ -244,6 +289,10 @@ def _owner_tables_by_group(src: Path) -> dict[str, list[str]]:
     with closing(connect(src)) as conn:
         recorded = dict(conn.execute("SELECT name, grp FROM db_legacy_tables").fetchall())
         tables = _main_tables(conn) - KT4_TABLES
+        views = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'view'")]
+    if views:
+        raise MigrationError(f"в {SINGLE_DB_NAME} представления {', '.join(views)}: выгрузка их не переносит, "
+                             "остановлена, файлы не тронуты")
     known = _schema_groups()
     groups: dict[str, list[str]] = {g: [] for g in LEGACY_DBS}
     unknown = []
@@ -286,12 +335,26 @@ def _export_group(src: Path, tmp: Path, tables: list[str]) -> dict[str, int]:
     return counts
 
 
+_SIDECARS = ("", "-journal", "-wal", "-shm")
+
+
 def _set_aside(path: Path, tag: str) -> None:
     """path и его -journal, -wal, -shm — в path.<tag>…: не удаляем, откладываем."""
-    for suffix in ("", "-journal", "-wal", "-shm"):
+    for suffix in _SIDECARS:
         p = path.with_name(path.name + suffix)
         if p.exists():
             os.replace(p, path.with_name(f"{path.name}.{tag}{suffix}"))
+
+
+def _free_stamp(state_dir: Path) -> str:
+    """Метка времени, под которой ещё нет отложенных файлов: два отката в одну секунду не затирают друг друга."""
+    base = time.strftime("%Y%m%d-%H%M%S")
+    names = [f"{g}.sqlite.pre-rollback-" for g in LEGACY_DBS] + [f"{SINGLE_DB_NAME}.rolledback-"]
+    for n in range(1000):
+        stamp = base if n == 0 else f"{base}-{n}"
+        if not any((state_dir / f"{name}{stamp}{sfx}").exists() for name in names for sfx in _SIDECARS):
+            return stamp
+    raise MigrationError("нет свободного имени для отложенных файлов")
 
 
 def export_legacy(storage_dir: Path | str) -> dict[str, dict[str, int]]:
@@ -305,7 +368,7 @@ def export_legacy(storage_dir: Path | str) -> dict[str, dict[str, int]]:
     if not src.is_file():
         raise MigrationError(f"нет {src}: выгружать нечего")
     groups = _owner_tables_by_group(src)
-    stamp = time.strftime("%Y%m%d-%H%M%S")
+    stamp = _free_stamp(state_dir)
     tmps: dict[str, Path] = {}
     report: dict[str, dict[str, int]] = {}
     try:

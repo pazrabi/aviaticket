@@ -11,6 +11,7 @@ import sqlite3
 import statistics
 import threading
 import time
+import zlib
 
 import pytest
 
@@ -56,18 +57,19 @@ def db(tmp_path, monkeypatch):
 
 
 def test_chat_state_write_cost(db):
-    cs = chat_state.ChatStateStore(db)
+    cs = chat_state.ChatStateStore(db, snapshot_ttl=1800.0)
     store = ResultStore()
     snap = realistic_snapshot(store, 1)
     session = Session(step=Step.DONE, origin="MOW", destination="AER", depart=date.today())
     size = len(chat_state.encode_snapshot(snap))
+    packed = len(zlib.compress(chat_state.encode_snapshot(snap).encode(), chat_state.SNAPSHOT_ZLIB_LEVEL))
     costs = []
     for i in range(200):
         snap.shown = i  # каждое сохранение — новая версия: пишется, а не пропускается
         t0 = time.perf_counter()
         cs.save_chat(1, session, snap)
         costs.append(time.perf_counter() - t0)
-    print(f"\nKT4DB save_chat: snapshot={size} B {ms(costs)}")
+    print(f"\nKT4DB save_chat: snapshot json={size} B zlib={packed} B {ms(costs)}")
     assert statistics.median(costs) < 0.05
 
 
@@ -96,7 +98,7 @@ def test_loop_writes_wait_behind_daily_maintenance(db, span_days):
     _fill_history(db, HISTORY_ROWS, span_days)
     history = PriceHistory(db)
     users = UserStore(db)
-    cs = chat_state.ChatStateStore(db)
+    cs = chat_state.ChatStateStore(db, snapshot_ttl=1800.0)
     snap = realistic_snapshot(ResultStore(), 2)
     session = Session(step=Step.DONE)
     done = threading.Event()

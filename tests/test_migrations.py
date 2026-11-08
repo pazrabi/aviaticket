@@ -212,3 +212,25 @@ def test_db_path_helper_follows_flag(tmp_path, monkeypatch):
         assert statedb.db_path(tmp_path, name) == tmp_path / "avia.sqlite"
     with pytest.raises(ValueError):
         statedb.db_path(tmp_path, "phones")
+
+
+def test_flag_toggled_without_rollback_refuses_start(state, monkeypatch):
+    """1 → 0 без db-rollback → 1: записи при 0 — только в старых файлах; молча на старой avia.sqlite не стартуем."""
+    statedb.ensure_single_db(state)
+    monkeypatch.setenv("DB_SINGLE", "0")
+    UserStore(statedb.db_path(state, "users")).register(4242, username="при нуле")
+
+    monkeypatch.setenv("DB_SINGLE", "1")
+    statedb.forget_ready()
+    with pytest.raises(statedb.MigrationError, match="users.sqlite изменились после переноса"):
+        statedb.db_path(state, "users")
+
+
+def test_removed_old_files_are_fine(state):
+    """Владелец убрал старые файлы, когда DB_SINGLE=1 прижился: бот стартует."""
+    statedb.ensure_single_db(state)
+    for name in LEGACY:
+        (state / f"{name}.sqlite").rename(state / f"{name}.sqlite.removed")
+    statedb.forget_ready()
+    path = statedb.ensure_single_db(state)
+    assert UserStore(path).get(PEOPLE[0]) is not None

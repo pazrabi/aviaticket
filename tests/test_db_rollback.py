@@ -143,3 +143,21 @@ def test_cli_db_rollback_without_single_db(tmp_path, monkeypatch):
     monkeypatch.setattr(sys, "argv", ["avia.cli", "db-rollback"])
     with pytest.raises(SystemExit, match="avia.sqlite"):
         avia.cli.main()
+
+
+def test_two_rollbacks_in_one_second_keep_both_copies(migrated, monkeypatch):
+    monkeypatch.setattr(statedb.time, "strftime", lambda fmt, *a: "20261108-210000")
+    statedb.export_legacy(migrated)
+    statedb.ensure_single_db(migrated)  # снова DB_SINGLE=1: перенос из выгруженных файлов
+    statedb.export_legacy(migrated)
+    names = {p.name for p in migrated.iterdir()}
+    assert {"avia.sqlite.rolledback-20261108-210000", "avia.sqlite.rolledback-20261108-210000-1"} <= names
+    assert {"users.sqlite.pre-rollback-20261108-210000", "users.sqlite.pre-rollback-20261108-210000-1"} <= names
+
+
+def test_view_stops_export(migrated):
+    with sqlite3.connect(migrated / "avia.sqlite") as db:
+        db.execute("CREATE VIEW active_people AS SELECT tg_id FROM users")
+    with pytest.raises(statedb.MigrationError, match="active_people"):
+        statedb.export_legacy(migrated)
+    assert (migrated / "avia.sqlite").exists()

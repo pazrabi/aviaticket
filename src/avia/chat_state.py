@@ -2,8 +2,8 @@
 
 Что сохраняется. Сессия (dialog.Session) и выдача (store.SearchSnapshot) — простые dataclass: строки,
 числа, даты, frozenset (части суток в SearchCriteria), Enum (Step), вложенные Query, SiteResult, Offer,
-Leg, OfferAlt. Замыканий, соединений и задач в них нет. Пишутся JSON с метками типов. Два места, которых
-нет в полях dataclass:
+Leg, OfferAlt. Замыканий, соединений и задач в них нет. Пишутся JSON с метками типов (выдача — сжатой zlib:
+в симуляторе до 1,1 МБ JSON, в базе 44 КБ). Два места, которых нет в полях dataclass:
 - атрибуты сверх полей: fresh_cache ставит Offer.cached_age через setattr — пишутся вместе с полями;
 - общие объекты: один билет лежит в results, flat и pool сразу — пишется один раз, ссылки по номеру;
   после загрузки это снова один объект, как до рестарта.
@@ -14,7 +14,7 @@ TTL. Выдача — TTL ResultStore владельца (1800 с, store.py), с
 владельца TTL нет: они живут в памяти до рестарта. SESSION_TTL_SECONDS — сутки от последнего изменения:
 недописанный вечером диалог продолжается утром; старше суток даты в нём чаще всего уже прошли, и человек
 начинает с меню, как сейчас после любого рестарта. Строк по одной на чат: база растёт с числом людей, а не
-поисков; старше TTL строки удаляются при старте бота.
+поисков; старше TTL строки удаляются при старте бота и раз в 10 минут при записи.
 
 Запись — синхронная короткая транзакция на цикле событий, только если сессия или выдача изменились
 (сравнение с последним записанным JSON). Замеры — tests/test_db_single_writes.py, docs/audit/kt4_db.md.
@@ -31,6 +31,7 @@ import logging
 from pathlib import Path
 import time
 from typing import Any, Callable
+import zlib
 
 from . import statedb
 from .criteria import SearchCriteria
@@ -41,6 +42,8 @@ from .store import ResultStore, SearchSnapshot
 log = logging.getLogger("avia.chat_state")
 
 SESSION_TTL_SECONDS = 86_400.0
+PRUNE_EVERY_SECONDS = 600.0
+SNAPSHOT_ZLIB_LEVEL = 6
 FORMAT = 1
 _CLASSES = {c.__name__: c for c in (Query, SiteResult, Offer, Leg, OfferAlt, SearchCriteria, Session)}
 _ENUMS = {"Step": Step}
@@ -152,11 +155,19 @@ def _digest(text: str | None) -> bytes | None:
 
 
 class ChatStateStore:
-    """Строки chat_sessions и chat_snapshots: по одной на чат, JSON, время для TTL."""
+    """Строки chat_sessions и chat_snapshots: по одной на чат; сессия — JSON, выдача — JSON в zlib.
 
-    def __init__(self, path: Path | str, clock: Callable[[], float] | None = None) -> None:
+    Выдача живого поиска в симуляторе — до 1,1 МБ JSON (1495 билетов), в zlib — 44 КБ.
+    Строки старше TTL удаляются при старте и раз в PRUNE_EVERY_SECONDS при записи.
+    """
+
+    def __init__(self, path: Path | str, snapshot_ttl: float, session_ttl: float = SESSION_TTL_SECONDS,
+                 clock: Callable[[], float] | None = None) -> None:
         self.path = Path(path)
+        self.snapshot_ttl = snapshot_ttl
+        self.session_ttl = session_ttl
         self._clock = clock
+        self._last_prune = 0.0
         self._session_saved: dict[str, bytes | None] = {}  # отпечаток последней записи сессии по чату
         self._snapshot_saved: dict[str, bytes | None] = {}
 
@@ -167,17 +178,26 @@ class ChatStateStore:
         with closing(statedb.connect(self.path)) as conn:
             return conn.execute(sql).fetchall()
 
-    def _delete(self, table: str, column: str, before: float) -> None:
+    def prune(self, now: float | None = None) -> None:
+        """Удаляет сессии старше session_ttl и выдачи старше snapshot_ttl (без RETURNING: SQLite < 3.35)."""
+        now = self._now() if now is None else now
+        rules = (("chat_sessions", "updated_at", self.session_ttl, self._session_saved),
+                 ("chat_snapshots", "created_at", self.snapshot_ttl, self._snapshot_saved))
         with closing(statedb.connect(self.path)) as conn, conn:
-            conn.execute(f"DELETE FROM {table} WHERE {column} < ?", (before,))
+            for table, column, ttl, saved in rules:
+                cutoff = now - ttl
+                for (key,) in conn.execute(f"SELECT chat_key FROM {table} WHERE {column} < ?", (cutoff,)).fetchall():
+                    saved.pop(key, None)
+                conn.execute(f"DELETE FROM {table} WHERE {column} < ?", (cutoff,))
+        self._last_prune = now
 
-    def load_sessions(self, ttl: float = SESSION_TTL_SECONDS, now: float | None = None) -> dict[int | str, Session]:
-        """Сессии моложе ttl; SEARCHING → DONE; старше ttl и битые строки — удаляются."""
+    def load_sessions(self, now: float | None = None) -> dict[int | str, Session]:
+        """Сессии моложе session_ttl; SEARCHING → DONE; битые строки пропускаются."""
         now = self._now() if now is None else now
         out: dict[int | str, Session] = {}
         searching = 0
         for key, data, updated_at in self._rows("SELECT chat_key, data, updated_at FROM chat_sessions"):
-            if now - updated_at > ttl:
+            if now - updated_at > self.session_ttl:
                 continue
             try:
                 session = decode_session(data)
@@ -189,38 +209,55 @@ class ChatStateStore:
                 searching += 1
             out[json.loads(key)] = session
             self._session_saved[key] = _digest(data)
-        self._delete("chat_sessions", "updated_at", now - ttl)
         log.info("сессий из базы: %d (поиск шёл в %d, шаг снят)", len(out), searching)
         return out
 
-    def load_snapshots(self, ttl: float, now: float | None = None) -> dict[int | str, SearchSnapshot]:
-        """Выдачи моложе ttl от создания (как ResultStore.get); старше — удаляются."""
+    def load_snapshots(self, now: float | None = None) -> dict[int | str, SearchSnapshot]:
+        """Выдачи моложе snapshot_ttl от создания (как ResultStore.get)."""
         now = self._now() if now is None else now
         out: dict[int | str, SearchSnapshot] = {}
-        for key, data, created_at in self._rows("SELECT chat_key, data, created_at FROM chat_snapshots"):
-            if now - created_at > ttl:
+        for key, blob, created_at in self._rows("SELECT chat_key, data, created_at FROM chat_snapshots"):
+            if now - created_at > self.snapshot_ttl:
                 continue
             try:
+                data = zlib.decompress(blob).decode()
                 out[json.loads(key)] = decode_snapshot(data)
             except Exception:
                 log.warning("выдача чата %s не читается, пропущена", key, exc_info=True)
                 continue
             self._snapshot_saved[key] = _digest(data)
-        self._delete("chat_snapshots", "created_at", now - ttl)
         log.info("выдач из базы: %d", len(out))
         return out
 
+    def load(self) -> tuple[dict[int | str, Session], dict[int | str, SearchSnapshot]]:
+        """Сессии и выдачи для нового объекта бота; строки старше TTL — удаляются."""
+        now = self._now()
+        sessions, snapshots = self.load_sessions(now), self.load_snapshots(now)
+        self.prune(now)
+        return sessions, snapshots
+
     def save_chat(self, chat_id: int | str, session: Session | None, snapshot: SearchSnapshot | None) -> None:
-        """Пишет то, что изменилось с прошлой записи; None — строки чата нет (сессию сбросили)."""
+        """Пишет то, что изменилось с прошлой записи; None — строки чата нет (сессию сбросили, выдача устарела)."""
+        now = self._now()
+        if snapshot is not None and now - snapshot.created_at > self.snapshot_ttl:
+            snapshot = None  # ResultStore.get её уже не отдаст; не воскрешать строку после prune
         key = _chat_key(chat_id)
         s_json = None if session is None else encode_session(session)
         p_json = None if snapshot is None else encode_snapshot(snapshot)
         s_sig, p_sig = _digest(s_json), _digest(p_json)
         s_new = s_sig != self._session_saved.get(key)
         p_new = p_sig != self._snapshot_saved.get(key)
-        if not (s_new or p_new):
-            return
-        now = self._now()
+        if s_new or p_new:
+            self._write(key, now, s_new, s_json, p_new, p_json, snapshot)
+            if s_new:
+                self._session_saved[key] = s_sig
+            if p_new:
+                self._snapshot_saved[key] = p_sig
+        if now - self._last_prune >= PRUNE_EVERY_SECONDS:
+            self.prune(now)
+
+    def _write(self, key: str, now: float, s_new: bool, s_json: str | None,
+               p_new: bool, p_json: str | None, snapshot: SearchSnapshot | None) -> None:
         with closing(statedb.connect(self.path)) as conn, conn:
             if s_new and s_json is None:
                 conn.execute("DELETE FROM chat_sessions WHERE chat_key = ?", (key,))
@@ -230,15 +267,12 @@ class ChatStateStore:
                              "updated_at = excluded.updated_at", (key, s_json, now))
             if p_new and p_json is None:
                 conn.execute("DELETE FROM chat_snapshots WHERE chat_key = ?", (key,))
-            elif p_new:
+            elif p_new and snapshot is not None:
+                blob = zlib.compress(p_json.encode(), SNAPSHOT_ZLIB_LEVEL)
                 conn.execute("INSERT INTO chat_snapshots (chat_key, data, created_at, updated_at) VALUES (?, ?, ?, ?) "
                              "ON CONFLICT(chat_key) DO UPDATE SET data = excluded.data, "
                              "created_at = excluded.created_at, updated_at = excluded.updated_at",
-                             (key, p_json, snapshot.created_at, now))
-        if s_new:
-            self._session_saved[key] = s_sig
-        if p_new:
-            self._snapshot_saved[key] = p_sig
+                             (key, blob, snapshot.created_at, now))
 
 
 class PersistentResultStore(ResultStore):
@@ -273,7 +307,8 @@ def open_chat_state(
     storage_dir: Path | str, on_put: Callable[[int | str], None] | None = None,
 ) -> tuple[ChatStateStore, PersistentResultStore, dict[int | str, Session]]:
     """Хранилище, ResultStore с выдачами моложе TTL и сессии моложе суток — для нового объекта бота."""
-    cs = ChatStateStore(statedb.ensure_single_db(storage_dir))
     store = PersistentResultStore(on_put=on_put)
-    store.preload(cs.load_snapshots(ttl=store.ttl, now=store.now()))
-    return cs, store, cs.load_sessions()
+    cs = ChatStateStore(statedb.ensure_single_db(storage_dir), snapshot_ttl=store.ttl, clock=store.now)
+    sessions, snapshots = cs.load()
+    store.preload(snapshots)
+    return cs, store, sessions
