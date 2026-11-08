@@ -484,10 +484,8 @@ class Bot:
         """
         if chat_id in self.s.tg_allowed_ids:
             return True, None
-        now = time.time()
-        if not self.users.try_use_search(chat_id, self.s.daily_search_limit, now=now):
-            return False, None
-        return True, now
+        charged_at = self.users.charge_search(chat_id, self.s.daily_search_limit)
+        return charged_at is not None, charged_at
 
     def _refund_search(self, chat_id: int, charged_at: float) -> None:
         """Возвращает попытку, списанную в charged_at: поиск упал или ни один сайт не ответил.

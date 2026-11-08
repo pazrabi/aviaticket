@@ -140,7 +140,18 @@ def deep(bot: FlakyBot, uid: int = PERSON_ID):
     return bot._run_deep_search(uid, DeepSearchRequest(query=QUERY))
 
 
-# --- UserStore.refund_search ---
+# --- UserStore.charge_search / refund_search ---
+
+
+def test_charge_returns_charge_moment_or_none_over_limit(tmp_path, clock):
+    store = UserStore(tmp_path / "u.sqlite")
+    store.register(PERSON_ID)
+
+    assert store.charge_search(PERSON_ID, 2) == clock[0]
+    assert store.charge_search(PERSON_ID, 2, now=clock[0] + 60) == clock[0] + 60
+    assert store.charge_search(PERSON_ID, 2) is None  # лимит 2 исчерпан, ничего не списано
+
+    assert counters(store, PERSON_ID) == ("2026-11-08", 2, 2)
 
 
 def test_refund_returns_attempt_of_the_charge_day(tmp_path):
