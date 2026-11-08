@@ -483,6 +483,11 @@ def _baggage_filter_line(baggage_mode: str, dropped: int) -> str:
     return f"🧳 {mode} · скрыто: {dropped} (без данных о багаже оставлены)"
 
 
+def _pending_site_line(site: str) -> str:
+    """Сайт ещё ищет, а карточка уже ушла (П31, CARD_EARLY)."""
+    return f"⏳ <b>{escape(site_label(site))}</b> ещё ищет"
+
+
 def _site_issue(r: SiteResult) -> str:
     label = f"<b>{escape(site_label(r.site))}</b>"
     link = f' · <a href="{escape(r.page_url, quote=True)}">открыть выдачу</a>' if r.page_url else ""
@@ -773,8 +778,13 @@ def build_compact_report(
     dropped_criteria: int = 0,
     settings: Any = None,
     history_hint: str | None = None,
+    pending_sites: Sequence[str] = (),
 ) -> tuple[list[str], list[Offer], list[Offer]]:
-    """Сводка с карточками (pick_cards), плоским списком (flat) и пулом билетов (pool)."""
+    """Сводка с карточками (pick_cards), плоским списком (flat) и пулом билетов (pool).
+
+    pending_sites — сайты, которые ещё ищут (ранняя карточка, П31): строка «⏳ <сайт> ещё ищет» над сайтами
+    с ошибками. Пусто — сводка как без параметра.
+    """
     unique_offers: list[Offer] = []
     seen_ids: set[str] = set()
     for r in results:
@@ -848,7 +858,7 @@ def build_compact_report(
     # недоступные сайты внизу списка: обычные предупреждения выше
     failed = [r for r in results if not r.ok]
     failed.sort(key=lambda r: is_unavailable(r))
-    issue_lines = [_site_issue(r) for r in failed]
+    issue_lines = [_pending_site_line(name) for name in pending_sites] + [_site_issue(r) for r in failed]
 
     empty_lines: list[str] = []
     if not pool:

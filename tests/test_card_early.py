@@ -52,22 +52,24 @@ NOT_FOUND = (
 @dataclass(frozen=True)
 class Answer:
     at: float  # секунд прода от старта поиска
-    kind: str = "price"  # price — цены; empty — ответил без билетов; error — ошибка сайта
+    kind: str = "price"  # price — цены; empty — ответил без билетов; error — ошибка сайта; crash — поиск упал
+    baggage: str | None = None  # багаж у билета сайта («без багажа» / «с багажом»)
 
 
-# 4 сайта с ценами к 10 с, aviasales — к 45 с (самый дешёвый: без него минимум карточки дороже)
+# 4 сайта с ценами к 10 с (последний — к 6 с: запас до проверки времени в 30 с), aviasales — к 45 с
+# (самый дешёвый: без него минимум карточки дороже)
 PLAN_MAIN = {
-    "kupibilet": Answer(6),
-    "tutu": Answer(7),
-    "yandex_travel": Answer(8),
-    "ozon_travel": Answer(10),
+    "kupibilet": Answer(3),
+    "tutu": Answer(4),
+    "yandex_travel": Answer(5),
+    "ozon_travel": Answer(6),
     "aviasales": Answer(45),
 }
 
 
 def site_result(site: str, answer: Answer) -> SiteResult:
     if answer.kind == "price":
-        offers = [Offer(site, PRICES[site], airline=f"{site}air")]
+        offers = [Offer(site, PRICES[site], airline=f"{site}air", baggage=answer.baggage)]
         return SiteResult(site, True, offers, elapsed=answer.at)
     if answer.kind == "empty":
         return SiteResult(site, True, [], elapsed=answer.at)
@@ -88,6 +90,8 @@ class FakeSearch:
         async def one(site: SiteConfig) -> SiteResult:
             answer = self.plan[site.name]
             await asyncio.sleep(answer.at * SCALE)
+            if answer.kind == "crash":
+                raise RuntimeError(f"{site.name}: парсер упал")
             res = site_result(site.name, answer)
             if on_site_done is not None:
                 await on_site_done(res)
@@ -112,11 +116,12 @@ class Call:
 class TimedBot(Bot):
     """Пишет вызовы Telegram с моментом и состоянием busy; правка карточки может падать (edit_error)."""
 
-    def __init__(self, settings: Settings, edit_error: str | None = None) -> None:
+    def __init__(self, settings: Settings, edit_error: str | None = None, html_only: bool = False) -> None:
         super().__init__(settings)
         self.calls: list[Call] = []
         self.next_msg_id = 300
         self.edit_error = edit_error
+        self.html_only = html_only  # падает только правка с parse_mode=HTML
         self.t0 = 0.0
 
     async def call(self, method: str, *, retries: int | None = None, **params: Any) -> Any:
@@ -127,11 +132,20 @@ class TimedBot(Bot):
             return {"message_id": self.next_msg_id, "chat": {"id": params.get("chat_id")}}
         # правка с клавиатурой — это карточка (сообщение ожидания правится без неё)
         if method == "editMessageText" and self.edit_error and params.get("reply_markup") is not None:
-            raise RuntimeError(self.edit_error)
+            if not self.html_only or params.get("parse_mode") == "HTML":
+                raise RuntimeError(self.edit_error)
         return True
 
 
-def make_bot(tmp_path, *, early: bool, trial: bool = False, edit_error: str | None = None) -> TimedBot:
+def make_bot(
+    tmp_path,
+    *,
+    early: bool,
+    trial: bool = False,
+    edit_error: str | None = None,
+    html_only: bool = False,
+    safety: float = 90,
+) -> TimedBot:
     sites = [SiteConfig(name=n, url_template=f"http://{n}/{{origin}}") for n in LIVE]
     if trial:
         sites.append(SiteConfig(name=TRIAL, url_template=f"http://{TRIAL}/{{origin}}", stage="trial"))
@@ -144,10 +158,10 @@ def make_bot(tmp_path, *, early: bool, trial: bool = False, edit_error: str | No
         tg_open=True,
         daily_search_limit=DAILY_LIMIT,
         storage_dir=tmp_path,
-        live_safety_seconds=90 * SCALE,
+        live_safety_seconds=safety * SCALE,
         **flags,
     )
-    bot = TimedBot(settings, edit_error=edit_error)
+    bot = TimedBot(settings, edit_error=edit_error, html_only=html_only)
     bot.users.register(PERSON_ID, None, "Имя")
     return bot
 
@@ -165,13 +179,28 @@ def spy_store(bot: TimedBot) -> list[list[str]]:
     return puts
 
 
-async def run(bot: TimedBot, monkeypatch, plan: dict[str, Answer]) -> FakeSearch:
+async def run(bot: TimedBot, monkeypatch, plan: dict[str, Answer], baggage_mode: str = "any") -> FakeSearch:
     search = FakeSearch(plan)
     monkeypatch.setattr("avia.bot.search", search)
     bot.dialog.sessions[PERSON_ID] = Session(step=Step.SEARCHING, dialog_id=DIALOG_ID)
     bot.t0 = asyncio.get_running_loop().time()
-    await bot._run_search(PERSON_ID, SearchRequest(query=QUERY))
+    await bot._run_search(PERSON_ID, SearchRequest(query=QUERY, baggage_mode=baggage_mode))
     return search
+
+
+def spy_builds(monkeypatch) -> list[bool]:
+    """Сборки карточки в боте по порядку: True — ранняя (с pending_sites), False — обычная, как в kt1-all."""
+    import avia.bot
+
+    builds: list[bool] = []
+    real = avia.bot.build_compact_report
+
+    def build(*args, **kwargs):
+        builds.append("pending_sites" in kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(avia.bot, "build_compact_report", build)
+    return builds
 
 
 def is_card(c: Call) -> bool:
@@ -226,9 +255,11 @@ def assert_search_closed(bot: TimedBot) -> None:
 async def test_flag_off_one_card_after_all_sites_texts_as_now(tmp_path, monkeypatch):
     bot = make_bot(tmp_path, early=False)
     puts = spy_store(bot)
+    builds = spy_builds(monkeypatch)
 
     search = await run(bot, monkeypatch, PLAN_MAIN)
 
+    assert builds == [False]  # одна сборка, без pending_sites (без него вывод тот же — test_compact_report_*)
     cards = cards_sent(bot)
     assert len(cards) == 1
     assert cards[0].t >= 45  # ждала aviasales
@@ -284,13 +315,15 @@ def test_flags_from_env(monkeypatch, env, expected):
 async def test_early_card_at_four_sites_then_edit_to_full(tmp_path, monkeypatch):
     bot = make_bot(tmp_path, early=True, trial=True)
     puts = spy_store(bot)
+    builds = spy_builds(monkeypatch)
 
     search = await run(bot, monkeypatch, PLAN_MAIN)
 
+    assert builds == [True, False]  # ранняя с «ещё ищет», полная — обычной сборкой
     cards = cards_sent(bot)
     assert len(cards) == 1
     card = cards[0]
-    assert 10 <= card.t < 30  # по четырём сайтам, не по времени и не по aviasales
+    assert 6 <= card.t < 30  # по четырём сайтам, не по времени и не по aviasales
     assert card.busy  # поиск идёт дальше: busy держим до конца, как в kt1-all
     early_text = html_to_plain(card.params["text"])
     assert PENDING.format("Aviasales") in early_text
@@ -320,23 +353,23 @@ async def test_early_card_at_30s_with_two_sites(tmp_path, monkeypatch):
     bot = make_bot(tmp_path, early=True)
     puts = spy_store(bot)
     plan = {
-        "kupibilet": Answer(5),
-        "tutu": Answer(8),
-        "aviasales": Answer(45),
-        "yandex_travel": Answer(50),
-        "ozon_travel": Answer(55),
+        "kupibilet": Answer(3),
+        "tutu": Answer(5),
+        "aviasales": Answer(60),
+        "yandex_travel": Answer(65),
+        "ozon_travel": Answer(70),
     }
 
     search = await run(bot, monkeypatch, plan)
 
     cards = cards_sent(bot)
     assert len(cards) == 1
-    assert 30 <= cards[0].t < 45
+    assert 30 <= cards[0].t < 60
     early_text = html_to_plain(cards[0].params["text"])
     for label in ("Aviasales", "Яндекс Путешествия", "Ozon Travel"):
         assert PENDING.format(label) in early_text
     edits = card_edits(bot)
-    assert len(edits) == 1 and edits[0].t >= 55
+    assert len(edits) == 1 and edits[0].t >= 70
     assert [edits[0].params["text"]] == full_chunks(search)
     assert puts == [["kupibilet", "tutu"], sorted(LIVE)]
     assert_search_closed(bot)
@@ -347,18 +380,18 @@ async def test_no_prices_by_30s_one_card_at_end(tmp_path, monkeypatch):
     bot = make_bot(tmp_path, early=True)
     puts = spy_store(bot)
     plan = {  # к 30 с цен нет; потом цены у трёх — до четырёх сайтов с ценами не дойти
-        "kupibilet": Answer(5, "error"),
-        "tutu": Answer(8, "empty"),
-        "yandex_travel": Answer(35),
-        "ozon_travel": Answer(40),
-        "aviasales": Answer(45),
+        "kupibilet": Answer(3, "error"),
+        "tutu": Answer(5, "empty"),
+        "yandex_travel": Answer(50),
+        "ozon_travel": Answer(55),
+        "aviasales": Answer(60),
     }
 
     search = await run(bot, monkeypatch, plan)
 
     cards = cards_sent(bot)
     assert len(cards) == 1
-    assert cards[0].t >= 45
+    assert cards[0].t >= 60
     assert card_edits(bot) == []
     assert [cards[0].params["text"]] == full_chunks(search)
     assert not any("ещё ищет" in t for t in texts(bot))
@@ -396,10 +429,10 @@ async def test_safety_after_early_card_edits_to_what_answered(tmp_path, monkeypa
 
     assert search.cancelled
     cards = cards_sent(bot)
-    assert len(cards) == 1 and 10 <= cards[0].t < 30
+    assert len(cards) == 1 and 6 <= cards[0].t < 30
     edits = card_edits(bot)
     assert len(edits) == 1
-    assert 90 <= edits[0].t < 120  # предохранитель 90 с
+    assert 90 <= edits[0].t < 140  # предохранитель 90 с
     full_text = html_to_plain(edits[0].params["text"])
     assert "💤 Aviasales: пока недоступен" in full_text  # «сайт временно недоступен», как сейчас
     assert "ещё ищет" not in full_text
@@ -460,6 +493,102 @@ async def test_full_card_longer_than_one_message_rest_sent_after(tmp_path, monke
     assert len(cards_sent(bot)) == 1
     assert_search_closed(bot)
 
+@pytest.mark.asyncio
+async def test_card_edit_html_rejected_retried_as_plain_text(tmp_path, monkeypatch):
+    bot = make_bot(tmp_path, early=True, html_only=True,
+                   edit_error="telegram editMessageText: Bad Request: can't parse entities: unclosed tag")
+
+    search = await run(bot, monkeypatch, PLAN_MAIN)
+
+    edits = card_edits(bot)
+    assert [e.params.get("parse_mode") for e in edits] == ["HTML", None]  # как send: повтор без разметки
+    assert edits[1].params["text"] == html_to_plain(full_chunks(search)[0])
+    assert len(cards_sent(bot)) == 1
+    assert_search_closed(bot)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_error_after_early_card_keeps_one_card(tmp_path, monkeypatch):
+    bot = make_bot(tmp_path, early=True)
+    real = bot.store.put
+    calls: list[int] = []
+
+    def put(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("снимок не сохранился")
+        return real(*args, **kwargs)
+
+    bot.store.put = put  # type: ignore[method-assign]
+
+    search = await run(bot, monkeypatch, PLAN_MAIN)
+
+    assert len(cards_sent(bot)) == 1  # карточка ушла — второй не будет, только правка
+    edits = card_edits(bot)
+    assert len(edits) == 1 and [edits[0].params["text"]] == full_chunks(search)
+    assert bot.store.get(PERSON_ID) is not None  # полный снимок
+    assert_search_closed(bot)
+
+
+@pytest.mark.asyncio
+async def test_search_error_after_early_card_as_in_kt1_all(tmp_path, monkeypatch):
+    bot = make_bot(tmp_path, early=True)
+
+    await run(bot, monkeypatch, {**PLAN_MAIN, "aviasales": Answer(45, "crash")})
+
+    assert len(cards_sent(bot)) == 1  # ранняя ушла
+    assert card_edits(bot) == []
+    assert any(t.startswith("⚠️") for t in texts(bot))  # исключение поиска — как в kt1-all: ошибка и возврат
+    assert today_count(bot) == 0
+    assert PERSON_ID not in bot.busy
+    assert bot.dialog.sessions[PERSON_ID].step != Step.SEARCHING
+
+
+@pytest.mark.asyncio
+async def test_no_early_card_when_filters_leave_nothing(tmp_path, monkeypatch):
+    bot = make_bot(tmp_path, early=True)
+    no_bag = {site: Answer(a.at, baggage="без багажа") for site, a in PLAN_MAIN.items()}
+    plan = {**no_bag, "aviasales": Answer(45, baggage="с багажом")}
+
+    await run(bot, monkeypatch, plan, baggage_mode="with")
+
+    cards = cards_sent(bot)  # «Билетов не нашлось» с «ещё ищет» не шлём: ждём, одна карточка в конце
+    assert len(cards) == 1 and cards[0].t >= 45
+    assert card_edits(bot) == []
+    assert money(PRICES["aviasales"], "RUB") in html_to_plain(cards[0].params["text"])
+    row = last_search_row(tmp_path)
+    assert row["card_seconds"] == row["total_seconds"]
+    assert row["card_min_price"] == row["full_min_price"] == PRICES["aviasales"]  # минимум после фильтра багажа
+    assert_search_closed(bot)
+
+
+@pytest.mark.asyncio
+async def test_safety_before_early_seconds_one_card(tmp_path, monkeypatch):
+    bot = make_bot(tmp_path, early=True, safety=15)
+    plan = {**{site: Answer(NEVER) for site in LIVE}, "kupibilet": Answer(3), "tutu": Answer(5)}
+
+    await run(bot, monkeypatch, plan)
+
+    cards = cards_sent(bot)
+    assert len(cards) == 1 and 15 <= cards[0].t < 60  # предохранитель раньше CARD_EARLY_SECONDS
+    assert card_edits(bot) == []
+    assert not any("ещё ищет" in t for t in texts(bot))
+    assert_search_closed(bot)
+
+
+def test_compact_report_pending_lines_only_when_given():
+    results = [site_result("kupibilet", Answer(3)), SiteResult("tutu", False, [], error="таймаут")]
+
+    base, _, _ = build_compact_report(QUERY, results, SearchCriteria())
+    same, _, _ = build_compact_report(QUERY, results, SearchCriteria(), pending_sites=[])
+    early, _, _ = build_compact_report(QUERY, results, SearchCriteria(), pending_sites=["aviasales", "ozon_travel"])
+
+    assert same == base
+    plain = html_to_plain(early[0])
+    pending = "⏳ Aviasales ещё ищет\n⏳ Ozon Travel ещё ищет\n"
+    assert pending + "⚠️ Туту: таймаут" in plain  # над сайтами с ошибкой
+    assert html_to_plain(base[0]) == plain.replace(pending, "")
+
 
 # --- метрики в searches --------------------------------------------------------------------------------------
 
@@ -483,7 +612,7 @@ async def test_metrics_flag_on_early_card(tmp_path, monkeypatch):
     await run(bot, monkeypatch, PLAN_MAIN)
 
     row = last_search_row(tmp_path)
-    assert 10 * SCALE <= row["card_seconds"] < 30 * SCALE
+    assert 6 * SCALE <= row["card_seconds"] < 30 * SCALE
     assert row["total_seconds"] >= 45 * SCALE
     assert row["card_sites_ok"] == 4
     assert row["sites_ok"] == 5
@@ -494,8 +623,8 @@ async def test_metrics_flag_on_early_card(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_metrics_flag_on_no_early_card_same_as_off(tmp_path, monkeypatch):
     bot = make_bot(tmp_path, early=True)
-    plan = {**PLAN_MAIN, "kupibilet": Answer(35), "tutu": Answer(36), "yandex_travel": Answer(37),
-            "ozon_travel": Answer(38, "error")}
+    plan = {**PLAN_MAIN, "kupibilet": Answer(40), "tutu": Answer(41), "yandex_travel": Answer(42),
+            "ozon_travel": Answer(43, "error"), "aviasales": Answer(50)}
 
     await run(bot, monkeypatch, plan)
 

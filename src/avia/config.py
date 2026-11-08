@@ -165,6 +165,10 @@ class Settings:
     history_hint: bool = True
     fresh_max_age_seconds: float = 600.0
     kupibilet_ticket_link: bool = True
+    # П31: карточка живого поиска не ждёт самый медленный сайт (CARD_EARLY=1; по умолчанию выключено)
+    card_early: bool = False
+    card_early_seconds: float = 30.0  # в этот момент карточка уходит, если цены уже есть
+    card_early_sites: int = 4  # карточка уходит, как только сайтов с ценами столько
 
     def __post_init__(self) -> None:
         if self.backup_dir is None:
@@ -378,6 +382,20 @@ def load_settings(path: Path | None = None) -> Settings:
     kupibilet_ticket_link_env = os.getenv("KUPIBILET_TICKET_LINK", "1").strip().lower()
     kupibilet_ticket_link = kupibilet_ticket_link_env not in ("0", "false", "False", "no", "off")
 
+    card_early = os.getenv("CARD_EARLY", "0").strip() == "1"
+    try:
+        card_early_seconds = float(os.getenv("CARD_EARLY_SECONDS", "30"))
+    except ValueError:
+        card_early_seconds = 30.0
+    if not card_early_seconds > 0:  # ноль, минус и nan — по умолчанию
+        card_early_seconds = 30.0
+    try:
+        card_early_sites = int(os.getenv("CARD_EARLY_SITES", "4"))
+    except ValueError:
+        card_early_sites = 4
+    if card_early_sites < 1:
+        card_early_sites = 4
+
     try:
         search_budget_per_hour = max(0, int(os.getenv("SEARCH_BUDGET_PER_HOUR", "0")))
     except ValueError:
@@ -483,6 +501,9 @@ def load_settings(path: Path | None = None) -> Settings:
         history_hint=history_hint,
         fresh_max_age_seconds=fresh_max_age_seconds,
         kupibilet_ticket_link=kupibilet_ticket_link,
+        card_early=card_early,
+        card_early_seconds=card_early_seconds,
+        card_early_sites=card_early_sites,
     )
 
 

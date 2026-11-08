@@ -143,7 +143,11 @@ CREATE TABLE IF NOT EXISTS searches (
     sites_total    INTEGER NOT NULL,
     sites_ok       INTEGER NOT NULL,
     queue_seconds  REAL,
-    cls            TEXT
+    cls            TEXT,
+    card_seconds   REAL,
+    card_sites_ok  INTEGER,
+    card_min_price REAL,
+    full_min_price REAL
 );
 CREATE INDEX IF NOT EXISTS ix_searches_ts ON searches (ts);
 
@@ -196,6 +200,15 @@ class SiteOutcome(tuple):
     def __init__(self, device: str | None, ok: bool, captcha: bool = False, ts: float = 0.0) -> None:
         self._captcha = captcha
         self._ts = ts
+
+
+# П31: колонки карточки в searches (NULL — фон, подписки, глубокий поиск и строки до П31)
+SEARCHES_CARD_COLUMNS = (
+    ("card_seconds", "REAL"),
+    ("card_sites_ok", "INTEGER"),
+    ("card_min_price", "REAL"),
+    ("full_min_price", "REAL"),
+)
 
 
 class MetricsStore:
@@ -256,6 +269,10 @@ class MetricsStore:
             cols_srch = {row[1] for row in conn.execute("PRAGMA table_info(searches)").fetchall()}
             if "cls" not in cols_srch:
                 conn.execute("ALTER TABLE searches ADD COLUMN cls TEXT")
+            # П31: карточка живого поиска — когда ушла, сайтов с ценами, минимум в карточке и в полной выдаче
+            for col, col_type in SEARCHES_CARD_COLUMNS:
+                if col not in cols_srch:
+                    conn.execute(f"ALTER TABLE searches ADD COLUMN {col} {col_type}")
 
     def _connect(self) -> sqlite3.Connection:
         self._ensure_schema()
@@ -926,8 +943,17 @@ def _record_search(
     queue_seconds: float | None = None,
     ts: float | None = None,
     cls: str | None = "fast",
+    *,
+    card_seconds: float | None = None,
+    card_sites_ok: int | None = None,
+    card_min_price: float | None = None,
+    full_min_price: float | None = None,
 ) -> None:
-    """Итог всего поиска: сколько ждал человек, когда пришла первая цена, сколько сайтов ответило."""
+    """Итог всего поиска: сколько ждал человек, когда пришла первая цена, сколько сайтов ответило.
+
+    card_* и full_min_price — карточка живого поиска (П31): когда ушла, сайтов с ценами в ней, минимум цены
+    в карточке и в полной выдаче. Без карточки (фон, подписки, глубокий поиск) — NULL.
+    """
     try:
         oks = [float(r.elapsed) for r in results if r.ok and r.offers]
         cls_val = cls if cls is not None else "fast"
@@ -940,11 +966,16 @@ def _record_search(
             len(oks),
             float(queue_seconds) if queue_seconds is not None else None,
             cls_val,
+            float(card_seconds) if card_seconds is not None else None,
+            int(card_sites_ok) if card_sites_ok is not None else None,
+            float(card_min_price) if card_min_price is not None else None,
+            float(full_min_price) if full_min_price is not None else None,
         )
         with self._connect() as db:
             db.execute(
-                "INSERT INTO searches (ts, source, total_seconds, first_seconds, sites_total, sites_ok, queue_seconds, cls)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO searches (ts, source, total_seconds, first_seconds, sites_total, sites_ok, queue_seconds, cls,"
+                " card_seconds, card_sites_ok, card_min_price, full_min_price)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 row,
             )
     except Exception:

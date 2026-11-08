@@ -18,6 +18,15 @@ import httpx
 from . import admin_panel, advice, analytics, charts, forecast
 from .backup import backup_all, list_backups
 from .bg_collector import BackgroundCollector
+from .card_early import (
+    CompactView,
+    EarlyCard,
+    SiteWatch,
+    card_metrics,
+    live_site_names,
+    min_price,
+    sites_with_prices,
+)
 from .config import Settings, load_settings
 from .deep_cache import DeepCache
 from .fresh_cache import FreshCache
@@ -653,10 +662,21 @@ class Bot:
                 footer=footer,
             )
 
+            watch: SiteWatch | None = None
+            if getattr(self.s, "card_early", False):
+                watch = SiteWatch(
+                    updater.on_site_done,
+                    live_site_names(self.s),
+                    early_seconds=self.s.card_early_seconds,
+                    early_sites=self.s.card_early_sites,
+                )
+
             self._active_searches += 1
             t_search0 = time.monotonic()
+            t_loop0 = asyncio.get_running_loop().time()  # ранняя карточка: таймауты asyncio идут по часам цикла
             timed_out = False
             search_task: asyncio.Task | None = None
+            early: EarlyCard | None = None
             try:
                 search_task = asyncio.create_task(
                     _search_call(
@@ -665,15 +685,20 @@ class Bot:
                         self.s,
                         priority=0,
                         samples_dir=self.s.storage_dir / "samples",
-                        on_site_done=updater.on_site_done,
+                        on_site_done=updater.on_site_done if watch is None else watch.on_site_done,
                         fresh_cache=getattr(self, "fresh_cache", None),
                         fresh_max_age=float(getattr(self.s, "fresh_max_age_seconds", 600.0)),
                     )
                 )
+                if watch is not None:
+                    early = await self._early_card_phase(chat_id, req, watch, search_task, t_search0, t_loop0)
                 if self.s.live_safety_seconds > 0:
+                    safety_left = self.s.live_safety_seconds
+                    if watch is not None:  # часть предохранителя ушла на раннюю карточку
+                        safety_left = max(0.0, safety_left - (asyncio.get_running_loop().time() - t_loop0))
                     done, pending = await asyncio.wait(
                         [search_task],
-                        timeout=self.s.live_safety_seconds,
+                        timeout=safety_left,
                     )
                     timed_out = search_task in pending
                 else:
@@ -720,8 +745,13 @@ class Bot:
             keep_charge = any(r.ok for r in results)
             self._record_metrics("user", results)
             if self.metrics is not None and results:
+                total_seconds = time.monotonic() - t_search0
                 self.metrics.record_search(  # type: ignore[attr-defined]
-                    "user", time.monotonic() - t_search0, results, queue_seconds=0.0
+                    "user",
+                    total_seconds,
+                    results,
+                    queue_seconds=0.0,
+                    **card_metrics(early, total_seconds, results, req.criteria, baggage_mode),
                 )
 
             results = assign_ids(results)
@@ -729,76 +759,14 @@ class Bot:
                 await asyncio.to_thread(self.history.annotate, q, results)
             except Exception:
                 log.exception("история цен недоступна")
-            filtered_crit, dropped_criteria = apply_criteria(results, req.criteria)
-            filtered, dropped_baggage = filter_by_baggage(filtered_crit, baggage_mode)
-
-            hint_line: str | None = None
-            settings = getattr(self, "settings", self.s)
-            if getattr(settings, "history_hint", True) and self.history is not None:
-                try:
-                    ok_offers = [o for r in filtered if r.ok for o in r.offers]
-                    if ok_offers:
-                        best_price = min(o.price for o in ok_offers)
-                        now = time.time()
-                        since = now - analytics.HINT_WINDOW_DAYS * 86400.0
-                        route_prices = await asyncio.to_thread(
-                            self.history.route_search_minima, q, since, now
-                        )
-                        hint_line = analytics.history_hint_line(best_price, route_prices)
-                except Exception as exc:
-                    log.warning("Ошибка вычисления history_hint_line: %s", exc)
-                    hint_line = None
-
-            chunks, flat, pool = build_compact_report(
-                q,
-                filtered,
-                req.criteria,
-                baggage_mode=baggage_mode,
-                dropped_baggage=dropped_baggage,
-                dropped_criteria=dropped_criteria,
-                history_hint=hint_line,
-            )
-
-            session = self.dialog.sessions.get(chat_id)
-            if session is None or not session.dialog_id:
-                session = Session(
-                    step=Step.DONE,
-                    origin=q.origin,
-                    destination=q.destination,
-                    depart=q.depart,
-                    return_date=q.return_date,
-                    adults=q.adults,
-                    baggage_mode=baggage_mode,
-                    criteria=req.criteria,
-                    dialog_id=secrets.token_hex(2),
-                )
-                self.dialog.sessions[chat_id] = session
+            view = await self._compact_view(req, results)
+            if early is None:
+                session = self._card_session(chat_id, req)
+                reply_markup = to_reply_markup(compact_keyboard(session.dialog_id, has_more=view.has_more))
+                await self._send_chunks(chat_id, view.chunks, reply_markup)
             else:
-                session.step = Step.DONE
-
-            d_id = session.dialog_id
-            shown_ids = {o.offer_id for o in flat if o.offer_id}
-            has_more = any(o.offer_id not in shown_ids for o in pool)
-            kb = compact_keyboard(d_id, has_more=has_more)
-            reply_markup = to_reply_markup(kb)
-
-            for i, chunk in enumerate(chunks):
-                rm = reply_markup if i == len(chunks) - 1 else None
-                await self.send(chat_id, chunk, reply_markup=rm)
-
-            self.store.put(
-                chat_id,
-                q,
-                filtered,
-                baggage_mode,
-                flat,
-                criteria=req.criteria,
-                pool=pool,
-                shown=len(flat),
-                view="compact",
-                dropped_baggage=dropped_baggage,
-                dropped_criteria=dropped_criteria,
-            )
+                await self._finish_early_card(chat_id, early, view)
+            self._put_view(chat_id, req, view)
         except Exception as e:
             keep_charge = False
             log.exception("search failed")
@@ -820,6 +788,204 @@ class Bot:
                         )
                     except Exception:
                         pass
+
+    async def _history_hint_line(self, q: Query, filtered: list[SiteResult]) -> str | None:
+        """Строка «ниже/выше обычного» для карточки по истории маршрута; None — не показывать."""
+        settings = getattr(self, "settings", self.s)
+        if not (getattr(settings, "history_hint", True) and self.history is not None):
+            return None
+        try:
+            ok_offers = [o for r in filtered if r.ok for o in r.offers]
+            if not ok_offers:
+                return None
+            best_price = min(o.price for o in ok_offers)
+            now = time.time()
+            since = now - analytics.HINT_WINDOW_DAYS * 86400.0
+            route_prices = await asyncio.to_thread(self.history.route_search_minima, q, since, now)
+            return analytics.history_hint_line(best_price, route_prices)
+        except Exception as exc:
+            log.warning("Ошибка вычисления history_hint_line: %s", exc)
+            return None
+
+    async def _compact_view(
+        self, req: SearchRequest, results: list[SiteResult], pending_sites: list[str] | None = None
+    ) -> CompactView:
+        """Карточка живого поиска по выдаче: фильтры и багаж человека, подсказка истории, сводка.
+
+        pending_sites — сайты, которые ещё ищут (ранняя карточка): строка «⏳ <сайт> ещё ищет».
+        """
+        filtered_crit, dropped_criteria = apply_criteria(results, req.criteria)
+        filtered, dropped_baggage = filter_by_baggage(filtered_crit, req.baggage_mode)
+        hint_line = await self._history_hint_line(req.query, filtered)
+        extra = {"pending_sites": pending_sites} if pending_sites else {}
+        chunks, flat, pool = build_compact_report(
+            req.query,
+            filtered,
+            req.criteria,
+            baggage_mode=req.baggage_mode,
+            dropped_baggage=dropped_baggage,
+            dropped_criteria=dropped_criteria,
+            history_hint=hint_line,
+            **extra,
+        )
+        return CompactView(chunks, flat, pool, filtered, dropped_criteria, dropped_baggage)
+
+    def _card_session(self, chat_id: int, req: SearchRequest) -> Session:
+        """Диалог карточки: шаг DONE (сессии нет или без id — новая), кнопки карточки — по её dialog_id."""
+        q = req.query
+        session = self.dialog.sessions.get(chat_id)
+        if session is None or not session.dialog_id:
+            session = Session(
+                step=Step.DONE,
+                origin=q.origin,
+                destination=q.destination,
+                depart=q.depart,
+                return_date=q.return_date,
+                adults=q.adults,
+                baggage_mode=req.baggage_mode,
+                criteria=req.criteria,
+                dialog_id=secrets.token_hex(2),
+            )
+            self.dialog.sessions[chat_id] = session
+        else:
+            session.step = Step.DONE
+        return session
+
+    async def _send_chunks(self, chat_id: int, chunks: list[str], reply_markup: dict | None) -> None:
+        """Части карточки по порядку; клавиатура — на последней."""
+        for i, chunk in enumerate(chunks):
+            rm = reply_markup if i == len(chunks) - 1 else None
+            await self.send(chat_id, chunk, reply_markup=rm)
+
+    def _put_view(self, chat_id: int, req: SearchRequest, view: CompactView) -> None:
+        """Снимок выдачи для кнопок и номеров билетов — по той выдаче, что в карточке."""
+        self.store.put(
+            chat_id,
+            req.query,
+            view.filtered,
+            req.baggage_mode,
+            view.flat,
+            criteria=req.criteria,
+            pool=view.pool,
+            shown=len(view.flat),
+            view="compact",
+            dropped_baggage=view.dropped_baggage,
+            dropped_criteria=view.dropped_criteria,
+        )
+
+    async def _early_card_phase(
+        self,
+        chat_id: int,
+        req: SearchRequest,
+        watch: SiteWatch,
+        search_task: asyncio.Task,
+        t_search0: float,
+        t_loop0: float,
+    ) -> EarlyCard | None:
+        """П31: ждёт, пока пора (SiteWatch.due), и шлёт раннюю карточку; поиск при этом идёт дальше.
+
+        None — ранней карточки нет: поиск кончился раньше, сработал предохранитель или карточка не ушла.
+        Тогда, как без флага, одна карточка в конце.
+        """
+        loop = asyncio.get_running_loop()
+        safety = self.s.live_safety_seconds
+        tried = -1  # сколько сайтов ответило при прошлой попытке, когда показать было нечего
+        while not search_task.done():
+            watch.changed.clear()
+            elapsed = loop.time() - t_loop0
+            safety_left = safety - elapsed if safety > 0 else None
+            if safety_left is not None and safety_left <= 0:
+                return None
+            if watch.due(elapsed) and len(watch.results) != tried:
+                tried = len(watch.results)
+                try:
+                    card = await self._send_early_card(chat_id, req, watch, t_search0)
+                except Exception:
+                    log.exception("ранняя карточка не ушла, chat_id=%s: будет одна карточка в конце", chat_id)
+                    return None
+                if card is not None:
+                    return card
+                continue
+            await watch.wait(search_task, watch.next_timeout(elapsed, safety_left))
+        return None
+
+    async def _send_early_card(
+        self, chat_id: int, req: SearchRequest, watch: SiteWatch, t_search0: float
+    ) -> EarlyCard | None:
+        """Ранняя карточка по ответившим сайтам; None — показать нечего (после фильтров пусто) или не влезла."""
+        # момент «пора», до сборки и отправки — как total_seconds без флага: снят до сборки полной карточки
+        seconds = time.monotonic() - t_search0
+        answered = watch.results
+        order = [s.name for s in self.s.sites]
+        results = [answered[name] for name in order if name in answered] + [
+            res for name, res in answered.items() if name not in order
+        ]
+        results = list(assign_ids(results))
+        view = await self._compact_view(req, results, pending_sites=watch.pending())
+        if not view.pool or len(view.chunks) != 1:
+            log.info("ранняя карточка отложена, chat_id=%s: билетов %d, частей %d",
+                     chat_id, len(view.pool), len(view.chunks))
+            return None
+        session = self._card_session(chat_id, req)
+        reply_markup = to_reply_markup(compact_keyboard(session.dialog_id, has_more=view.has_more))
+        sent = await self.send(chat_id, view.chunks[0], reply_markup=reply_markup)
+        # карточка у человека: дальше ничто не должно вернуть None, иначе в конце уйдёт вторая карточка
+        card = EarlyCard(
+            message_id=sent.get("message_id") if isinstance(sent, dict) else None,
+            dialog_id=session.dialog_id,
+            seconds=seconds,
+            sites_ok=sites_with_prices(results),
+            min_price=min_price(view.filtered),
+        )
+        try:
+            self._put_view(chat_id, req, view)
+        except Exception:
+            log.exception("снимок ранней карточки не сохранён, chat_id=%s: кнопки заработают с полной", chat_id)
+        log.info("ранняя карточка, chat_id=%s: %.1f с, сайтов с ценами %d", chat_id, seconds, card.sites_ok)
+        return card
+
+    async def _finish_early_card(self, chat_id: int, early: EarlyCard, view: CompactView) -> None:
+        """Ранняя карточка → полная: та же карточка правится (клавиатура на ней), что не влезло — после неё.
+
+        Карточку не поправить (её удалили и т. п.) — полная уходит новой карточкой, как без флага.
+        """
+        if not view.chunks:
+            return
+        reply_markup = to_reply_markup(compact_keyboard(early.dialog_id, has_more=view.has_more))
+        if await self._edit_card(chat_id, early.message_id, view.chunks[0], reply_markup):
+            await self._send_chunks(chat_id, view.chunks[1:], None)
+            return
+        await self._send_chunks(chat_id, view.chunks, reply_markup)
+
+    async def _edit_card(self, chat_id: int, message_id: int | None, text: str, reply_markup: dict) -> bool:
+        """Правит карточку; True — она показывает text (правка прошла или Telegram ответил «not modified»)."""
+        if message_id is None:
+            return False
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+            "reply_markup": reply_markup,
+        }
+        try:
+            try:
+                await self.call("editMessageText", **params)
+            except RuntimeError as e:
+                if "can't parse entities" not in str(e):
+                    raise
+                # как в send: разметка сломана (текст сайта) — лучше без форматирования, чем старая карточка
+                log.warning("telegram отверг HTML правки карточки, правлю текстом: %s", e)
+                plain = {k: v for k, v in params.items() if k != "parse_mode"}
+                await self.call("editMessageText", **{**plain, "text": html_to_plain(text)})
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                log.info("ранняя карточка уже такая, правка не нужна, chat_id=%s", chat_id)
+                return True
+            log.warning("ранняя карточка не поправлена, chat_id=%s: %s — полная уйдёт новым сообщением", chat_id, e)
+            return False
+        return True
 
     async def _run_deep_search(self, chat_id: int, req: DeepSearchRequest) -> None:
         q = req.query
