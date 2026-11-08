@@ -8,7 +8,16 @@ from avia.collector import Snapshot
 from avia.config import load_settings
 from avia.models import Query
 from avia.sites import build_url
-from avia.yandex_ids import STATIC_CITIES, city_id
+from avia.yandex_ids import STATIC_CITIES, city_id, clear_cache
+
+
+@pytest.fixture(autouse=True)
+def reset_yandex_cache(tmp_path, monkeypatch):
+    cache_path = tmp_path / "test_yandex_ids_cache.json"
+    monkeypatch.setenv("YANDEX_IDS_CACHE", str(cache_path))
+    clear_cache()
+    yield
+    clear_cache()
 
 
 def test_city_id_known_codes():
@@ -120,13 +129,20 @@ async def test_pipeline_yandex_id_resolution(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_pipeline_yandex_unknown_city_raises():
+async def test_pipeline_yandex_unknown_city_raises(monkeypatch):
     """В pipeline._from_browser неизвестный город прерывает выполнение с RuntimeError."""
+    import httpx
     from avia.pipeline import _from_browser
+
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json=["unknown", []]))
+    monkeypatch.setattr(
+        "avia.yandex_ids._build_client",
+        lambda **kw: httpx.AsyncClient(transport=transport, **kw),
+    )
 
     settings = load_settings()
     site = next(s for s in settings.sites if s.name == "yandex_travel")
     q = Query("UNKNOWN", "ALA", date(2026, 12, 12))
 
-    with pytest.raises(RuntimeError, match=r"Яндекс Путешествия: город UNKNOWN пока не поддерживается"):
+    with pytest.raises(RuntimeError, match=r"Яндекс Путешествия: не нашёл id для UNKNOWN"):
         await _from_browser(site, q, settings)

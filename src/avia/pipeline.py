@@ -33,6 +33,7 @@ from .parsers.travelpayouts import fetch_travelpayouts, search_url
 from .sites import build_url
 from .statedb import db_path
 from .tutu_ids import resolve_city
+from . import yandex_ids
 from .yandex_ids import city_id
 
 log = logging.getLogger("avia.pipeline")
@@ -364,8 +365,8 @@ async def resolve_extra(site: SiteConfig, q: Query) -> dict[str, str] | None:
         }
     elif site.id_resolver == "yandex":
         extra = {
-            "origin_id": city_id(q.origin),
-            "destination_id": city_id(q.destination),
+            "origin_id": await yandex_ids.resolve(q.origin),
+            "destination_id": await yandex_ids.resolve(q.destination),
         }
     return extra
 
