@@ -10,7 +10,7 @@
 |---|---|---|---|---|
 | `kt1-telegram` | `f611764`, `d31c796` | 6 файлов, +609 −48 | 9 failed + ошибка сборки `test_tg_text.py` → 17 passed; доп. 2: 3 failed → 20 passed | `TG_API_BASE` (пусто — `api.telegram.org`) |
 | `kt1-tests` | `dc845e9` | 1 файл, +15 | полный pytest с системным прокси: 86 failed → 0 failed | — |
-| `kt1-p0` | `478491f`, `88f8a4e` | 2 файла, +216 | 3 failed → 3 passed; доп. 3: 3 failed, 2 passed → 5 passed | — |
+| `kt1-p0` | `478491f`, `88f8a4e`, `524ca44` | 2 файла, +281 −4 | 3 failed → 3 passed; доп. 3: 3 failed, 2 passed → 5 passed; доп. 6: 1 failed, 5 passed → 6 passed | — |
 | `kt1-typeerror` | `5f36433` | 2 файла, +166 −2 | 3 failed, 2 passed → 5 passed | — |
 | `kt1-loop` | `7e52bb0`, `f6b27e9` | 12 файлов, +1065 −172 | 5 failed, 2 passed → 7 passed; доп. 3: 2 failed, 1 passed → 3 passed | — (пулы метрик — константы: чтения 2 потока, записи 1) |
 | `kt1-budget` | `de086d6`, `5c385cd` | 3 файла, +463 −1 | 7 failed, 2 passed → 9 passed; доп. 2: 3 failed → 16 passed | `SEARCH_BUDGET_PER_HOUR`, `NEW_USERS_PER_DAY`, по умолчанию 0 — выключено |
@@ -30,24 +30,32 @@
 | `kt1-loop` `f6b27e9` (доп. 3) | 994 passed, 3 skipped | — |
 | `kt1-all` `bdafb14` | 1035 passed, 3 skipped | 1035 passed, 3 skipped |
 | `kt1-all` `aba9321` (доп. 3) | **1040 passed**, 3 skipped | **1040 passed**, 3 skipped |
+| `kt1-p0` `524ca44` (доп. 6) | 990 passed, 3 skipped | — |
+| `kt1-all` `699f40c` (доп. 6) | **1042 passed**, 3 skipped | — |
 
-1040 = 984 + 5 (p0) + 5 (typeerror) + 20 (telegram) + 16 (budget) + 10 (loop): тесты веток вместе не мешают друг другу.
+1040 = 984 + 5 (p0) + 5 (typeerror) + 20 (telegram) + 16 (budget) + 10 (loop): тесты веток вместе не мешают друг другу. Доп. 6: 990 = 989 + 1 (тест SQLite), 1042 = 1040 + 2 (тест SQLite и тест бюджета).
 
-`tests/test_loop_responsive.py` в паузе очереди: `kt1-loop` `f6b27e9` — 7 passed (опоздание таймера: живой поиск 24 мс, фон 14 мс, `/stats` 4 мс, история 18 мс); `kt1-all` `aba9321` — 7 passed (24, 13, 7, 32 мс). Порог — 100 мс.
+Доп. 6: полный pytest — 2026-11-08, 04:14–04:17, после коммита КТ0 `db84cc5` в `kt0-up` и двух пустых `pgrep -f 'loadtest.run|pytest'` подряд (в виде `[l]oadtest.run|[p]ytest`: голый шаблон ловит и сам цикл ожидания, и сторож сессии КТ0, в тексте которых есть эти слова); по одному, без прокси. Интерпретатор — `~/avia-scale/upstream/.venv` только на чтение (`PYTHONDONTWRITEBYTECODE=1`, `-p no:cacheprovider`): в нём есть `matplotlib`, нет `sklearn` — 3 skipped, как в строках выше. В `~/avia-scale/work/.venv` нет `matplotlib`, там `test_charts.py` пропускается целиком: `524ca44` — 986 passed, 4 skipped.
+
+`tests/test_loop_responsive.py` в паузе очереди: `kt1-loop` `f6b27e9` — 7 passed (опоздание таймера: живой поиск 24 мс, фон 14 мс, `/stats` 4 мс, история 18 мс); `kt1-all` `aba9321` — 7 passed (24, 13, 7, 32 мс); доп. 6, `kt1-all` `699f40c` (04:17, сразу после полного прогона, load 3,9) — 7 passed in 7.12s (32, 12, 6, 38 мс). Порог — 100 мс.
 
 Доп. 4 (16:20): `kt1-p0` `88f8a4e`, `kt1-loop` `f6b27e9` и этот файл (`47bd70e`) приёмщик принял по коду; полный pytest и `tests/test_loop_responsive.py` он повторит сам, когда очередь КТ0 встанет. П. 5 (пул записей и часы симулятора) — в разделе 5.
 
 Доп. 5 (21:20): прямой тест порядка записи и чтения принят вместо «один seed дважды» — делается при переносе gate (раздел 5). Полный pytest `kt1-p0`, `kt1-loop`, `kt1-all` и `tests/test_loop_responsive.py` приёмщик повторит сам после очереди КТ0.
 
+Доп. 6 (2026-11-08, 03:00): владелец решил закрыть последнюю дыру `kt1-p0` — исключение SQLite в проверках до `busy.add` оставляло `SEARCHING`. `kt1-p0` `524ca44`, влито в `kt1-all` (`699f40c`, конфликт 3); подробности — раздел 3, «Доп. 6».
+
 ## Пробная ветка `kt1-all` и порядок влития (доп. 2, п. 5)
 
 Порядок: `kt1-tests` → `kt1-typeerror` → `kt1-p0` → `kt1-telegram` → `kt1-budget` → `kt1-loop`, каждая — `merge --no-ff`. Сначала маленькие и независимые, потом `bot.py` по возрастанию площади правки, `kt1-loop` — последней, она самая широкая.
 
-Правки доп. 3 влиты в `kt1-all` повторно: `kt1-p0` (`88f8a4e`) → `8b70265`, `kt1-loop` (`f6b27e9`) → `aba9321`.
+Правки доп. 3 влиты в `kt1-all` повторно: `kt1-p0` (`88f8a4e`) → `8b70265`, `kt1-loop` (`f6b27e9`) → `aba9321`. Доп. 6: `kt1-p0` (`524ca44`) → `699f40c`.
 
 **Конфликт 1** — `kt1-budget` после `kt1-telegram`, `src/avia/bot.py`, сразу после `API = …`: обе ветки добавили туда свои константы и функции. Разрешение — оба блока подряд, без правки строк: сначала telegram (`TG_MAX_RETRIES`, `TG_MAX_RETRY_AFTER`, `TG_NO_RETRY_METHODS`, `_retry_after`), затем budget (`SEARCH_BUDGET_WINDOW_SECONDS`, `NEW_PEOPLE_FULL_TEXT`, `_local_day_start`). Коммит `56699b7`. Остальные пары `git merge-tree` сливает без конфликтов; `kt1-loop` легла на пять веток чисто (`bdafb14`).
 
 **Конфликт 2** — повторное влитие `kt1-p0` (`88f8a4e`), `src/avia/bot.py`: `kt1-p0` убрал обёртку `_run_search` / `_run_search_body`, а в `kt1-all` прямо перед ней стояли функции бюджета. Оставлены функции бюджета, старая обёртка убрана. Проверки бюджета стоят в `_run_search` до `busy.add`: отказ бюджета сам ставит `DONE` (`_refuse_over_budget`), как отказ по лимиту; `SEARCHING` снимается в `finally` сразу после `busy.discard`, повторы на 429 там выключены (`kt1-telegram`). Коммит `8b70265`; `kt1-loop` (`f6b27e9`) легла чисто (`aba9321`).
+
+**Конфликт 3** — доп. 6, влитие `kt1-p0` (`524ca44`), `src/avia/bot.py`, `_run_search`: `kt1-p0` взял проверку дневного лимита под `try`, а `kt1-budget` вставил перед ней `_search_budget_wait` / `_refuse_over_budget`, после — `_note_search_budget`. Разрешение (`bot.py:571–597` на `699f40c`): один `try` накрывает весь код до `busy.add` без `await` — `_search_budget_wait`, `try_use_search` (только если бюджет не исчерпан: сверх бюджета лимит человека не списывается, как в `kt1-budget`) и `_note_search_budget` (только если поиск пускаем). Отказы по бюджету и по лимиту — после `try`, тексты и порядок прежние; оба снимают `SEARCHING` до своего `await`. Тест на бюджет — только в `kt1-all` (раздел 3, «Доп. 6»). При влитии в `main` владелец встретит тот же конфликт: разрешение — как здесь.
 
 Проверено после разрешения: тесты трёх веток, правивших `bot.py` (`test_searching_reset.py`, `test_bot_budget.py`, `test_bot_telegram_limits.py`) — 35 passed на `aba9321`. Отказ по лимиту новых людей на кнопке идёт через `answerCallbackQuery` — с `kt1-telegram` он без повтора на 429 (`TG_NO_RETRY_METHODS`).
 
@@ -137,9 +145,38 @@ FAILED tests/test_searching_reset.py::test_press_while_deep_search_running_clear
 ```
 Каждая новая строка проверена откатом по одной: без `:499` падает тест лимита, без `:689` — тест исключения, без `:944` — `deep_error`.
 
+**Доп. 6 (`524ca44`): исключение до `busy.add`.** `users.try_use_search` ходит в SQLite до `busy.add`; на `88f8a4e` исключение там (`sqlite3.OperationalError: database is locked`) вылетало из обработчика кнопки (`asyncio` пишет «Task exception was never retrieved» без `chat_id`), шаг оставался `SEARCHING`, и на любой текст человек получал «⏳ Поиск ещё идёт» до `/start` или `/cancel`.
+- `_run_search` (`bot.py:495–504` на `524ca44`): проверка лимита под `try`; на исключение — `log.exception("не получилось начать поиск, chat_id=%s", …)`, `_leave_searching` и «⚠️ Не получилось начать поиск, попробуйте ещё раз.» Отказ по лимиту (`:505`) и отказ «занят» не менялись. Внутри `try` — только синхронная проверка, без `await`; тексты отказов уходят уже после `_leave_searching`.
+- В `kt1-all` (`699f40c`) под тем же `try` — `_search_budget_wait` и `_note_search_budget` (конфликт 3). `_search_budget_wait` считает в памяти (`self._budget_times`), в SQLite не ходит, но стоит до `busy.add` и тоже защищён.
+- Глубокий поиск не тронут: шаг `SEARCHING` он не ставит — действие `deep` в `dialog.py:702–717` возвращает `DeepSearchRequest`, шаг не меняя (после живого поиска он `DONE`), а чужой `SEARCHING` в это время принадлежит живому поиску, который его и снимет. Поэтому теста на глубокий поиск нет.
+
+**Доп. 6, RED** (`88f8a4e`) → **GREEN** `524ca44`, `tests/test_searching_reset.py::test_db_error_in_daily_limit_resets_searching` (`try_use_search` бросает `OperationalError` один раз: шаг не `SEARCHING`, `busy` пуст, текст ошибки, одна запись `avia.bot` с `exc_info` и `chat_id`; следующий поиск того же человека идёт):
+```
+src/avia/bot.py:497: in _run_search
+    and not self.users.try_use_search(chat_id, self.s.daily_search_limit)
+E           sqlite3.OperationalError: database is locked
+FAILED tests/test_searching_reset.py::test_db_error_in_daily_limit_resets_searching
+1 failed, 5 passed in 0.65s
+---
+6 passed in 0.91s
+```
+**Доп. 6, `kt1-all`**, `test_budget_error_resets_searching` (`_search_budget_wait` бросает `RuntimeError` один раз: то же плюс `total_searches == 0` — лимит не списан). RED — на копии `df6022e` (до влития) и на копии с «наивным» разрешением (под `try` только лимит из `kt1-p0`, бюджет снаружи); GREEN — `699f40c`:
+```
+df6022e:  src/avia/bot.py:577: E sqlite3.OperationalError: database is locked
+          src/avia/bot.py:571: E RuntimeError: бюджет сломан
+          2 failed, 5 passed in 0.55s
+наивное:  src/avia/bot.py:571: E RuntimeError: бюджет сломан
+          FAILED tests/test_searching_reset.py::test_budget_error_resets_searching
+          1 failed, 6 passed in 0.52s
+---
+699f40c:  tests/test_searching_reset.py tests/test_bot_budget.py — 23 passed in 0.84s
+```
+
 **Не проверено / замечания.**
 - Гонка нового нажатия: диалог ставит `SEARCHING` до проверки `busy`, между ними `await answerCallbackQuery`. Если первый поиск кончится в этом окне, его `finally` снимет `SEARCHING` нового нажатия; новый поиск идёт с шагом `DONE` — человек не застревает, но до конца поиска текст получает меню.
-- Ошибка SQLite в `users.try_use_search` (до `busy.add`) оставляет `SEARCHING`, как на `367f108`; обёртка `478491f` этот случай закрывала.
+- ~~Ошибка SQLite в `users.try_use_search` (до `busy.add`) оставляет `SEARCHING`, как на `367f108`; обёртка `478491f` этот случай закрывала.~~ Закрыто в доп. 6 (`524ca44`).
+- Доп. 6: в `kt1-all` `_note_search_budget` стоит в `try` после `try_use_search`; если бы он бросил, лимит человека уже списан, а поиска нет. Это копия списка в памяти, на практике не бросает; теста нет.
+- Доп. 6: проверки глубокого поиска до `busy.add` (`try_use_search`, в `kt1-all` и `_search_budget_wait`, `bot.py:860–877` на `699f40c`) не защищены: исключение там по-прежнему вылетает из обработчика кнопки без ответа человеку. `SEARCHING` при этом не застревает (глубокий поиск его не ставит), поэтому в доп. 6 не трогал.
 - Готовый результат глубокого поиска из кэша ставит `DONE` текущей сессии, даже если идёт живой поиск, — код владельца, успех, не трогал.
 - На `367f108` симптом был только у свободного текста: `/start`, `/cancel`, «Найти билет» и кнопка багажа работали.
 - `_run_deep_search` получил `_leave_searching` в `finally`; его отказы «занят» и по лимиту не менялись (отказ бюджета там ставит `DONE` сам — `kt1-budget`).
