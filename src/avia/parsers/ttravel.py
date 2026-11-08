@@ -37,7 +37,7 @@ from typing import Any
 from ..collector import Snapshot
 from ..models import Leg, Offer, Query
 from ..offers import compute_offer_id
-from . import register_parser
+from . import ParsedOffers, register_parser
 from .travelpayouts import format_duration
 
 logger = logging.getLogger(__name__)
@@ -277,6 +277,7 @@ def parse_ttravel(snapshot: Snapshot, query: Query) -> list[Offer]:
 
     url = _build_search_url(query, snapshot)
     offers: list[Offer] = []
+    total = 0  # офферов во всех ответах; кривые пропускаем
 
     for _, body in streaming_payloads:
         try:
@@ -301,6 +302,7 @@ def parse_ttravel(snapshot: Snapshot, query: Query) -> list[Offer]:
 
         is_roundtrip = bool(query and query.return_date)
 
+        total += len(offers_raw)
         for offer_raw in offers_raw:
             if not isinstance(offer_raw, dict):
                 continue
@@ -422,7 +424,7 @@ def parse_ttravel(snapshot: Snapshot, query: Query) -> list[Offer]:
                 continue
 
     offers.sort(key=lambda o: o.price)
-    return offers
+    return ParsedOffers(offers, total=total, skipped=total - len(offers))
 
 
 parse_ttravel.results_complete = results_complete  # type: ignore[attr-defined]

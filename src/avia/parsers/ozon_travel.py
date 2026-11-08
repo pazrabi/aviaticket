@@ -11,7 +11,7 @@ import urllib.parse
 from ..collector import Snapshot
 from ..models import Leg, Offer, Query
 from ..offers import compute_offer_id
-from . import register_parser
+from . import ParsedOffers, register_parser
 from .travelpayouts import format_duration
 
 logger = logging.getLogger(__name__)
@@ -444,6 +444,7 @@ def parse_ozon_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
     if has_async_error and not best_flights:
         return []
 
+    total = len(best_flights) if best_flights else 0  # карточек в выдаче; кривые пропускаем
     if best_flights:
         offers: list[Offer] = []
         for card in best_flights:
@@ -567,7 +568,7 @@ def parse_ozon_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
 
             result_offers = list(offers_by_id.values())
             result_offers.sort(key=lambda o: o.price)
-            return result_offers
+            return ParsedOffers(result_offers, total=total, skipped=total - len(offers))
 
     # Запасной разбор по тексту страницы (snapshot.text),
     # срабатывает ТОЛЬКО когда по JSON не получилось ни одного оффера
@@ -575,9 +576,9 @@ def parse_ozon_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
     if text:
         text_offers = _parse_ozon_travel_text(text, query)
         logger.info("ozon: разобрано %d карточек из текста страницы (нет JSON)", len(text_offers))
-        return text_offers
+        return ParsedOffers(text_offers, total=total, skipped=total)
 
-    return []
+    return ParsedOffers(total=total, skipped=total)
 
 
 parse_ozon_travel.results_complete = results_complete  # type: ignore[attr-defined]

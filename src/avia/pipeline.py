@@ -328,6 +328,9 @@ async def _process_snapshot(
                 offers = await parser(snap, q)
             else:
                 offers = parser(snap, q)
+        skipped = getattr(offers, "skipped", 0)
+        if skipped:
+            log.warning("Сайт %s: пропущено %d из %d элементов выдачи", site.name, skipped, offers.total)
         for o in offers:
             o.site = site.name
         checker = getattr(parser, "results_complete", None)
