@@ -1158,7 +1158,7 @@ def parse_yandex_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
     if text:
         text_offers = _parse_yandex_travel_text(text, query)
         logger.info("yandex: разобрано %d карточек из текста страницы (нет JSON)", len(text_offers))
-        return ParsedOffers(text_offers, total=total, skipped=skipped)
+        return ParsedOffers(text_offers, total=total + len(text_offers), skipped=skipped)
 
     return ParsedOffers(total=total, skipped=skipped)
 

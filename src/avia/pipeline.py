@@ -45,6 +45,14 @@ EMPTY_RETRY_DELAY: float = 3.0
 # Минимальный интервал между быстрыми разборами в evaluate (сек)
 PARSER_MIN_INTERVAL: float = 1.0
 
+# Имя отладочного снимка пустой выдачи: {сайт}_{tag}_{ГГГГММДД_ЧЧММСС}.json (см. _save_empty_snapshot)
+DEBUG_SNAPSHOT_NAME = re.compile(r"[\w.-]+_(?:empty|wrongdates|short)_\d{8}_\d{6}\.json")
+# Время билета: ЧЧ:ММ; дата-время: ГГГГ-ММ-ДДTЧЧ:ММ (дальше могут идти секунды и пояс)
+_CLOCK_TIME = re.compile(r"(?:[01]?\d|2[0-3]):[0-5]\d")
+_ISO_MINUTE = re.compile(r"\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|2[0-3]):[0-5]\d")
+# Сколько символов короткой страницы показать в ошибке «сайт не отдал выдачу»
+SHORT_PAGE_EXCERPT_CHARS = 60
+
 
 def _attempt_role(role: str | None, attempt_tracker: list[int] | None) -> str:
     """Роль попытки: hedge как есть, иначе primary для первой попытки сайта и retry для следующих."""
@@ -234,10 +242,40 @@ def _save_empty_snapshot(
             flags=re.I,
         )
         target.write_text(content, encoding="utf-8")
+        _prune_debug_snapshots(debug_dir, int(getattr(settings, "debug_snapshots_max", 100) or 0))
         return target
     except Exception as e:
         log.warning("Не удалось сохранить отладочный снимок для %s: %s", site.name, e)
         return None
+
+
+def _drop_debug_snapshot(exc: ParserEmptyError) -> None:
+    """Удаляет отладочный снимок попытки, за которой последует повтор."""
+    if exc.snapshot_path and exc.snapshot_path.exists():
+        try:
+            exc.snapshot_path.unlink()
+        except OSError:
+            pass
+
+
+def _prune_debug_snapshots(debug_dir: Path, keep: int) -> None:
+    """Оставляет в debug_dir не больше keep снимков пустой выдачи, удаляя самые старые.
+
+    Трогает только файлы с именем снимка (DEBUG_SNAPSHOT_NAME) в самом debug_dir, без рекурсии;
+    keep <= 0 — без предела.
+    """
+    if keep <= 0:
+        return
+    try:
+        snaps = [
+            p for p in debug_dir.iterdir()
+            if DEBUG_SNAPSHOT_NAME.fullmatch(p.name) and p.is_file() and not p.is_symlink()
+        ]
+        snaps.sort(key=lambda p: (p.stat().st_mtime, p.name))
+        for old in snaps[:-keep]:
+            old.unlink(missing_ok=True)
+    except OSError as e:
+        log.warning("Не удалось почистить отладочные снимки в %s: %s", debug_dir, e)
 
 
 def filter_wrong_dates(offers: list[Offer], q: Query) -> tuple[list[Offer], int]:
@@ -271,6 +309,37 @@ def filter_wrong_dates(offers: list[Offer], q: Query) -> tuple[list[Offer], int]
         kept.append(offer)
 
     return kept, dropped
+
+
+def _has_bad_time(offer: Offer) -> bool:
+    """Время в билете есть, но не ЧЧ:ММ (дата-время — не ГГГГ-ММ-ДДTЧЧ:ММ): элемент выдачи кривой.
+
+    Пустое время или его отсутствие — время неизвестно, билет остаётся. Проверяются оба плеча.
+    """
+    back = getattr(offer, "back", None)
+    for leg in (offer, back) if back is not None else (offer,):
+        for value in (leg.depart_time, leg.arrive_time):
+            if value and not (isinstance(value, str) and _CLOCK_TIME.fullmatch(value)):
+                return True
+        for value in (leg.depart_at, leg.arrive_at):
+            if value and not (isinstance(value, str) and _ISO_MINUTE.match(value)):
+                return True
+    return False
+
+
+def _has_json_answer(snap: Snapshot) -> bool:
+    """JSON-ответ — перехваченный ответ сайта (snap.json_payloads), тело которого разбирается как JSON."""
+    for _url, body in snap.json_payloads or []:
+        try:
+            json.loads(body)
+        except (TypeError, ValueError):
+            continue
+        return True
+    return False
+
+
+def _page_excerpt(text: str) -> str:
+    return " ".join(text.split())[:SHORT_PAGE_EXCERPT_CHARS] or "пустая страница"
 
 
 async def _from_api(site: SiteConfig, q: Query, settings: Settings) -> tuple[list[Offer], str | None]:
@@ -328,9 +397,12 @@ async def _process_snapshot(
                 offers = await parser(snap, q)
             else:
                 offers = parser(snap, q)
-        skipped = getattr(offers, "skipped", 0)
+        total = getattr(offers, "total", 0) or len(offers)
+        good_time = [o for o in offers if not _has_bad_time(o)]
+        skipped = getattr(offers, "skipped", 0) + len(offers) - len(good_time)
+        offers = good_time
         if skipped:
-            log.warning("Сайт %s: пропущено %d из %d элементов выдачи", site.name, skipped, offers.total)
+            log.warning("Сайт %s: пропущено %d из %d элементов выдачи", site.name, skipped, total)
         for o in offers:
             o.site = site.name
         checker = getattr(parser, "results_complete", None)
@@ -358,6 +430,14 @@ async def _process_snapshot(
             snap_path = _save_empty_snapshot(site, snap, settings)
             raise ParserEmptyError(
                 "формат выдачи мог измениться, 0 вариантов при непустой странице",
+                page_url=snap.url,
+                snapshot_path=snap_path,
+            )
+        # SHORT_PAGE_FAIL: короткая страница (не длиннее 200 символов) без JSON-ответов — сайт не отдал выдачу
+        if getattr(settings, "short_page_fail", False) and not is_captcha and not _has_json_answer(snap):
+            snap_path = _save_empty_snapshot(site, snap, settings, tag="short")
+            raise ParserEmptyError(
+                f"сайт не отдал выдачу: «{_page_excerpt(text_stripped)}»",
                 page_url=snap.url,
                 snapshot_path=snap_path,
             )
@@ -402,6 +482,7 @@ def _quick_parse_offers(site: SiteConfig, snap: Snapshot, q: Query) -> list[Offe
         offers = parser(snap, q)
     if not offers or not isinstance(offers, list):
         return []
+    offers = [o for o in offers if not _has_bad_time(o)]
     offers, _ = filter_wrong_dates(offers, q)
     return offers
 
@@ -1205,11 +1286,6 @@ async def _run_site(
             try:
                 return await _fetch_browser()
             except ParserEmptyError as exc:
-                if exc.snapshot_path and exc.snapshot_path.exists():
-                    try:
-                        exc.snapshot_path.unlink()
-                    except OSError:
-                        pass
                 if phone_enabled(settings, site):
                     cand_list = [
                         c
@@ -1231,9 +1307,15 @@ async def _run_site(
                         deep=deep,
                     ):
                         raise
+                    # снимок удаляем, только когда повтор точно пойдёт на другой телефон; иначе он остаётся владельцу
+                    if cand_list:
+                        _drop_debug_snapshot(exc)
                 elif _hit_time_cap(priority, stats, actual_wait_sec):
                     # упёрлись в лимит ожидания: повтор потратит столько же времени и даст то же
                     raise
+                else:
+                    # без телефонов повтор идёт тем же браузером и при неудаче оставит свой снимок — как раньше
+                    _drop_debug_snapshot(exc)
                 bad_dev = stats.get("device")
                 log.warning(
                     "Сайт %s вернул 0 вариантов (%s), повторная попытка через %s с (без телефона %s)",

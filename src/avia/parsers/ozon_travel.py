@@ -142,6 +142,8 @@ def _parse_leg(details: Any, base_date: Any) -> dict[str, Any]:
     duration = _parse_duration(dur_obj.get("text") if isinstance(dur_obj, dict) else None)
     transfers, layovers = _parse_transfers_and_layovers(details.get("transfers"))
     return {
+        # время в карточке есть, но не разобралось — кривая карточка (пустое время — неизвестно, не кривое)
+        "bad_time": bool(time_text.strip()) and not dep_time,
         "depart_time": dep_time,
         "arrive_time": arr_time,
         "depart_at": dep_at,
@@ -488,12 +490,16 @@ def parse_ozon_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
                         airline = a_text.strip() or None
 
                 there = _parse_leg(card.get("wayThereDetails"), query.depart if query is not None else None)
+                if there["bad_time"]:
+                    continue
                 back_info = None
                 if round_trip:
                     back_details = card.get("wayBackDetails")
                     if not isinstance(back_details, dict):
                         continue
                     back_info = _parse_leg(back_details, query.return_date)
+                    if back_info["bad_time"]:
+                        continue
 
                 luggage_obj = card.get("luggageText")
                 baggage = _parse_baggage(luggage_obj)
@@ -576,7 +582,7 @@ def parse_ozon_travel(snapshot: Snapshot, query: Query) -> list[Offer]:
     if text:
         text_offers = _parse_ozon_travel_text(text, query)
         logger.info("ozon: разобрано %d карточек из текста страницы (нет JSON)", len(text_offers))
-        return ParsedOffers(text_offers, total=total, skipped=total)
+        return ParsedOffers(text_offers, total=total + len(text_offers), skipped=total)
 
     return ParsedOffers(total=total, skipped=total)
 
