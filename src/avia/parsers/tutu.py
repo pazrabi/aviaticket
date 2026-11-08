@@ -736,6 +736,7 @@ def parse_tutu(snapshot: Snapshot, query: Query) -> list[Offer]:
             continue
         off_id = str(offer.get("id") or _offer_id)
         if off_id in seen_offer_ids:
+            made += 1  # дубль id — не кривой элемент
             continue
         seen_offer_ids.add(off_id)
         try:
