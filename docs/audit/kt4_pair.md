@@ -9,7 +9,7 @@
 | Файл | Что |
 |---|---|
 | `tests/test_speed_pair_breakdown.py` (новый) | 12 тестов: 8 сценариев (3 — `xfail(strict=True)`), сверка таблицы ниже, проба после карантина (обычный и капча) и пара с короткой историей |
-| `src/` | не менялся: `git diff --stat 74854fa -- src` пуст |
+| `src/` | не менялся: `git diff --stat 74854fa -- src` пуст (до П35; правка — в разделе «П35») |
 
 Как считаем. История за 7 дней: у A и B по 50 удачных сборов живого поиска, A быстрее (4 с против 8 с), поэтому до поломки A первая. Дальше A ломается. Запрос — строка `site_runs` пары A с `priority = 0`, раз в минуту. Строки пишем так же, как бот: провал — `ok = 0`, капча — `captcha = 1`, partial без билетов — `ok = 1, partial = 1, offers = 0`. После каждой записи `droidhub._record_failure` сбрасывает кэш таблицы (`invalidate`, `droidhub.py:1242–1244`), поэтому в тесте таблица пересчитывается после каждого запроса. Число в таблице — номер запроса, после которого A перестаёт быть первой.
 
@@ -107,5 +107,201 @@ backup_list.sort(key=lambda x: (self.get_stats(site_name, x[0], "live", now=now)
 
 ## Что не сделано
 
-- Код правки `speed.py` — по заданию только после решения приёмщика.
+- Код правки `speed.py` — по заданию только после решения приёмщика. *(Сделано под флагом — раздел «П35».)*
 - Влияние окна 15 на прод (сколько раз здоровая пара уйдёт в запасные) — оценка по модели выше; фактическая доля успехов пар за 7 дней видна в `/admin` → «Сайт × телефон».
+
+## П35
+
+**Задание:** приёмщик, 2026-11-08 — П35 принят пользователем («Да, П35»). Правка `speed.py` под флагом поверх `95c8a4d`, та же ветка `kt4-pair`. Это предложения 1 и 2 выше.
+
+| Коммит | Что |
+|---|---|
+| `c0e65fe` | `tests/test_speed_pair_breakdown.py` — RED на `95c8a4d` |
+| `4514dd9` | код: флаг `SPEED_PAIR_WINDOW` |
+| этот | отчёт |
+
+`git diff --numstat 95c8a4d 4514dd9`:
+
+| Файл | Строк | Что и где (строки — на `4514dd9`) |
+|---|---|---|
+| `src/avia/config.py` | +17 | константы `SPEED_PAIR_WINDOW_DEFAULT = 30`, `SPEED_PAIR_WINDOW_MIN = 5` и `normalize_pair_window` (13–25); поле `Settings.speed_pair_window` (151–152); чтение `SPEED_PAIR_WINDOW` в `load_settings` (269) и передача в `Settings` (473) |
+| `src/avia/speed.py` | +21 −6 | импорт (15); `pair_window(settings)` (31–36); `refresh`: `window = pair_window(settings)` (110), `r_list[-30:]` → `r_list[-window:]` (338, комментарий 333); `order_candidates`: строки в docstring (549–550), `weak_backups_last` (568), признак `proven_weak` у запасных (576, 587–588), сортировка запасных (602–605) |
+| `tests/test_speed_pair_breakdown.py` | +238 −15 | 53 теста (было 12): 47 обычных, 6 `xfail(strict=True, raises=AssertionError)` |
+
+Пороги `speed.py` по умолчанию (`speed_min_samples`, `speed_live_min_p_lower`, карантин, кулдауны капчи), `sites.yaml` и стадии сайтов не тронуты. `kt4-parsers` не тронут.
+
+### Флаг
+
+- **Включить:** `SPEED_PAIR_WINDOW=15` в `.env` бота и перезапуск: флаг читается в `load_settings` при старте.
+- **Откатить:** убрать строку или поставить `SPEED_PAIR_WINDOW=30`, затем перезапуск.
+- **Значения.** Целое не меньше 5. Мусор, пусто или меньше 5 — 30, то есть флаг выключен. Проверка одна: `normalize_pair_window`, ею пользуются и `load_settings`, и `speed.py`, так что `Settings(speed_pair_window=3)` тоже даст 30.
+- **Не задан или 30 — как было.** Окно `r_list[-30:]`, сортировка запасных — только по цене C. У всех запасных признак `proven_weak` = False, первый ключ сортировки одинаковый, порядок прежний. `test_window_unset_30_and_invalid_give_identical_routing` сверяет на каждом из 30 запросов трёх сценариев (флаг не задан, 30 и 4):
+  - раскладки живого поиска и фона (порядок, терпение, `preferred_count`);
+  - `SpeedStats` по обоим классам;
+  - `PairStatus`.
+- **Что меняет значение не 30.**
+  1. **Окно.** Доля успехов пары (`n`, `ok_count`, `p`, `p_lower`, цена C, `ok_rate` в `/admin` → «Сайт × телефон») считается по последним N сборам пары за `speed_window_days`, а не по 30.
+  2. **Запасные живого поиска** (`priority = 0`). Доказанно слабая пара (`n ≥ speed_min_samples` и `p_lower < speed_live_min_p_lower`) идёт после непроверенной (`n < speed_min_samples`). Внутри каждой группы — по цене C, как раньше. Карантин и ожидание пробы — в самом конце, как сейчас.
+
+  `test_live_backups_weak_after_unproven_only_under_flag` проверяет сортировку на кандидатах A (слабая), B (непроверенная), C (карантин), D (ждёт пробы):
+
+  | Окно | Порядок |
+  |---|---|
+  | не задано или 30 | `[A, B, C, D]` |
+  | 15 или 20 | `[B, A, C, D]` |
+
+  Подписки и фон этой сортировкой не затронуты (`test_backup_sort_does_not_touch_subscriptions_and_background`).
+
+### Таблица сценариев при 30 и 15
+
+Те же сценарии и та же модель, что в «Таблице сценариев» выше. Числа держит `test_breakdown_table_matches_report` (флаг не задан, 30, 15).
+
+| Сценарий | Не задан / 30 | 15 | Порог ≤ 10 при 15 |
+|---|---|---|---|
+| ломается совсем | 3 | 3 | ✅ |
+| капча на первом же сборе | 1 | 1 | ✅ |
+| через раз | 20 (`xfail`) | **8** | ✅ |
+| два провала из трёх | 14 (`xfail`) | **5** | ✅ |
+| partial без билетов подряд | 3 | 3 | ✅ |
+| короткая история A, у B 50 сборов | 0 | 0 | ✅ |
+| короткая история у A и B, A ломается совсем | 3 | **2** | ✅ |
+| доп.: через раз, у B меньше 5 сборов | не выведена за 60 (`xfail`) | **8** | ✅ |
+
+При 15 все 8 сценариев — обычные тесты (`test_broken_pair_withdrawn_within_10_requests_window_15`). Без флага и при 30 три сценария, как и раньше, — `xfail(strict=True)`, теперь с `raises=AssertionError`: чужая ошибка (`TypeError` и т.п.) не сойдёт за ожидаемое падение.
+
+Откуда 2 в «короткой истории у обоих». После 2-го провала у A 5 сборов (3 удачных и 2 провала) и `p_lower` < 0,6. Это доказанно слабая пара, и она встаёт после B, у которой 3 сбора. Без флага A держится первой по цене C до карантина на 3-м провале.
+
+### Цена для здоровой пары
+
+Пара A с 90 % успехов: исходы случайные, `random.Random(7)`, 1000 запросов раз в минуту. A пробуют на каждом запросе, как в модели работы 3. У B 50 удачных сборов, B медленнее. «Не первая» — B стоит первой, хотя A здорова.
+
+| Окно | A не первая | Из них `p_lower` < 0,6 | Из них карантин |
+|---|---|---|---|
+| 30 | **1 из 1000 (0,1 %)** | 0 | 1 |
+| 15 | **67 из 1000 (6,7 %)** | 66 | 1 |
+
+- В выборке 107 провалов из 1000 (10,7 %). Модель работы 3 (20 000 запросов, только формула) давала 0,1 % и 5,7 %.
+- Граница в `test_price_healthy_pair_90_percent_not_first_share`: при 30 — не больше 1 %, при 15 — не больше 10 %, и при 15 не меньше, чем при 30.
+- «Не первая» — не потеря сайта: запрос идёт на B. Цена — только скорость: B медленнее A.
+
+### Тесты владельца при флаге 15
+
+`tests/test_speed_routing.py` при флаге 15 — **20 passed**, как и без флага (20 passed). Ни один не упал.
+
+Как гонял. Разовый плагин в scratchpad сессии (не в ветке): каждый `Settings(...)` без явного `speed_pair_window` получает 15. Плюс `SPEED_PAIR_WINDOW=15` в окружении — для `load_settings()`.
+
+```python
+import avia.config as _config
+_ORIGINAL_INIT = _config.Settings.__init__
+def _init_with_window_15(self, *args, **kwargs):
+    kwargs.setdefault("speed_pair_window", 15)
+    _ORIGINAL_INIT(self, *args, **kwargs)
+_config.Settings.__init__ = _init_with_window_15
+```
+
+```
+PYTHONPATH=<каталог плагина>:src SPEED_PAIR_WINDOW=15 python -B -m pytest -q -p no:cacheprovider -p p35_window15 tests/test_speed_routing.py tests/test_speed_pair_breakdown.py::test_settings_speed_pair_window_default
+FAILED tests/test_speed_pair_breakdown.py::test_settings_speed_pair_window_default   ← контроль: assert 15 == 30, плагин действует
+1 failed, 20 passed in 0.39s
+```
+
+Почему ничего не изменилось:
+
+- **Окно.** У пар в этих тестах не больше 10 сборов, и окно 15 их не обрезает. Исключение — пара на `other_site` с 2050 удачными сборами, там окно 15 и 30 дают одно и то же.
+- **Сортировка запасных** итог этих тестов не меняет.
+- **Без настроек.** `test_migration_priority_column_old_db` строит `SpeedTable` без настроек и считает с окном 30 при любом флаге.
+
+### Подписки и фон (`priority > 0`)
+
+По тесту окно 15 у фона сдвигает момент, когда пара становится ненадёжной: порядок «через раз» A тот же, `[B, A]`, но A теряет 60-секундное терпение (`patience 60 → 0`, `preferred_count 1 → 2`) после 8-го запроса, а не после 20-го (`test_background_order_alternate_pair_window_15`). Окно меняет у фона и цену C, по которой он делит пары на медленные и быстрые, но в этом сценарии деление то же.
+
+**Находка, не правил.** Так `speed.py` владельца устроен и без флага: когда у фона нет быстрых пригодных пар, ненадёжная пара стоит последней, но с терпением 0 и попадает в «основные» (`preferred_count` = весь список). Пока B занята, фон берёт ненадёжную A сразу. Здоровую быструю A он ждал бы 60 с. Решение — за владельцем.
+
+### Что смотреть владельцу до и после
+
+Снять за 7 дней до включения и за 1–2 дня после.
+
+- **«Здоровье»** (`/admin` → «🩺 Здоровье»): последние 5 запусков на каждом телефоне по сайтам. После включения пары, которые идут «через раз», реже стоят первыми у людей. У здоровых пар значки не должны чаще мигать ❌.
+- **`prod_stats.py`** (`~/avia-scale/work/docs/review/prod_stats.py`, запуск — по шапке файла, JSON — в `~/avia-scale/prod_stats/<дата>.json`):
+  - `attempts.by_site_device_source` — исходы попыток по ключу «сайт|телефон|источник». Для `user` смотреть долю `ok`/`partial` и долю капчи по парам. Ожидание: у пар, которые проваливаются через раз, попыток людей меньше, а доля успехов у людей по сайту выше.
+  - `searches.fast.sites_ok_mean` — среднее число сайтов с ценами на быстрый поиск. Не должно упасть. Если упало или выросла доля капчи на запасных телефонах — откатить флаг.
+- Там же: `/admin` → «Сайт × телефон» — `ok_rate` и `n` пары теперь по последним 15 сборам.
+
+### RED / GREEN
+
+RED — итоговый `tests/test_speed_pair_breakdown.py` (`c0e65fe`) на коде `95c8a4d`:
+
+```
+..xx...xFFFFFFFFFFFFFFFF.FF...FFF.FFFFF.FFFFFFFFFFFFF                    [100%]
+FAILED ...::test_broken_pair_withdrawn_within_10_requests[window_30-*]            ×8
+FAILED ...::test_broken_pair_withdrawn_within_10_requests_window_15[*]            ×8
+FAILED ...::test_breakdown_table_matches_report[window_30], [window_15]
+FAILED ...::test_window_unset_30_and_invalid_give_identical_routing[*]            ×3
+FAILED ...::test_live_backups_weak_after_unproven_only_under_flag[window_30|15|20]
+FAILED ...::test_backup_sort_does_not_touch_subscriptions_and_background
+FAILED ...::test_price_healthy_pair_90_percent_not_first_share
+FAILED ...::test_background_order_alternate_pair_window_15[window_15]
+FAILED ...::test_settings_speed_pair_window_default
+FAILED ...::test_load_settings_speed_pair_window[*]                                ×11
+XFAIL  ...::test_broken_pair_withdrawn_within_10_requests[window_unset-alternate|two_of_three|alternate_short_b]
+39 failed, 11 passed, 3 xfailed in 2.43s
+
+  27 E       TypeError: Settings.__init__() got an unexpected keyword argument 'speed_pair_window'
+  12 E       AttributeError: 'Settings' object has no attribute 'speed_pair_window'
+```
+
+11 passed — то, что от флага не зависит:
+
+- 5 сценариев без флага;
+- таблица без флага;
+- сортировка без флага;
+- фон без флага;
+- короткая история;
+- обе пробы после карантина.
+
+GREEN на `4514dd9`: **47 passed, 6 xfailed in 7.41s**. Все числа, заданные в тестах до кода, совпали: таблица при 15, фон 20 и 8. Самый долгий — тест цены, 4,4 с.
+
+### pytest
+
+Без прокси, `~/avia-scale/upstream/.venv`, `-B`, `-p no:cacheprovider`. Перед каждым запуском `pgrep -f '[l]oadtest.run|[-]m pytest'` пуст: ждал, пока закончатся чужие pytest из другого проекта.
+
+| Код | Результат | Время |
+|---|---|---|
+| `kt4-pair` `95c8a4d` | 1089 passed, 3 skipped, 3 xfailed in 31,44 s | 19:55:32–19:56:04 |
+| `kt4-pair` `4514dd9` | **1127 passed, 3 skipped, 6 xfailed** in 38,09 s | 20:49:27–20:50:05 |
+
+- +41 = 53 − 12 тестов в `test_speed_pair_breakdown.py`.
+- 6 `xfail` — те же 3 сценария, что и раньше, при флаге «не задан» и «30»: без флага порог П9 так и не выполняется. Скрыто ничего нет.
+- 3 skipped — тесты владельца, `tests/test_forecast.py:344, 397, 425`, «could not import 'sklearn'».
+
+### gate quick
+
+`cd ~/avia-scale/kt0-up && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=~/avia-scale/kt4-pair/src:~/avia-scale/kt0-up ~/avia-scale/kt0-up/.venv/bin/python -m loadtest.gate --profile quick --tag _kt4w --results ~/avia-scale/kt4-pair/.sim_results`.
+
+- Без прокси, флаг выключен: `SPEED_PAIR_WINDOW` не задан, снят и `env -u`.
+- Перед прогоном `pgrep` пуст.
+- JSON — в `.sim_results/*_kt4w.json`, не в git. `kt0-up` после прогона не изменился (`git status` пуст).
+
+| Код | Код выхода | Время |
+|---|---|---|
+| `4514dd9` | **0, 8/8 ok** | 20:50:05–20:50:27 |
+
+```
+профиль quick, база 9ba5ae37bc14af588021af11b5c2e3d23287d1b4, эталон *_v8base.json, код /Users/a1/avia-scale/kt4-pair/src (4514dd9), JSON /Users/a1/avia-scale/kt4-pair/.sim_results/*_kt4w.json
+| прогон | метрика | порог | факт | ok |
+|---|---|---|---|---|
+| A 10/2 | card_latency.n | ≥ 10 | 10 | ok |
+| A 10/2 | card_latency.p95 | ≤ 103 | 90.3 | ok |
+| A 10/2 | card_latency.max | ≤ 103 | 90.3 | ok |
+| A 10/2 | card_sites.mean | ≥ 0.81 | 0.9 | ok |
+| A 50/4 | card_latency.n | ≥ 50 | 50 | ok |
+| A 50/4 | card_latency.p95 | ≤ 104 | 90.5 | ok |
+| A 50/4 | card_latency.max | ≤ 110 | 90.6 | ok |
+| A 50/4 | card_sites.mean | ≥ 0.55 | 0.6 | ok |
+```
+
+### Что не сделано
+
+- `gate --profile quick` с флагом 15 не гонял: в задании — при выключенном. `gate full` тоже не гонял: по П33 он один раз, перед передачей пачки владельцу.
+- Влияние на прод — только по модели и тестам. Ответ даст `prod_stats.py` до и после.
+- Находку про ненадёжную пару в фоне не правил.
