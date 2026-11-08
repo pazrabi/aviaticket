@@ -37,6 +37,7 @@ from avia.bot import Bot
 from avia.config import Settings, load_settings
 from avia.criteria import SearchCriteria
 from avia.models import Offer, Query, SiteResult
+from avia.parsers import travelpayouts as tp_client
 from avia.scheduler import Scheduler
 from avia.subscriptions import SubscriptionStore, poll_interval_seconds
 
@@ -51,6 +52,7 @@ T0 = 1_800_000_000.0
 PRICE = 10000
 TICK = 300.0  # Scheduler.run_forever: шаг планировщика владельца
 LOGGER = "avia.sub_prefilter"
+REAL_FETCH = tp_client.fetch_travelpayouts  # до подмены в тестах
 
 
 class FakeClock:
@@ -588,7 +590,7 @@ async def test_safety_full_hours_from_settings(tmp_path, monkeypatch):
 
 
 def zero_counts() -> dict[str, int]:
-    return {"skip": 0, "changed": 0, "unknown": 0, "full": 0, "error": 0}
+    return {"skip": 0, "changed": 0, "threshold": 0, "unknown": 0, "full": 0, "error": 0}
 
 
 @pytest.mark.parametrize("full_intervals", [2, 3, 4, 6])
@@ -620,6 +622,9 @@ def test_decide_branches():
     assert sub_prefilter.decide(PRICE, None, 5.0) == sub_prefilter.Decision(True, "unknown")
     assert sub_prefilter.decide(PRICE, 10500, 5.0) == sub_prefilter.Decision(True, "changed")
     assert sub_prefilter.decide(PRICE, 10499, 5.0) == sub_prefilter.Decision(False, "skip")
+    assert sub_prefilter.decide(PRICE, 9800, 5.0, threshold=9800) == sub_prefilter.Decision(True, "threshold")
+    assert sub_prefilter.decide(9900, PRICE, 5.0, threshold=9900) == sub_prefilter.Decision(True, "threshold")
+    assert sub_prefilter.decide(PRICE, 9800, 5.0, threshold=9799) == sub_prefilter.Decision(False, "skip")
 
 
 # --- /admin → «Парсинг»: счётчик пропусков ---------------------------------------------------------------------
@@ -680,9 +685,150 @@ def test_admin_line_counts_and_since_start():
     line = pf.admin_line(T0 - DAY)
     assert line.startswith("Предфильтр подписок: проверок 6 · пропущено 2 · собрано 4")
     assert "кэш изменился 1" in line and "кэш не знает 1" in line and "страховочный 1" in line and "ошибка кэша 1" in line
+    assert "у порога 0" in line
     assert "с запуска" in line  # счётчик в памяти: после перезапуска — с нуля
     assert "с запуска" not in pf.admin_line(T0 + 1)
     assert pf.counts(T0 + 2) == {**zero_counts(), "changed": 1, "unknown": 1, "full": 1, "error": 1}
+
+
+# --- по ревью: порог человека, лимит API, туда-обратно, отмена, валюта ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "threshold, cache_price, collect",
+    [
+        (9800, 9750, True),  # кэш −2,5 % (меньше 5 %), но ниже порога: собираем, уведомление «ниже порога» — сразу
+        (12000, PRICE, True),  # порог поставлен выше текущей цены: собранная уже ниже порога — собираем, как сейчас
+        (9000, PRICE, False),  # порог ниже и кэша, и собранной — пропуск
+    ],
+    ids=["cache-at-threshold", "last-below-threshold", "threshold-below-both"],
+)
+@pytest.mark.asyncio
+async def test_threshold_of_person_collects(tmp_path, monkeypatch, threshold, cache_price, collect):
+    w = make_world(tmp_path, monkeypatch)
+    sub = await collected(w)
+    assert w.store.set_threshold(sub.id, 101, threshold)
+    w.cache.set_prices(cache_price)
+    w.phones.set_price(cache_price)
+
+    await next_check(w, sub.id)
+
+    assert len(w.phones.calls) == (2 if collect else 1)
+    assert w.prefilter.counts(T0)["threshold" if collect else "skip"] == 1
+    if collect:
+        assert len(w.notes.sent) == 1 and "ниже вашего порога" in w.notes.sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_429_no_cache_requests_for_10_minutes(tmp_path, monkeypatch):
+    mono = FakeMonotonic()
+    w = make_world(tmp_path, monkeypatch, mono=mono)
+    sub = await collected(w)
+    w.cache.error = httpx.HTTPStatusError(
+        "429 Too Many Requests",
+        request=httpx.Request("GET", tp_client.ENDPOINT),
+        response=httpx.Response(429),
+    )
+
+    await next_check(w, sub.id)
+    assert len(w.cache.calls) == 1 and len(w.phones.calls) == 2
+
+    w.cache.error = None
+    mono.advance(599)
+    await next_check(w, sub.id)
+    assert len(w.cache.calls) == 1 and len(w.phones.calls) == 3  # лимит: кэш не спрашиваем, собираем, как сейчас
+    mono.advance(2)
+    await next_check(w, sub.id)
+    assert len(w.cache.calls) == 2 and len(w.phones.calls) == 3  # через 10 минут — снова кэш, изменения нет
+    assert w.prefilter.counts(T0)["error"] == 2
+
+
+RT = Query(origin="MOW", destination="LED", depart=date(2027, 2, 1), return_date=date(2027, 2, 8))
+RT_PAYLOAD = {
+    "success": True,
+    "currency": "rub",
+    "data": [
+        {"price": PRICE, "airline": "SU", "departure_at": "2027-02-01T07:15:00+03:00", "return_at": "2027-02-08T19:00:00+03:00",
+         "transfers": 0, "duration": 180, "link": "/search/MOW0102LED08021"},
+    ],
+}
+
+
+@pytest.mark.asyncio
+async def test_round_trip_through_real_fetch_without_network(tmp_path, monkeypatch):
+    """Туда-обратно: настоящий fetch_travelpayouts и разбор ответа (сеть подменена), return_at в запросе."""
+    w = make_world(tmp_path, monkeypatch)
+    monkeypatch.setattr(TP_FETCH, REAL_FETCH)
+    seen: list[tuple[str, dict, dict]] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def json(self) -> dict:
+            return RT_PAYLOAD
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:  # httpx.AsyncClient без сети
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *exc: Any) -> bool:
+            return False
+
+        async def get(self, url: str, params: dict, headers: dict) -> FakeResponse:
+            seen.append((url, params, headers))
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+    sub = subscribe(w, query=RT)
+    await w.sched.run_once()
+    assert len(w.phones.calls) == 1 and w.phones.calls[0] == RT
+
+    await next_check(w, sub.id)
+
+    assert len(w.phones.calls) == 1  # кэш за всю поездку = собранной цене: пропуск
+    assert len(seen) == 1
+    url, params, headers = seen[0]
+    assert url == tp_client.ENDPOINT
+    assert params["return_at"] == "2027-02-08" and params["one_way"] == "false"
+    assert headers == {"X-Access-Token": TOKEN}
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_cache_request_propagates(tmp_path, monkeypatch):
+    """Остановка бота посреди запроса в кэш: отмена не превращается в «ошибку кэша» и сбор."""
+    w = make_world(tmp_path, monkeypatch, make_settings(sub_prefilter_full_hours=24, tp_preview_timeout=30))
+    sub = await collected(w)
+    w.cache.delay = 60.0
+    w.clock.advance(math.ceil(due_after(sub.id, FAR.depart)) + 1)
+
+    task = asyncio.create_task(w.sched.run_once())
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if len(w.cache.calls) == 1:
+            break
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(w.cache.calls) == 1 and len(w.phones.calls) == 1
+    assert w.prefilter.counts(T0)["error"] == 0
+
+
+@pytest.mark.asyncio
+async def test_cache_min_in_subscription_currency(tmp_path, monkeypatch):
+    w = make_world(tmp_path, monkeypatch)
+    sub = await collected(w)
+    w.cache.offers = [cache_offer(100, currency="USD"), cache_offer(PRICE)]
+
+    await next_check(w, sub.id)
+
+    assert len(w.phones.calls) == 1  # рубли кэша = собранной цене: пропуск, доллары не мешают
 
 
 # --- модель: синтетические ряды цен, кэш с запаздыванием ------------------------------------------------------
