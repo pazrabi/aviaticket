@@ -502,6 +502,69 @@ async def test_one_crooked_element_logs_one_warning_with_site_name(tmp_path, cas
     ]
 
 
+def _duplicate_first_element(case: SiteCase, data: Any) -> None:
+    """Тот же элемент выдачи приходит дважды (у tutu предложения — словарь по id)."""
+    if case.name == "tutu":
+        actual = data[0]["offers"]["actual"]
+        first_key = next(iter(actual))
+        actual[f"{first_key}dup"] = copy.deepcopy(actual[first_key])
+        return
+    elements = case.elements(data)
+    elements.append(copy.deepcopy(elements[0]))
+
+
+@pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
+@pytest.mark.asyncio
+async def test_duplicate_element_not_counted_as_skipped(tmp_path, case, caplog):
+    """Дубль элемента — не кривой: строки о пропуске нет, билеты те же."""
+    intact = {_offer_key(o) for o in _intact_offers(case)}
+    data = case.data()
+    _duplicate_first_element(case, data)
+    settings = _settings(tmp_path, case)
+
+    with caplog.at_level(logging.WARNING):
+        offers, _, _ = await _process_snapshot(settings.sites[0], case.snapshot(data), case.query, settings)
+
+    assert {_offer_key(o) for o in offers} == intact
+    assert not [r for r in caplog.records if "пропущено" in r.getMessage()]
+
+
+@pytest.mark.asyncio
+async def test_yandex_route_missing_from_reference_counted_as_skipped(tmp_path, caplog):
+    """Второй этап yandex: тариф с ценой, но рейса маршрута нет в справочнике — билет не собран, пропуск учтён."""
+    case = next(c for c in SITE_CASES if c.name == "yandex_travel")
+    data = case.data()
+    case.elements(data)[0]["route"][0][0] = "missing-flight-key"
+    settings = _settings(tmp_path, case)
+
+    with caplog.at_level(logging.WARNING):
+        offers, _, _ = await _process_snapshot(settings.sites[0], case.snapshot(data), case.query, settings)
+
+    assert len(offers) == case.normal_count - 1
+    assert [r.getMessage() for r in caplog.records if "пропущено" in r.getMessage()] == [
+        f"Сайт yandex_travel: пропущено 1 из {case.normal_count} элементов выдачи"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_aviasales_counts_each_delivery_of_a_crooked_ticket(tmp_path, caplog):
+    """Aviasales шлёт выдачу порциями, билеты в них повторяются: N и K — по доставкам, не по уникальным билетам."""
+    case = SITE_CASES[0]
+    data = case.data()
+    case.drop_price(data, case.elements(data)[0])
+    body = json.dumps(data)
+    snap = Snapshot(url=case.page_url, text=LONG_PAGE_TEXT, json_payloads=[(case.payload_url, body)] * 2)
+    settings = _settings(tmp_path, case)
+
+    with caplog.at_level(logging.WARNING):
+        offers, _, _ = await _process_snapshot(settings.sites[0], snap, case.query, settings)
+
+    assert len(offers) == case.normal_count - 1
+    assert [r.getMessage() for r in caplog.records if "пропущено" in r.getMessage()] == [
+        f"Сайт aviasales: пропущено 2 из {2 * case.normal_count} элементов выдачи"
+    ]
+
+
 @pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
 def test_quick_parse_does_not_log_skip_line(case, caplog):
     """Быстрый разбор (FAST_STOP) зовёт парсер много раз за сбор — строка о пропуске только на полный разбор."""
