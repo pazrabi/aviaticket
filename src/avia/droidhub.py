@@ -16,6 +16,7 @@ import httpx
 
 from .collector import Snapshot
 from .config import Settings, SiteConfig
+from .statedb import db_path
 
 logger = logging.getLogger(__name__)
 
@@ -1218,7 +1219,7 @@ def _record_failure(
         if metrics is None:
             storage_dir = getattr(settings, "storage_dir", None)
             if storage_dir is not None:
-                metrics_path = Path(storage_dir) / "metrics.sqlite"
+                metrics_path = db_path(storage_dir, "metrics")
                 if metrics_path.exists():
                     metrics = MetricsStore(metrics_path)
         if metrics is not None:

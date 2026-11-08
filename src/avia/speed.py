@@ -14,6 +14,7 @@ from typing import Any, Sequence
 
 from .config import SPEED_PAIR_WINDOW_DEFAULT, Settings, SiteConfig, normalize_pair_window
 from .droidhub import PreferenceList
+from .statedb import db_path
 
 logger = logging.getLogger("avia.speed")
 
@@ -79,9 +80,9 @@ class SpeedTable:
         if metrics_path is not None:
             self.metrics_path = Path(metrics_path)
         elif settings is not None and getattr(settings, "storage_dir", None) is not None:
-            self.metrics_path = Path(settings.storage_dir) / "metrics.sqlite"
+            self.metrics_path = db_path(settings.storage_dir, "metrics")
         else:
-            self.metrics_path = Path("state") / "metrics.sqlite"
+            self.metrics_path = db_path(Path("state"), "metrics")
 
         self._lock = threading.RLock()
         # пересчёт из SQLite идёт в одном потоке за раз; остальные ждут его и берут свежую таблицу
@@ -701,9 +702,9 @@ _speed_lock = threading.Lock()
 def get_speed_table(settings: Settings | None = None) -> SpeedTable:
     """Возвращает singleton таблицы скоростей для заданных настроек."""
     if settings is not None and getattr(settings, "storage_dir", None) is not None:
-        path = Path(settings.storage_dir) / "metrics.sqlite"
+        path = db_path(settings.storage_dir, "metrics")
     else:
-        path = Path("state") / "metrics.sqlite"
+        path = db_path(Path("state"), "metrics")
 
     with _speed_lock:
         table = _speed_tables.get(path)

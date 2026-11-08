@@ -31,6 +31,7 @@ from .parsers import PARSERS
 from .parsers.kupibilet import build_ticket_url
 from .parsers.travelpayouts import fetch_travelpayouts, search_url
 from .sites import build_url
+from .statedb import db_path
 from .tutu_ids import resolve_city
 from .yandex_ids import city_id
 
@@ -507,7 +508,7 @@ async def _record_timeline_bg(
                 storage_dir = getattr(settings, "storage_dir", None)
                 if storage_dir is not None:
                     from .metrics import MetricsStore
-                    metrics = MetricsStore(Path(storage_dir) / "metrics.sqlite")
+                    metrics = MetricsStore(db_path(storage_dir, "metrics"))
             if metrics is not None:
                 metrics.record_timeline(
                     search_id=search_id,

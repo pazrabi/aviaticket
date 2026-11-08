@@ -14,6 +14,7 @@ import time
 from typing import Any, Iterable
 
 from .config import Settings
+from .statedb import db_path
 
 logger = logging.getLogger("avia.hedge")
 
@@ -72,7 +73,7 @@ def get_hedge_stats(
         if metrics is None:
             storage_dir = getattr(settings, "storage_dir", None)
             if storage_dir is not None:
-                metrics_path = Path(storage_dir) / "metrics.sqlite"
+                metrics_path = db_path(storage_dir, "metrics")
                 if metrics_path.exists():
                     from .metrics import MetricsStore
 
