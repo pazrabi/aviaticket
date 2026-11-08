@@ -188,17 +188,21 @@ class WaitMessageUpdater:
     async def show_preview(self, line: str) -> bool:
         """П32: строка кэша под шапкой, правка сразу; True — сообщение ожидания её показывает.
 
-        Правка не прошла — строку не держим: иначе она всплывёт с правкой сайта, а метрика скажет «не было».
+        Правка не прошла или задачу сняли посреди правки (конец поиска) — строку не держим: иначе она всплывёт
+        с правкой сайта или с последней правкой ожидания, а метрика скажет «не было».
         """
         async with self._lock:
             if self.closed or self.message_id is None:
                 return False
             self.preview_line = line
-            await self._push_edit(time.monotonic(), force=True)
-            if self.last_rendered_text == self._render():
-                return True
-            self.preview_line = None
-            return False
+            shown = False
+            try:
+                await self._push_edit(time.monotonic(), force=True)
+                shown = self.last_rendered_text == self._render()
+            finally:
+                if not shown:
+                    self.preview_line = None
+            return shown
 
     async def flush(self) -> None:
         async with self._lock:

@@ -578,6 +578,37 @@ async def test_wait_edit_failed_no_line_later(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_preview_edit_cancelled_midway_line_not_kept():
+    from avia.bot import WaitMessageUpdater
+
+    class HangingBot:  # правка со строкой кэша висит, пока поиск не кончится
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+            self.hang = True
+
+        async def call(self, method: str, *, retries: int | None = None, **params: Any) -> Any:
+            self.texts.append(params["text"])
+            if self.hang:
+                await asyncio.sleep(NEVER)
+            return True
+
+    bot = HangingBot()
+    sites = [SiteConfig(name=n, url_template="") for n in LIVE]
+    updater = WaitMessageUpdater(bot, PERSON_ID, WAIT_MSG_ID, sites, header="🔍 <b>Ищу билеты</b>", footer="…")
+    task = asyncio.create_task(updater.show_preview(f"⚡ строка <i>({NOTE})</i>"))
+    while not bot.texts:
+        await asyncio.sleep(0)
+
+    task.cancel()  # конец поиска: stop_preview снимает задачу посреди правки
+    await asyncio.wait([task])
+    bot.hang = False
+    await updater.flush()
+
+    assert updater.preview_line is None
+    assert len(bot.texts) == 1  # последняя правка ожидания не несёт строку кэша второй раз
+
+
+@pytest.mark.asyncio
 async def test_with_card_early_early_card_as_in_kt2_card(tmp_path, monkeypatch):
     plain = make_bot(new_dir(tmp_path, "plain"), preview=False, early=True)
     await run(plain, monkeypatch, PLAN_EARLY, FakeCache())
