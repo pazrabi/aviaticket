@@ -51,6 +51,7 @@ sites:
 
   # Заглушки: шаблон URL нужно снять руками с реальной выдачи, потом recon и парсер.
   - name: tutu
+    airports: false   # Туту и Т-Путешествия ищут только по городу, отдельный аэропорт не поддерживают
     source: browser
     parser: tutu
     id_resolver: tutu
@@ -104,6 +105,7 @@ sites:
 
   # Т-Путешествия: новый агрегатор (шаг 14 PLAN_SPEED.md), в боевом режиме с 2026-11-07 по решению владельца.
   - name: ttravel
+    airports: false   # Туту и Т-Путешествия ищут только по городу, отдельный аэропорт не поддерживают
     source: browser
     parser: ttravel
     enabled: true

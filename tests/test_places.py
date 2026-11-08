@@ -120,3 +120,10 @@ def test_airports_of_mow():
     assert "DME" in codes
     assert "SVO" in codes
     assert "VKO" in codes
+
+
+def test_is_airport():
+    from avia.places import is_airport
+
+    assert is_airport("DME") and is_airport("vko")
+    assert not is_airport("MOW") and not is_airport("UUS") and not is_airport("XX")

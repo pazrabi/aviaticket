@@ -56,6 +56,8 @@ class SiteConfig:
     phone_full_wait_seconds: int | None = None
     phone_full_wait_for: str | None = None
     stage: str = "live"
+    # умеет ли сайт искать по коду отдельного аэропорта (иначе при аэропорте в запросе пропускается)
+    airports: bool = True
 
     def __post_init__(self) -> None:
         if self.phone_patience_seconds < 0:

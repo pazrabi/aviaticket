@@ -30,6 +30,7 @@ from .models import Offer, Query, SiteResult
 from .parsers import PARSERS
 from .parsers.kupibilet import build_ticket_url
 from .parsers.travelpayouts import fetch_travelpayouts, search_url
+from .places import is_airport
 from .sites import build_url
 from .statedb import db_path
 from .tutu_ids import resolve_city
@@ -1492,6 +1493,13 @@ async def search(
                 ok=False,
                 offers=[],
                 error="для этого сайта обратные билеты пока не поддерживаются",
+            )
+        elif not getattr(s, "airports", True) and (is_airport(q.origin) or is_airport(q.destination)):
+            res = SiteResult(
+                site=s.name,
+                ok=False,
+                offers=[],
+                error="сайт не ищет по отдельному аэропорту",
             )
         elif priority == 0 and (await check_site_fuse_async(s.name, settings, now=now, consume_probe=False))[0]:
             is_fused, had_captcha = await check_site_fuse_async(s.name, settings, now=now, consume_probe=True)

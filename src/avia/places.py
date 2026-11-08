@@ -361,3 +361,12 @@ def resolve(text: str) -> Place:
     if suggestions:
         msg += f". Возможно, вы имели в виду: {', '.join(suggestions)}?"
     raise UnknownCityError(msg, suggestions=suggestions)
+
+
+def is_airport(code: str) -> bool:
+    """True, если код — отдельный аэропорт, а не город (Домодедово DME, а не Москва MOW)."""
+    c = (code or "").strip().upper()
+    if len(c) != 3:
+        return False
+    cat = _get_catalog()
+    return c not in cat.cities_by_code and c in cat.airports_by_code
