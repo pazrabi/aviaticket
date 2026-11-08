@@ -40,6 +40,7 @@ def register_parser(name: str):
 
 # Импорт модулей регистрирует их парсеры.
 from . import aviasales  # noqa: E402,F401
+from . import city_travel  # noqa: E402,F401
 from . import kupibilet  # noqa: E402,F401
 from . import ozon_travel  # noqa: E402,F401
 from . import travelpayouts  # noqa: E402,F401

@@ -231,6 +231,7 @@ SITE_NAMES = {
     "tutu": "Туту",
     "onetwotrip": "OneTwoTrip",
     "ozon_travel": "Ozon Travel",
+    "city_travel": "City Travel",
 }
 
 MONTHS_SHORT = ("янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек")
