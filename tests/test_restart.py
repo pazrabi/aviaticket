@@ -116,7 +116,7 @@ async def populate(bot, search: FakeSearch) -> asyncio.Task:
     d_id = await searched(bot, 304)
     await bot.handle_callback(cq(304, f"more:{d_id}"))  # выдача изменена на месте: flat, shown
     d_id = await searched(bot, 305)
-    await bot.handle_callback(cq(305, f"list:{d_id}:full"))  # view = full
+    await bot.handle_callback(cq(305, f"full:{d_id}"))  # view = full, flat — полный отчёт
     d_id = await searched(bot, 306)
     await bot.handle_callback(cq(306, f"track:{d_id}"))  # подписка из выдачи
     d_id = await searched(bot, 307)

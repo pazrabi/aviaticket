@@ -27,6 +27,7 @@ from .card_early import (
     min_price,
     sites_with_prices,
 )
+from .chat_state import open_chat_state
 from .config import Settings, load_settings
 from .deep_cache import DeepCache
 from .fresh_cache import FreshCache
@@ -61,6 +62,7 @@ from .parsing import city_name
 from .phones import PhoneRegistry
 from .pipeline import search
 from .scheduler import Scheduler
+from .statedb import db_path, db_single_enabled
 from .store import ResultStore
 from .subscriptions import SubscriptionStore
 from .tg_text import html_to_plain, split_html
@@ -271,7 +273,7 @@ class Bot:
         self._known_users: set[int] = set()  # id, которые точно есть в users: лимит новых людей их не ищет
         self._new_day_start: float | None = None  # местные сутки счётчика новых людей (NEW_USERS_PER_DAY)
         self._new_day_count: int = 0  # новых людей за эти сутки
-        self.users = UserStore(settings.storage_dir / "users.sqlite")
+        self.users = UserStore(db_path(settings.storage_dir, "users"))
         if getattr(settings, "phones", None) is not None:
             self.phones = settings.phones
         else:
@@ -285,7 +287,7 @@ class Bot:
         self._phones_fail_count: int = 0
         self._phones_task: asyncio.Task | None = None
         try:
-            self.metrics: MetricsStore | None = MetricsStore(settings.storage_dir / "metrics.sqlite")
+            self.metrics: MetricsStore | None = MetricsStore(db_path(settings.storage_dir, "metrics"))
         except Exception:
             log.exception("метрики недоступны")
             self.metrics = None
@@ -293,7 +295,7 @@ class Bot:
         self._last_forecast_train: float = 0.0
         self._bg_sem = asyncio.Semaphore(settings.max_parallel_searches)
         self._active_searches: int = 0
-        self.history = PriceHistory(settings.storage_dir / "history.sqlite")
+        self.history = PriceHistory(db_path(settings.storage_dir, "history"))
         self.bg_collector: BackgroundCollector | None = None
         if self.s.bg_collect:
             self.bg_collector = BackgroundCollector(
@@ -305,14 +307,19 @@ class Bot:
         self._bg_task: asyncio.Task | None = None
         self._bg_tasks: set[asyncio.Task] = set()
         self._hist_times: dict[int, float] = {}
+        self.chat_state = None  # DB_SINGLE=1: сессии и выдачи в avia.sqlite (chat_state.py), иначе в памяти
         if dialog is not None:
             self.dialog = dialog
             self.store = store if store is not None else dialog.store
             self.subs = dialog.subs
         else:
-            self.subs = SubscriptionStore(settings.storage_dir / "subscriptions.sqlite")
-            self.store = store if store is not None else ResultStore()
-            self.dialog = Dialog(store=self.store, subs=self.subs)
+            self.subs = SubscriptionStore(db_path(settings.storage_dir, "subscriptions"))
+            if store is None and db_single_enabled():
+                self.chat_state, self.store, sessions = open_chat_state(settings.storage_dir, self._save_chat_state)
+                self.dialog = Dialog(sessions=sessions, store=self.store, subs=self.subs)
+            else:
+                self.store = store if store is not None else ResultStore()
+                self.dialog = Dialog(store=self.store, subs=self.subs)
         self.deep_cache = DeepCache(ttl_seconds=getattr(settings, "deep_cache_ttl_seconds", 900))
         try:
             self.fresh_cache = FreshCache()
@@ -1382,7 +1389,20 @@ class Bot:
                 await self._admin_command(chat_id, text)
             return
         actions = self.dialog.on_text(chat_id, text)
-        await self._process_actions(chat_id, actions)
+        self._save_chat_state(chat_id)
+        try:
+            await self._process_actions(chat_id, actions)
+        finally:
+            self._save_chat_state(chat_id)
+
+    def _save_chat_state(self, chat_id: int | str) -> None:
+        """DB_SINGLE=1: сессия и выдача чата — в avia.sqlite, если изменились. Ошибка базы — только в лог."""
+        if self.chat_state is None:
+            return
+        try:
+            self.chat_state.save_chat(chat_id, self.dialog.sessions.get(chat_id), self.store.peek(chat_id))
+        except Exception:
+            log.exception("не удалось сохранить сессию и выдачу, chat_id=%s", chat_id)
 
     def _stats_text(self) -> str:
         """Текст /stats. Синхронный: читает users, историю цен и подписки из SQLite."""
@@ -1947,7 +1967,7 @@ class Bot:
         now = time.time()
         growth_24 = self.history.rows_since(now - 86400) if self.history else 0
 
-        ph_path = self.s.storage_dir / "history.sqlite"
+        ph_path = db_path(self.s.storage_dir, "history")
         total_ph = h_stats.get("price_history", 0)
         growth_mb = 0.0
         if total_ph > 0 and ph_path.exists():
@@ -2098,6 +2118,7 @@ class Bot:
         answered = False
         try:
             actions = self.dialog.on_callback(chat_id, data)
+            self._save_chat_state(chat_id)
             answer_text = None
             for item in actions:
                 if isinstance(item, Reply) and item.answer:
@@ -2116,6 +2137,7 @@ class Bot:
 
             await self._process_actions(chat_id, actions, message_id=message_id)
         finally:
+            self._save_chat_state(chat_id)
             if not answered:
                 try:
                     await self.call("answerCallbackQuery", callback_query_id=cq_id)

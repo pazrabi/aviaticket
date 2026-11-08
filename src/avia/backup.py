@@ -13,6 +13,8 @@ import sqlite3
 import tempfile
 from typing import Any
 
+from .statedb import SINGLE_DB_NAME, db_single_enabled
+
 log = logging.getLogger("avia.backup")
 
 
@@ -57,6 +59,10 @@ def backup_all(
         f for f in sorted(state_path.iterdir())
         if f.is_file() and f.suffix == ".sqlite" and not f.name.startswith(".")
     ]
+    if db_single_enabled():
+        # DB_SINGLE=1: живая база одна (вместе с WAL — через backup API); четыре старых файла после переноса
+        # не меняются, их копии уже есть в бэкапах до включения флага
+        sqlite_files = [f for f in sqlite_files if f.name == SINGLE_DB_NAME]
 
     for src_file in sqlite_files:
         base_name = src_file.stem

@@ -71,13 +71,13 @@ def test_chat_state_write_cost(db):
     assert statistics.median(costs) < 0.05
 
 
-def _fill_history(path, n: int) -> None:
+def _fill_history(path, n: int, span_days: float) -> None:
     PriceHistory(path)
     rng = random.Random(7)
     now = time.time()
     rows = []
     for i in range(n):
-        obs = now - rng.uniform(0, 60) * 86400
+        obs = now - rng.uniform(0, span_days) * 86400
         rows.append(("MOW", "AER", (date.today() + timedelta(days=rng.randint(1, 90))).isoformat(), None, 1,
                      rng.choice(SITES), 5000 + rng.randint(0, 5000), "RUB", f"o{i % 3000}", obs, f"s{i // 60}"))
     with sqlite3.connect(path) as conn:
@@ -86,12 +86,14 @@ def _fill_history(path, n: int) -> None:
             "offer_id, observed_at, search_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
 
 
-def test_loop_writes_wait_behind_daily_maintenance(db):
-    """Раз в сутки обслуживание (rebuild_route_daily, prune) держит запись в общей базе.
+@pytest.mark.parametrize("span_days", [46.0, 60.0], ids=["daily_prune_1day", "catch_up_prune_15days"])
+def test_loop_writes_wait_behind_daily_maintenance(db, span_days):
+    """Раз в сутки (и при старте бота) обслуживание — rebuild_route_daily, prune — держит запись в общей базе.
 
     Цикл событий в это время пишет человека и сессию синхронно, как сторы владельца: замер ожидания.
+    46 дней истории — prune (keep_days=45) удаляет один день, как каждые сутки; 60 — догоняет 15 дней.
     """
-    _fill_history(db, HISTORY_ROWS)
+    _fill_history(db, HISTORY_ROWS, span_days)
     history = PriceHistory(db)
     users = UserStore(db)
     cs = chat_state.ChatStateStore(db)
@@ -110,19 +112,22 @@ def test_loop_writes_wait_behind_daily_maintenance(db):
     t = threading.Thread(target=maintenance)
     waits_users, waits_chat = [], []
     t.start()
+    def timed(waits: list[float], write) -> None:
+        t0 = time.perf_counter()
+        write()
+        waits.append(time.perf_counter() - t0)
+
     i = 0
     while not done.is_set():
-        t0 = time.perf_counter()
-        users.register(10_000 + i)
-        waits_users.append(time.perf_counter() - t0)
-        snap.shown = i
-        t0 = time.perf_counter()
-        cs.save_chat(2, session, snap)
-        waits_chat.append(time.perf_counter() - t0)
+        snap.shown = i  # новая версия выдачи: save_chat пишет, а не пропускает
+        person = (waits_users, lambda: users.register(10_000 + i))
+        chat = (waits_chat, lambda: cs.save_chat(2, session, snap))
+        for waits, write in ((person, chat) if i % 2 == 0 else (chat, person)):  # кто первым упрётся в замок
+            timed(waits, write)
         i += 1
-        time.sleep(0.005)
+        time.sleep(0.002)
     t.join()
-    print(f"\nKT4DB maintenance on {HISTORY_ROWS} price_history rows: "
+    print(f"\nKT4DB maintenance on {HISTORY_ROWS} price_history rows over {span_days:.0f} days: "
           + ", ".join(f"{k}={v * 1000:.0f}ms" for k, v in spans.items()))
     print(f"KT4DB loop users.register during maintenance: {ms(waits_users)}")
     print(f"KT4DB loop save_chat during maintenance: {ms(waits_chat)}")

@@ -10,6 +10,26 @@ from .formatting import format_report
 from .guard import friendly_error
 from .parsing import ParseError, parse_query
 from .pipeline import search
+from .statedb import db_path
+
+
+def db_rollback() -> None:
+    """КТ4, работа 1: откат DB_SINGLE — всё из state/avia.sqlite обратно в четыре файла. Бот должен быть остановлен."""
+    from .statedb import MigrationError, export_legacy, single_db_path
+
+    s = load_settings()
+    path = single_db_path(s.storage_dir)
+    if not path.is_file():
+        sys.exit(f"Нет {path}: откатывать нечего")
+    try:
+        report = export_legacy(s.storage_dir)
+    except MigrationError as e:
+        sys.exit(f"⚠️ {e}")
+    for name, tables in report.items():
+        rows = ", ".join(f"{t} {n}" for t, n in tables.items()) or "таблиц нет"
+        print(f"{name}.sqlite: {rows}")
+    print("Готово: avia.sqlite отложена, прежние файлы — *.pre-rollback-*. "
+          "Дальше DB_SINGLE=0 в .env и перезапуск бота.")
 
 
 def main():
@@ -18,9 +38,13 @@ def main():
         from . import forecast
         from .history import PriceHistory
         s = load_settings()
-        hist = PriceHistory(s.storage_dir / "history.sqlite")
+        hist = PriceHistory(db_path(s.storage_dir, "history"))
         rep = forecast.train_and_eval(hist, s.forecast_dir)
         print(json.dumps(rep, indent=2, ensure_ascii=False))
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "db-rollback":
+        db_rollback()
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "parser-check":
@@ -33,7 +57,7 @@ def main():
         from .metrics import MetricsStore
         from .stop_calibrate import calibrate_all, write_rules
         s = load_settings()
-        metrics = MetricsStore(s.storage_dir / "metrics.sqlite")
+        metrics = MetricsStore(db_path(s.storage_dir, "metrics"))
         dry_run = "--dry-run" in sys.argv
         results = calibrate_all(metrics, days=7)
         if not results:

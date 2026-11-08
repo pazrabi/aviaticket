@@ -20,6 +20,7 @@ from .models import Query
 from .parsers import PARSERS
 from .pipeline import filter_wrong_dates, resolve_extra
 from .sites import build_url
+from .statedb import db_path
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +119,7 @@ def get_reference_price(
     prices: list[float] = []
 
     # 1. Поиск в metrics.sqlite (site_runs.min_price)
-    metrics_path = Path(settings.storage_dir) / "metrics.sqlite"
+    metrics_path = db_path(settings.storage_dir, "metrics")
     if metrics_path.exists():
         try:
             with sqlite3.connect(metrics_path, timeout=5) as db:
@@ -140,7 +141,7 @@ def get_reference_price(
             logger.debug("Ошибка чтения эталона из metrics: %s", e)
 
     # 2. Поиск в history.sqlite (price_history)
-    history_path = Path(settings.storage_dir) / "history.sqlite"
+    history_path = db_path(settings.storage_dir, "history")
     if history_path.exists():
         try:
             with sqlite3.connect(history_path, timeout=5) as db:
@@ -459,7 +460,7 @@ async def _do_run_phone_check(
             metrics_store = bot.metrics
         else:
             try:
-                metrics_store = MetricsStore(Path(settings.storage_dir) / "metrics.sqlite")
+                metrics_store = MetricsStore(db_path(settings.storage_dir, "metrics"))
             except Exception:
                 metrics_store = None
 
@@ -746,7 +747,7 @@ async def probe_denied_pairs(
             metrics_store = settings.metrics
         else:
             try:
-                metrics_store = MetricsStore(Path(settings.storage_dir) / "metrics.sqlite")
+                metrics_store = MetricsStore(db_path(settings.storage_dir, "metrics"))
             except Exception:
                 metrics_store = None
 
