@@ -22,6 +22,11 @@ CREATE TABLE IF NOT EXISTS users (
 """
 
 
+def _search_day(ts: float) -> str:
+    """Местные сутки, за которые засчитан поиск (users.search_day)."""
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
 @dataclass
 class User:
     tg_id: int
@@ -89,7 +94,7 @@ class UserStore:
     def try_use_search(self, tg_id: int, daily_limit: int, now: float | None = None) -> bool:
         """Засчитывает поиск за сегодня; False, если дневной лимит исчерпан (0 = без лимита)."""
         ts = time.time() if now is None else now
-        day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        day = _search_day(ts)
         with self._connect() as db:
             row = db.execute("SELECT search_day, search_count FROM users WHERE tg_id = ?", (int(tg_id),)).fetchone()
             if row is None:
@@ -103,6 +108,23 @@ class UserStore:
                 (day, count + 1, int(tg_id)),
             )
         return True
+
+    def refund_search(self, tg_id: int, charged_at: float) -> None:
+        """Возвращает попытку, которую try_use_search списал в момент charged_at.
+
+        Счёт дня уменьшается, только если в строке ещё день списания: поиск на стыке суток
+        не трогает счёт нового дня. Всего поисков уменьшается в любом случае. Оба не ниже 0;
+        нет строки — ничего не делает.
+        """
+        with self._connect() as db:
+            db.execute(
+                "UPDATE users SET "
+                "search_count = CASE WHEN search_day = ? AND search_count > 0 "
+                "THEN search_count - 1 ELSE search_count END, "
+                "total_searches = MAX(total_searches - 1, 0) "
+                "WHERE tg_id = ?",
+                (_search_day(charged_at), int(tg_id)),
+            )
 
     def stats(self, today: str | None = None) -> dict[str, int]:
         """Сводка для администратора: людей всего, активных сегодня, заблокированных, поисков всего."""

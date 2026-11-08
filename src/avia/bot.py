@@ -563,23 +563,50 @@ class Bot:
         if session is not None and session.step == Step.SEARCHING:
             session.step = Step.DONE
 
+    def _try_charge_search(self, chat_id: int) -> tuple[bool, float | None]:
+        """Списывает суточную попытку поиска: (можно искать, момент списания).
+
+        Момент списания нужен возврату (_refund_search): возвращаем за тот день, в который списали.
+        Администратор — (True, None): ему не списываем и не возвращаем. Лимит исчерпан — (False, None).
+        """
+        if chat_id in self.s.tg_allowed_ids:
+            return True, None
+        now = time.time()
+        if not self.users.try_use_search(chat_id, self.s.daily_search_limit, now=now):
+            return False, None
+        return True, now
+
+    def _refund_search(self, chat_id: int, charged_at: float) -> None:
+        """Возвращает попытку, списанную в charged_at: поиск упал или ни один сайт не ответил.
+
+        Ошибка базы здесь не должна ломать ответ человеку: она только в лог.
+        """
+        try:
+            self.users.refund_search(chat_id, charged_at)
+        except Exception:
+            log.exception("не удалось вернуть попытку поиска, chat_id=%s", chat_id)
+            return
+        log.info("попытка поиска возвращена, chat_id=%s", chat_id)
+
     async def _run_search(self, chat_id: int, req: SearchRequest):
         if chat_id in self.busy:
             # Поиск этого человека уже идёт: шаг не трогаем, SEARCHING снимет его finally
             await self.send(chat_id, "⏳ Предыдущий поиск ещё идёт, подождите.")
             return
+        charged_at: float | None = None  # момент списания суточной попытки; None — не списывали
         try:
             budget_wait = self._search_budget_wait(chat_id)
             # Сверх бюджета дневной лимит человека не списываем
-            within_limit = budget_wait <= 0 and (
-                chat_id in self.s.tg_allowed_ids
-                or self.users.try_use_search(chat_id, self.s.daily_search_limit)
-            )
+            within_limit = False
+            if budget_wait <= 0:
+                within_limit, charged_at = self._try_charge_search(chat_id)
             if within_limit:
                 self._note_search_budget(chat_id)
         except Exception:
             # Бюджет или SQLite (database is locked и т.п.) до busy.add: снять SEARCHING некому, кроме нас
             log.exception("не получилось начать поиск, chat_id=%s", chat_id)
+            if charged_at is not None:  # списали, а поиск так и не начался
+                self._refund_search(chat_id, charged_at)
             self._leave_searching(chat_id)
             await self.send(chat_id, "⚠️ Не получилось начать поиск, попробуйте ещё раз.")
             return
@@ -599,6 +626,8 @@ class Bot:
         baggage_mode = req.baggage_mode
         wait_msg_id = None
         updater = None
+        # Попытка остаётся списанной, только если хоть один сайт ответил и поиск дошёл до конца без исключения
+        keep_charge = False
         try:
             enabled_sites = [s for s in self.s.sites if s.enabled]
             header = (
@@ -690,6 +719,7 @@ class Bot:
                     if not any(s.name == name for s in enabled_sites):
                         results.append(res)
 
+            keep_charge = any(r.ok for r in results)
             self._record_metrics("user", results)
             if self.metrics is not None and results:
                 self.metrics.record_search(  # type: ignore[attr-defined]
@@ -772,9 +802,12 @@ class Bot:
                 dropped_criteria=dropped_criteria,
             )
         except Exception as e:
+            keep_charge = False
             log.exception("search failed")
             await self.send(chat_id, f"⚠️ {escape(friendly_error(e))}")
         finally:
+            if charged_at is not None and not keep_charge:
+                self._refund_search(chat_id, charged_at)
             # Без await между ними: иначе новый поиск успеет взять busy, а мы снимем его SEARCHING
             self.busy.discard(chat_id)
             self._leave_searching(chat_id)
@@ -863,10 +896,8 @@ class Bot:
             return
 
         # 4. Проверяем и списываем дневной лимит поиска
-        if (
-            chat_id not in self.s.tg_allowed_ids
-            and not self.users.try_use_search(chat_id, self.s.daily_search_limit)
-        ):
+        within_limit, charged_at = self._try_charge_search(chat_id)
+        if not within_limit:
             await self.send(
                 chat_id,
                 f"😴 На сегодня лимит поисков исчерпан ({self.s.daily_search_limit}). Завтра можно снова, "
@@ -878,6 +909,8 @@ class Bot:
         self.busy.add(chat_id)
         wait_msg_id = None
         updater = None
+        # Попытка остаётся списанной, только если хоть один сайт ответил и поиск дошёл до конца без исключения
+        keep_charge = False
         try:
             enabled_sites = [s for s in self.s.sites if s.enabled]
             header = (
@@ -971,6 +1004,7 @@ class Bot:
                     if not any(s.name == name for s in enabled_sites):
                         results.append(res)
 
+            keep_charge = any(r.ok for r in results)
             self._record_metrics("user", results)
             if self.metrics is not None and results:
                 self.metrics.record_search(  # type: ignore[attr-defined]
@@ -982,7 +1016,9 @@ class Bot:
                 )
 
             # Сохраняем в DeepCache
-            self.deep_cache.put(q, results)
+            # кладём в кеш только полную выдачу: пустые, неполные и упавшие сайты оставили бы дыру на 15 минут
+            if results and all(r.ok and r.offers and not r.partial for r in results):
+                self.deep_cache.put(q, results)
 
             results = assign_ids(results)
             try:
@@ -1037,9 +1073,12 @@ class Bot:
                 dropped_criteria=dropped_criteria,
             )
         except Exception as e:
+            keep_charge = False
             log.exception("deep search failed")
             await self.send(chat_id, f"⚠️ {escape(friendly_error(e))}")
         finally:
+            if charged_at is not None and not keep_charge:
+                self._refund_search(chat_id, charged_at)
             # Пока шёл глубокий поиск, человек мог нажать «Искать»: отказ «занят» оставил SEARCHING
             self.busy.discard(chat_id)
             self._leave_searching(chat_id)

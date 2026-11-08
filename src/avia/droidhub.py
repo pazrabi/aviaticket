@@ -127,6 +127,13 @@ class JobsUnsupported(DroidhubError):
     """Хаб не поддерживает задания fetch_jobs (404/405)."""
 
 
+class JobEmptyError(DroidhubError):
+    """Задание хаба завершилось без ответов (пустая выдача)."""
+
+    def __init__(self, message: str = "empty") -> None:
+        super().__init__(message)
+
+
 _jobs_unsupported: bool = False
 # Сайты, где задание хаба не отдало ни одного ответа (а старый fetch_page отдаёт): {сайт: до какого времени без заданий}
 _jobs_bad_sites: dict[str, float] = {}
@@ -707,9 +714,12 @@ def _is_retryable_error(exc: Exception) -> bool:
     Повторяем при:
     - 502 (телефон недоступен или страница не открылась);
     - 429 (очередь занята);
-    - сетевых ошибках и таймаутах.
+    - сетевых ошибках и таймаутах;
+    - пустом задании хаба (JobEmptyError).
     Ошибки авторизации (401/403) не повторяем.
     """
+    if isinstance(exc, JobEmptyError):
+        return True
     if not isinstance(exc, DroidhubError):
         return False
     status = getattr(exc, "status_code", None)
@@ -1234,6 +1244,17 @@ def _record_failure(
                 table.invalidate()
             except Exception:
                 pass
+            if error == "empty" and hasattr(metrics, "record_attempt"):
+                metrics.record_attempt(
+                    site=site,
+                    device=device,
+                    source=source,
+                    role="primary",
+                    outcome="empty",
+                    offers=offers,
+                    fetch_seconds=fetch_seconds,
+                    queue_wait=queue_wait,
+                )
     except Exception as e:
         logger.warning("Не удалось записать провал в метрики (%s): %s", device, e)
 
@@ -1293,6 +1314,7 @@ async def fetch_page_snapshot_any(
     last_exc: Exception | None = None
     total_queue_wait: float = 0.0
     attempts: int = 0
+    empty_jobs: int = 0
 
     pref_base = preferred_count or 1
     pref_set = set(clean_candidates[:pref_base])
@@ -1370,14 +1392,30 @@ async def fetch_page_snapshot_any(
                         and capture_json
                         and not snap.blocked
                     ):
-                        # задание закончилось без единого ответа: хаб в этом режиме не видит выдачу сайта.
-                        # Старый fetch_page её видит, поэтому берём его сразу и на время отключаем задания для сайта.
                         bad_name = site_name or _infer_site_name(url)
                         now = time.monotonic()
                         cutoff = now - JOBS_BAD_WINDOW_SECONDS
+                        has_untried = any(c for c in clean_candidates if c not in tried)
+
+                        if has_untried and empty_jobs == 0:
+                            empty_jobs += 1
+                            strikes = [t for t in _jobs_bad_strikes.get(bad_name, []) if t >= cutoff]
+                            strikes.append(now)
+                            _jobs_bad_strikes[bad_name] = strikes
+                            logger.warning(
+                                "Задание хаба для %s вернуло пустой результат на %s, пробуем повторить на другом телефоне",
+                                bad_name,
+                                dev,
+                            )
+                            raise JobEmptyError("empty")
+
+                        # Фолбэк на fetch_page на этом же телефоне:
+                        # когда непробованных телефонов нет, либо повтор тоже оказался пустым (empty_jobs > 0).
                         strikes = [t for t in _jobs_bad_strikes.get(bad_name, []) if t >= cutoff]
-                        strikes.append(now)
-                        _jobs_bad_strikes[bad_name] = strikes
+                        if empty_jobs == 0:
+                            strikes.append(now)
+                            _jobs_bad_strikes[bad_name] = strikes
+                        empty_jobs += 1
                         pause_sec = JOBS_BAD_FIRST_SECONDS if len(strikes) == 1 else JOBS_BAD_SITE_SECONDS
                         _jobs_bad_sites[bad_name] = now + pause_sec
                         logger.warning(
