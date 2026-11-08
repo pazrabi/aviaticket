@@ -14,6 +14,7 @@
 | `kt1-typeerror` | `5f36433` | 2 файла, +166 −2 | 3 failed, 2 passed → 5 passed | — |
 | `kt1-loop` | `7e52bb0`, `f6b27e9` | 12 файлов, +1065 −172 | 5 failed, 2 passed → 7 passed; доп. 3: 2 failed, 1 passed → 3 passed | — (пулы метрик — константы: чтения 2 потока, записи 1) |
 | `kt1-budget` | `de086d6`, `5c385cd` | 3 файла, +463 −1 | 7 failed, 2 passed → 9 passed; доп. 2: 3 failed → 16 passed | `SEARCH_BUDGET_PER_HOUR`, `NEW_USERS_PER_DAY`, по умолчанию 0 — выключено |
+| `kt1-refund` (П29, от `9ba5ae3`) | `0bc40e0`, `6ec60e9`, `7342517` | `diff --stat 9ba5ae3`: 3 файла, +546 −9 (src: 2 файла, +70 −9) | 15 failed, 8 passed → 23 passed; по ревью → 28 passed | — (багфикс) |
 
 Полный pytest — только в паузах очереди КТ0 (`pgrep -f loadtest.run` пуст; 12:00–12:06 и 13:56–13:58), рядом бывали процессы другого проекта на этой машине:
 
@@ -32,6 +33,9 @@
 | `kt1-all` `aba9321` (доп. 3) | **1040 passed**, 3 skipped | **1040 passed**, 3 skipped |
 | `kt1-p0` `524ca44` (доп. 6) | 990 passed, 3 skipped | — |
 | `kt1-all` `699f40c` (доп. 6) | **1042 passed**, 3 skipped | — |
+| `kt1-refund` `6ec60e9` (П29) | 1015 passed, 3 skipped | — |
+| `kt1-refund` `7342517` (П29) | 1016 passed, 3 skipped | — |
+| `kt1-all` `4bc6e4d` (П29, с `main` `9ba5ae3`) | **1080 passed**, 3 skipped | — |
 
 1040 = 984 + 5 (p0) + 5 (typeerror) + 20 (telegram) + 16 (budget) + 10 (loop): тесты веток вместе не мешают друг другу. Доп. 6: 990 = 989 + 1 (тест SQLite), 1042 = 1040 + 2 (тест SQLite и тест бюджета).
 
@@ -45,6 +49,8 @@
 
 Доп. 6 (2026-11-08, 03:00): владелец решил закрыть последнюю дыру `kt1-p0` — исключение SQLite в проверках до `busy.add` оставляло `SEARCHING`. `kt1-p0` `524ca44`, влито в `kt1-all` (`699f40c`, конфликт 3); подробности — раздел 3, «Доп. 6».
 
+Доп. 7 (2026-11-08, день): П29 — возврат суточной попытки, ветка `kt1-refund` от `main` `9ba5ae3`, раздел 7. Её влитие внесло в `kt1-all` четыре коммита владельца `367f108..9ba5ae3` (лимит 3 отслеживания, кэши, повтор пустого задания на другом телефоне): `gate --profile kt1` будут мерить против базы `9ba5ae3`. Полный pytest — без прокси, тем же интерпретатором, в паузах прогонов КТ0 (`pgrep -f '[l]oadtest.run|[-]m pytest'` пуст перед каждым запуском): `kt1-refund` `6ec60e9` — 12:52:01–12:52:20; `kt1-refund` `7342517` — 13:00:09–13:00:29 (19 с); `kt1-all` `4bc6e4d` — 13:00:29–13:01:01 (31 с); `tests/test_loop_responsive.py` на `kt1-all` `4bc6e4d` — 13:01:01–13:01:08, 7 passed in 7.22s (load 5,1 в конце). Перед каждым из трёх запусков `pgrep` был пуст; шли подряд, без `nice`: окна ждал не дольше 6 мин (12:44–12:46, 12:48–12:51, 12:53–12:59 — прогоны КТ0 `loadtest.run` и pytest в `kt0-up`). 1015 = 988 (`9ba5ae3`: 984 + 4 теста `test_droidhub_jobs_retry.py`) + 27 (`test_search_refund.py`); 1016 = 988 + 28; 1080 = 1042 (`699f40c`) + 4 (`test_droidhub_jobs_retry.py`) + 28 (`test_search_refund.py`) + 6 (`test_search_refund_budget.py`).
+
 ## Пробная ветка `kt1-all` и порядок влития (доп. 2, п. 5)
 
 Порядок: `kt1-tests` → `kt1-typeerror` → `kt1-p0` → `kt1-telegram` → `kt1-budget` → `kt1-loop`, каждая — `merge --no-ff`. Сначала маленькие и независимые, потом `bot.py` по возрастанию площади правки, `kt1-loop` — последней, она самая широкая.
@@ -56,6 +62,14 @@
 **Конфликт 2** — повторное влитие `kt1-p0` (`88f8a4e`), `src/avia/bot.py`: `kt1-p0` убрал обёртку `_run_search` / `_run_search_body`, а в `kt1-all` прямо перед ней стояли функции бюджета. Оставлены функции бюджета, старая обёртка убрана. Проверки бюджета стоят в `_run_search` до `busy.add`: отказ бюджета сам ставит `DONE` (`_refuse_over_budget`), как отказ по лимиту; `SEARCHING` снимается в `finally` сразу после `busy.discard`, повторы на 429 там выключены (`kt1-telegram`). Коммит `8b70265`; `kt1-loop` (`f6b27e9`) легла чисто (`aba9321`).
 
 **Конфликт 3** — доп. 6, влитие `kt1-p0` (`524ca44`), `src/avia/bot.py`, `_run_search`: `kt1-p0` взял проверку дневного лимита под `try`, а `kt1-budget` вставил перед ней `_search_budget_wait` / `_refuse_over_budget`, после — `_note_search_budget`. Разрешение (`bot.py:571–597` на `699f40c`): один `try` накрывает весь код до `busy.add` без `await` — `_search_budget_wait`, `try_use_search` (только если бюджет не исчерпан: сверх бюджета лимит человека не списывается, как в `kt1-budget`) и `_note_search_budget` (только если поиск пускаем). Отказы по бюджету и по лимиту — после `try`, тексты и порядок прежние; оба снимают `SEARCHING` до своего `await`. Тест на бюджет — только в `kt1-all` (раздел 3, «Доп. 6»). При влитии в `main` владелец встретит тот же конфликт: разрешение — как здесь.
+
+**Конфликт 4** — доп. 7, влитие `kt1-refund` (`0bc40e0`, от `9ba5ae3`) → `002e3bf`, `src/avia/bot.py`, пять мест:
+- помощники перед `_run_search`: оставлены оба набора — `_search_budget_wait`, `_note_search_budget`, `_refuse_over_budget`, `_leave_searching` (`kt1-budget`, `kt1-p0`) и `_try_charge_search`, `_refund_search` (`kt1-refund`);
+- `_run_search`, проверки до `busy.add`: списание осталось под общим `try` из `kt1-p0`, после проверки бюджета. `charged_at` ставится там же, только если лимит пустил (`_try_charge_search`); сверх бюджета `_try_charge_search` не вызывается — ни списания, ни возврата. Если тот же `try` упал уже после списания (например, в `_note_search_budget`), попытка возвращается до ответа «⚠️ Не получилось начать поиск»; SQLite упал в самом списании — `charged_at` пуст, возвращать нечего;
+- `finally` живого и глубокого поиска: сначала возврат (синхронный, без `await`), потом `busy.discard` и `_leave_searching` подряд, как в `kt1-p0`;
+- `_run_deep_search`: шаг 3 — бюджет (`kt1-budget`), шаг 4 — списание через `_try_charge_search`. Молчание глубокого поиска при ошибке базы до `busy.add` не тронуто (вопрос открыт).
+
+Остальное от `9ba5ae3` легло без конфликтов (`pipeline.py` — `key_query`/`cache_if` владельца рядом с `_record_attempt_nowait` из `kt1-loop`). Тесты по ревью (`6ec60e9`) → `094207a` без конфликтов; `7342517` → `dad0d32`. Тест на бюджет и общий `try` — только в `kt1-all`, `tests/test_search_refund_budget.py` (`4bc6e4d`), раздел 7. При влитии в `main` владелец встретит тот же конфликт: разрешение — как здесь.
 
 Проверено после разрешения: тесты трёх веток, правивших `bot.py` (`test_searching_reset.py`, `test_bot_budget.py`, `test_bot_telegram_limits.py`) — 35 passed на `aba9321`. Отказ по лимиту новых людей на кнопке идёт через `answerCallbackQuery` — с `kt1-telegram` он без повтора на 429 (`TG_NO_RETRY_METHODS`).
 
@@ -287,6 +301,69 @@ FAILED tests/test_bot_budget.py::test_new_people_count_cached_per_day           
 - Счёт новых за сутки в памяти может разойтись с базой: если `_admit` не зарегистрировал человека после проверки, место всё равно занято (ошибка в сторону отказа); админ, впервые написавший сегодня, в памяти не считается, а при перечитывании из базы — считается.
 - `_admit` владельца по-прежнему синхронно пишет в `users.sqlite` на каждое сообщение — это не новый код, не трогался.
 - Тексты отказов — мои, владелец может переписать.
+
+## 7. `kt1-refund` — возврат суточной попытки (П29, работа 10)
+
+**Задание:** `docs/audit/07_plan.md`, КТ1, работа 10 (2026-11-08). Ветка `kt1-refund` — от `main` `9ba5ae3` (не от `367f108`, как шесть веток выше), worktree `~/avia-scale/kt1-refund`. Смысл перенесён с нашего `6809085` и невлитого `1733a02` владельца (`pool/f60264b93650`), код не копировался.
+
+**Правило.** `_run_search` и `_run_deep_search` списывают попытку до поиска. Попытка возвращается, если её списали (человек не из `TG_ALLOWED_IDS`, лимит пустил) и человек не получил цен:
+- исключение в теле поиска после списания — тот же `except`, что шлёт «⚠️ …»;
+- ни у одного `SiteResult` нет `ok`: все сайты упали; сработал предохранитель, и неответившие стали «сайт временно недоступен»; пустой `results`;
+- по тому же смыслу (в задании не названо): поиск отменён (`CancelledError`, остановка бота), пока ни один сайт не ответил.
+
+Не возвращается: хоть один сайт `ok`, даже с 0 предложений («рейсов нет»); ответ из кэша глубокого поиска, отказы «занят», по бюджету и по лимиту — там не списывали. Бюджет бота на час (`_note_search_budget`) не возвращается: телефоны работу сделали. Тексты ответов не менялись, новых сообщений нет. Багфикс, без флага.
+
+**Где правка** (`git diff --stat 9ba5ae3 kt1-refund`: 3 файла, +546 −9; `src` — 2 файла, +70 −9):
+- `users.py`: `charge_search(tg_id, limit)` — обёртка над `try_use_search` владельца (его API не менялось), возвращает момент списания или `None`. `refund_search(tg_id, charged_at)` — день берётся из момента списания (`_search_day`, общий с `try_use_search`). Счёт дня уменьшается, только если строка ещё на дне списания и счёт больше 0 — поиск на стыке суток не трогает счёт нового дня; `total_searches` уменьшается всегда, не ниже 0; нет строки — ничего.
+- `bot.py`: `_try_charge_search` (можно ли искать, момент списания), `_refund_search` (ошибка базы — `log.exception` с `chat_id`, ответ человеку не ломается). В обоих поисках флаг `keep_charge`: `any(r.ok for r in results)` сразу после сборки `results` (после предохранителя тоже), `False` в `except`; в `finally` — один вызов `_refund_search`, если `charged_at` есть и `keep_charge` ложно. Одно списание — не больше одного возврата по построению.
+- Время списания берёт `UserStore`, а не `bot.py` (`7342517`): тест `kt1-p0` `test_daily_limit_refusal_resets_searching` переводит часы подменой `avia.users.time`; с `now=time.time()` из `bot.py` он падал на `kt1-all` `094207a` — «завтра» лимит не сбрасывался.
+
+**Коммиты `kt1-refund`:** `0bc40e0` (правка и тесты), `6ec60e9` (тесты по ревью), `7342517` (`charge_search`). Влиты в `kt1-all`: `002e3bf` (конфликт 4), `094207a`, `dad0d32`; тест бюджета — `4bc6e4d`.
+
+**RED** (`9ba5ae3` + `tests/test_search_refund.py`, код не тронут) → **GREEN** `0bc40e0`:
+```
+FAILED test_refund_returns_attempt_of_the_charge_day               (AttributeError: нет refund_search)
+FAILED test_refund_without_user_row_does_nothing                   (то же)
+FAILED test_refund_never_goes_below_zero                           (то же)
+FAILED test_refund_for_previous_day_keeps_new_day_count            (то же)
+FAILED test_live_search_exception_refunds_attempt                  (assert 4 == 3)
+FAILED test_live_no_site_answered_refunds_attempt[all_sites_down]  (assert 4 == 3)
+FAILED test_live_no_site_answered_refunds_attempt[no_results]      (assert 4 == 3)
+FAILED test_live_safety_fired_with_no_answers_refunds_attempt      (assert 4 == 3)
+FAILED test_deep_search_failure_refunds_attempt[exception]         (assert 4 == 3)
+FAILED test_deep_search_failure_refunds_attempt[all_sites_down]    (assert 4 == 3)
+FAILED test_refund_db_error_keeps_normal_reply[live]               (assert [] == [555]: возврата не было)
+FAILED test_refund_db_error_keeps_normal_reply[deep]               (то же)
+FAILED test_refund_across_midnight_keeps_new_day_count             (('2026-11-09', 1, 5) == ('2026-11-09', 1, 4))
+FAILED test_one_charge_one_refund_when_reply_send_fails[live]      (assert 4 == 3)
+FAILED test_one_charge_one_refund_when_reply_send_fails[deep]      (assert 4 == 3)
+15 failed, 8 passed in 0.88s
+---
+23 passed in 0.59s
+```
+8 прошедших в RED — охранные: «сайт ответил — списано» (живой и глубокий), кэш глубокого, админ, отказы «занят» и по лимиту.
+
+**По ревью** (`python-reviewer`, только чтение, на `0bc40e0`: в коде ошибок нет, в тестах не покрыт `keep_charge = False` в `except`) → `6ec60e9`: исключение при отправке выдачи после ответа сайтов — один возврат, живой и глубокий; отмена поиска до ответа сайтов — возврат; полночь — и для глубокого; `time.time` на полдень дня D на весь модуль, чтобы счёт за день не зависел от часа прогона. Мутация — копия `6ec60e9` без двух строк `keep_charge = False`: `2 failed, 25 passed` (`test_exception_after_site_answered_refunds_once[live|deep]`); сам `6ec60e9` — 27 passed. `7342517`: + `test_charge_returns_charge_moment_or_none_over_limit` — 28 passed.
+
+**`kt1-all`, тест бюджета и общего `try`** — `tests/test_search_refund_budget.py` (`4bc6e4d`, 6 тестов): сверх бюджета — ни списания, ни возврата (живой и глубокий); SQLite упал в самом списании под `try` из `kt1-p0` — возвращать нечего; списали, а тот же `try` упал до поиска — один возврат; возврат не отдаёт место в часовом бюджете. RED — на копиях `094207a` с «наивным» разрешением, GREEN — `dad0d32` + тест:
+```
+копия без возврата в общем except:  FAILED test_charged_but_search_not_started_refunds_once (assert [] == [555])
+                                    1 failed, 5 passed in 0.32s
+копия со списанием до бюджета:      FAILED test_budget_refusal_neither_charges_nor_refunds[live] (assert 4 == 3)
+                                    FAILED test_budget_refusal_neither_charges_nor_refunds[deep] (assert 4 == 3)
+                                    2 failed, 4 passed in 0.29s
+---
+kt1-all (тест бюджета, test_search_refund, test_searching_reset, test_bot_budget, test_bot_telegram_limits): 71 passed in 1.63s
+```
+На `094207a` (до `7342517`) тот же набор без `test_bot_telegram_limits.py`: `FAILED test_searching_reset.py::test_daily_limit_refusal_resets_searching`, 1 failed, 55 passed.
+
+**Не проверено / замечания.**
+- Исключение после того, как часть выдачи ушла (упал второй кусок), тоже возвращает попытку: по правилу «исключение в теле — возврат». Редко и в пользу человека.
+- На стыке суток `total_searches` уменьшается, счёт дня — нет (строка уже на новом дне).
+- Возврат — синхронный запрос к `users.sqlite` в цикле событий, как и само списание.
+- Глубокий поиск в `kt1-all`: бюджет и списание стоят вне `try` (место открытого вопроса «молчание при ошибке базы до `busy.add`», `bot.py` около 890–905). Если между списанием и `busy.add` что-то упадёт, попытка не вернётся — не трогал.
+- `droidhub._record_failure`: новая запись владельца `metrics.record_attempt(outcome="empty")` идёт мимо `_record_attempt_nowait` — не правил, по заданию.
+- `gate --profile kt1` не запускался: loadtest не трогаю.
 
 ## Что не проверено во всех ветках
 
