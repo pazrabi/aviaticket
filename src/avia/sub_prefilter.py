@@ -5,12 +5,16 @@
 
 - Страховочный полный сбор: срок — SUB_PREFILTER_FULL_HOURS, по умолчанию 2 интервала опроса подписки
   (poll_interval_seconds владельца). Если до следующей проверки срок истечёт (прошло с последней собранной цены
-  + ожидаемый промежуток до следующей проверки > срока), собираем сейчас и кэш не спрашиваем.
+  + ожидаемый промежуток до следующей проверки > срока), собираем сейчас и кэш не спрашиваем. Ожидаемый промежуток —
+  прошлый, но не меньше интервала: если планировщик опоздает сильнее (очередь групп, простой бота), срок превысится.
 - Иначе — один запрос prices_for_dates (fetch_travelpayouts владельца) на маршрут, не дольше TP_PREVIEW_TIMEOUT.
-  Цена кэша — минимум после фильтров подписки (tp_preview.cheapest, как строка П32).
+  Цена кэша — минимум в валюте подписки после её фильтров (tp_preview.cheapest, как строка П32).
   - отличается от последней собранной цены подписки на ≥ SUB_PREFILTER_PCT % или кэш маршрута не знает — собираем;
+  - у подписки есть порог человека, и цена кэша или последняя собранная не выше его — собираем: «ниже вашего порога»
+    не ждёт страховочного сбора;
   - у всех подписок группы изменения нет — сбор пропускаем (планировщик переносит срок, как после проверки).
 - Ошибка, таймаут, лимит API — собираем, как без предфильтра; WARNING не чаще раза в 10 минут.
+  После ответа 429 (лимит) кэш 10 минут не спрашиваем.
 
 Счётчик решений — в памяти (после перезапуска с нуля), строка в /admin → «Парсинг» под «Источниками».
 """
@@ -34,12 +38,14 @@ log = logging.getLogger("avia.sub_prefilter")
 
 SKIP = "skip"  # сбор пропущен: кэш изменения не показывает
 CHANGED = "changed"  # кэш отличается от последней собранной цены
+THRESHOLD = "threshold"  # цена кэша или последняя собранная не выше порога человека
 UNKNOWN = "unknown"  # кэш маршрута не знает (пусто, всё отсеяно фильтрами, другая валюта)
 FULL = "full"  # страховочный сбор: срок истекает или собранной цены нет
 ERROR = "error"  # ошибка, таймаут или лимит API
-REASONS = (SKIP, CHANGED, UNKNOWN, FULL, ERROR)
+REASONS = (SKIP, CHANGED, THRESHOLD, UNKNOWN, FULL, ERROR)
 
 WARN_EVERY_SECONDS = 600.0  # ошибки кэша — не больше одной строки WARNING за столько секунд
+LIMIT_PAUSE_SECONDS = 600.0  # после ответа 429 кэш не спрашиваем столько секунд
 FULL_INTERVALS = 2  # срок страховки по умолчанию, в интервалах опроса подписки
 KEEP_SECONDS = 7 * 86400.0 + 3600.0  # решения в памяти — на окно «7 дн» в /admin
 
@@ -85,11 +91,12 @@ def price_changed(cache_price: float, last_price: float, pct: float) -> bool:
     return abs(cache_price - last_price) * 100.0 >= pct * last_price
 
 
-def decide(last_price: int | None, cache_price: float | None, pct: float) -> Decision:
+def decide(last_price: int | None, cache_price: float | None, pct: float, threshold: int | None = None) -> Decision:
     """Решение по одной подписке.
 
     last_price — последняя собранная цена за окно страховки (None — окна нет: страховочный сбор);
-    cache_price — минимум кэша после фильтров подписки (None — кэш маршрута не знает).
+    cache_price — минимум кэша после фильтров подписки (None — кэш маршрута не знает);
+    threshold — порог человека («ниже вашего порога»), None — порога нет.
     """
     if last_price is None:
         return Decision(True, FULL)
@@ -97,6 +104,8 @@ def decide(last_price: int | None, cache_price: float | None, pct: float) -> Dec
         return Decision(True, UNKNOWN)
     if price_changed(cache_price, last_price, pct):
         return Decision(True, CHANGED)
+    if threshold is not None and min(cache_price, last_price) <= threshold:
+        return Decision(True, THRESHOLD)
     return Decision(False, SKIP)
 
 
@@ -105,7 +114,7 @@ def _error_text(exc: BaseException) -> str:
     response = getattr(exc, "response", None)
     status = getattr(response, "status_code", None)
     if isinstance(status, int):
-        return f"HTTP {status}" + (" (лимит запросов)" if status == 429 else "")
+        return f"HTTP {status}" + (" (лимит запросов, кэш не спрашиваем 10 мин)" if status == 429 else "")
     return f"{type(exc).__name__}: {str(exc)[:200]}"
 
 
@@ -129,6 +138,7 @@ class SubPrefilter:
         self._events: deque[tuple[float, str]] = deque()
         self._warned_at: float | None = None
         self._quiet_errors = 0
+        self._limited_until: float | None = None  # после 429 — до этого момента (monotonic) кэш не спрашиваем
 
     async def check(self, subs: Sequence[Subscription], now: float, today: date) -> Decision:
         """Собирать ли группу подписок одного маршрута. Не бросает: любая ошибка — «собираем»."""
@@ -153,9 +163,9 @@ class SubPrefilter:
             return Decision(True, ERROR)
         for sub in subs:
             q = sub.query()
-            best = tp_preview.cheapest(offers, q, sub.criteria)
-            cache_price = best.price if best is not None and best.currency == q.currency else None
-            decision = decide(last_prices[sub.id], cache_price, self.pct)
+            best = tp_preview.cheapest([o for o in offers if o.currency == q.currency], q, sub.criteria)
+            cache_price = best.price if best is not None else None
+            decision = decide(last_prices[sub.id], cache_price, self.pct, sub.threshold)
             if decision.collect:
                 return decision
         return Decision(False, SKIP)
@@ -170,6 +180,9 @@ class SubPrefilter:
 
     async def _fetch(self, sub: Subscription) -> list[Offer] | None:
         """Кэш по маршруту подписки; None — ошибка, таймаут или лимит (в лог, не чаще раза в 10 минут)."""
+        if self._limited_until is not None and self.monotonic() < self._limited_until:
+            log.debug("предфильтр подписок: после лимита кэш Aviasales не спрашиваем; собираем на телефонах")
+            return None
         try:
             return await asyncio.wait_for(
                 travelpayouts.fetch_travelpayouts(
@@ -180,6 +193,8 @@ class SubPrefilter:
         except asyncio.TimeoutError:
             self._warn(f"не ответил за {self.timeout:.1f} с")
         except Exception as e:
+            if getattr(getattr(e, "response", None), "status_code", None) == 429:
+                self._limited_until = self.monotonic() + LIMIT_PAUSE_SECONDS
             self._warn(_error_text(e))
         return None
 
@@ -215,7 +230,8 @@ class SubPrefilter:
         total = sum(c.values())
         line = (
             f"Предфильтр подписок: проверок {total} · пропущено {c[SKIP]} · собрано {total - c[SKIP]} "
-            f"(кэш изменился {c[CHANGED]}, кэш не знает {c[UNKNOWN]}, страховочный {c[FULL]}, ошибка кэша {c[ERROR]})"
+            f"(кэш изменился {c[CHANGED]}, у порога {c[THRESHOLD]}, кэш не знает {c[UNKNOWN]}, страховочный {c[FULL]}, "
+            f"ошибка кэша {c[ERROR]})"
         )
         if self.started_at > since_ts:
             line += f" · с запуска {datetime.fromtimestamp(self.started_at):%d.%m %H:%M}"
