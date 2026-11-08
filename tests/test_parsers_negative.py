@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date
 import json
 import logging
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any, Callable
@@ -21,14 +22,21 @@ from typing import Any, Callable
 import pytest
 
 from avia.collector import Snapshot
-from avia.config import Settings, SiteConfig
+from avia.config import Settings, SiteConfig, load_settings
 from avia.formatting import _site_issue
 from avia.guard import SearchGuard
 from avia.metrics import MetricsStore
-from avia.models import Offer, Query, SiteResult
+from avia.models import Leg, Offer, Query, SiteResult
 from avia.parser_watch import STATUS_BROKEN, STATUS_DEGRADED, get_parser_statuses
 from avia.parsers import PARSERS
-from avia.pipeline import ParserEmptyError, _process_snapshot, _quick_parse_offers, search
+from avia import pipeline
+from avia.pipeline import (
+    ParserEmptyError,
+    _process_snapshot,
+    _quick_parse_offers,
+    _save_empty_snapshot,
+    search,
+)
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 DEVICE = "dev1"
@@ -242,9 +250,10 @@ def _offer_key(offer: Offer) -> tuple[Any, ...]:
     return (offer.price, offer.depart_at, offer.arrive_at, tuple(offer.flight_numbers or ()), offer.airline)
 
 
-def _settings(tmp_path: Path, case: SiteCase, store: MetricsStore | None = None, **extra: Any) -> Settings:
+def _settings(tmp_path: Path, case: SiteCase, store: MetricsStore | None = None, phone: str = DEVICE,
+              **extra: Any) -> Settings:
     site = SiteConfig(name=case.name, url_template="https://site.test/{origin}{destination}", source="browser",
-                      parser=case.name, phone=DEVICE)
+                      parser=case.name, phone=phone)
     return Settings(sites=[site], storage_dir=tmp_path, metrics=store, droidhub_url="https://hub.test",
                     droidhub_token="hub-test-token", debug_dir=tmp_path / "debug", **extra)
 
@@ -254,22 +263,37 @@ def _no_empty_retry_delay(monkeypatch):
     monkeypatch.setattr("avia.pipeline.EMPTY_RETRY_DELAY", 0.0)
 
 
-async def _search_with_snapshot(tmp_path: Path, monkeypatch, case: SiteCase, snap: Snapshot) -> tuple[SiteResult, MetricsStore]:
-    """Живой поиск по одному сайту с одним телефоном; результат пишется в site_runs, как в боте."""
+async def _search_with_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+    case: SiteCase,
+    snap: Snapshot | list[Snapshot],
+    *,
+    priority: int = 0,
+    phone: str = DEVICE,
+    **extra: Any,
+) -> tuple[SiteResult, MetricsStore]:
+    """Поиск по одному сайту; сборщик отдаёт снимки по очереди сборов. Результат пишется в site_runs, как в боте."""
     store = MetricsStore(tmp_path / "metrics.sqlite")
-    settings = _settings(tmp_path, case, store)
+    settings = _settings(tmp_path, case, store, phone=phone, **extra)
+    queue = list(snap) if isinstance(snap, list) else None
 
     async def fake_fetch_any(_settings, cands, url, **kwargs):
         stats = kwargs.get("stats")
         if stats is not None:
             stats.update({"device": cands[0], "tried": [cands[0]], "queue_wait": 0.1, "fetch_seconds": 2.0})
-        return snap, True
+        return (queue.pop(0) if queue is not None else snap), True
 
     monkeypatch.setattr("avia.pipeline.fetch_page_snapshot_any", fake_fetch_any)
-    results = await search(case.query, settings, priority=0, guard=SearchGuard(min_interval=0.0, retry_delay=0.0))
-    store.record_results("user", results)
+    results = await search(case.query, settings, priority=priority, guard=SearchGuard(min_interval=0.0, retry_delay=0.0))
+    store.record_results("user" if priority == 0 else "bg", results)
     assert len(results) == 1
     return results[0], store
+
+
+def _debug_snapshots(tmp_path: Path) -> list[str]:
+    debug_dir = tmp_path / "debug"
+    return sorted(p.name for p in debug_dir.iterdir()) if debug_dir.exists() else []
 
 
 def _site_runs(store: MetricsStore) -> list[dict[str, Any]]:
@@ -384,24 +408,146 @@ async def test_renamed_format_recorded_as_failed_run(tmp_path, monkeypatch, case
     assert _site_issue(result).startswith("⚠️")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Отладочный снимок не доживает до владельца: _process_snapshot сохраняет его в debug_dir, "
-        "а _fetch удаляет его сразу при ParserEmptyError (pipeline.py:1208–1212), ещё до решения о повторе — "
-        "и когда повтора не будет. Предложение в docs/audit/kt4_parsers.md"
-    ),
-)
-@pytest.mark.asyncio
-async def test_renamed_format_keeps_debug_snapshot_when_no_retry(tmp_path, monkeypatch):
-    case = SITE_CASES[0]
+# ---------------------------------------------------------------------------
+# 3а. Отладочный снимок при ParserEmptyError: остаётся, если повтора на другом телефоне не будет
+# ---------------------------------------------------------------------------
+
+
+def _renamed_snapshot(case: SiteCase) -> Snapshot:
     data = case.data()
     case.rename_format(data)
+    return case.snapshot(data)
 
-    result, _ = await _search_with_snapshot(tmp_path, monkeypatch, case, case.snapshot(data))
+
+@pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
+@pytest.mark.asyncio
+async def test_renamed_format_keeps_debug_snapshot_when_no_retry(tmp_path, monkeypatch, case):
+    """Последний кандидат: повтора нет — снимок остаётся владельцу."""
+    result, _ = await _search_with_snapshot(tmp_path, monkeypatch, case, _renamed_snapshot(case))
 
     assert result.ok is False
-    assert list((tmp_path / "debug").glob(f"{case.name}_empty_*.json"))
+    snaps = _debug_snapshots(tmp_path)
+    assert len(snaps) == 1 and snaps[0].startswith(f"{case.name}_empty_")
+
+
+def _retry_answers(monkeypatch, answers: list[bool]) -> list[bool]:
+    """Подменяет решение о повторе: первый ответ — в _from_browser, второй — в _fetch."""
+    calls: list[bool] = []
+
+    def fake_can_retry(*args: Any, **kwargs: Any) -> bool:
+        answer = answers[len(calls)]
+        calls.append(answer)
+        return answer
+
+    monkeypatch.setattr("avia.pipeline._can_retry_on_phone", fake_can_retry)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_fetch_retry_on_other_phone_removes_debug_snapshot(tmp_path, monkeypatch):
+    case = SITE_CASES[0]
+    calls = _retry_answers(monkeypatch, [False, True])
+
+    result, _ = await _search_with_snapshot(
+        tmp_path, monkeypatch, case, [_renamed_snapshot(case), case.snapshot(case.data())],
+        phone="dev1,dev2", hedge=False,
+    )
+
+    assert calls == [False, True]
+    assert (result.ok, len(result.offers), result.device) == (True, case.normal_count, "dev2")
+    assert _debug_snapshots(tmp_path) == []
+
+
+@pytest.mark.asyncio
+async def test_fetch_no_retry_keeps_debug_snapshot(tmp_path, monkeypatch):
+    case = SITE_CASES[0]
+    calls = _retry_answers(monkeypatch, [False, False])
+
+    result, _ = await _search_with_snapshot(
+        tmp_path, monkeypatch, case, [_renamed_snapshot(case)], phone="dev1,dev2", hedge=False,
+    )
+
+    assert calls == [False, False]
+    assert result.ok is False
+    assert len(_debug_snapshots(tmp_path)) == 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_retry_on_same_phone_keeps_debug_snapshot(tmp_path, monkeypatch):
+    """Фон, один телефон: повтор пойдёт на тот же телефон, а не на другой — снимок первой попытки остаётся."""
+    case = SITE_CASES[0]
+
+    result, _ = await _search_with_snapshot(
+        tmp_path, monkeypatch, case, [_renamed_snapshot(case), case.snapshot(case.data())], priority=2,
+    )
+
+    assert (result.ok, len(result.offers)) == (True, case.normal_count)
+    assert len(_debug_snapshots(tmp_path)) == 1
+
+
+@pytest.mark.asyncio
+async def test_in_loop_retry_on_other_phone_removes_debug_snapshot(tmp_path, monkeypatch):
+    """Как было: повтор на втором телефоне внутри _from_browser удаляет снимок первого."""
+    case = SITE_CASES[0]
+
+    result, _ = await _search_with_snapshot(
+        tmp_path, monkeypatch, case, [_renamed_snapshot(case), case.snapshot(case.data())],
+        phone="dev1,dev2", hedge=False,
+    )
+
+    assert (result.ok, result.device) == (True, "dev2")
+    assert _debug_snapshots(tmp_path) == []
+
+
+def _make_debug_files(debug_dir: Path, names: list[str], start_mtime: float = 1_700_000_000.0) -> None:
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    for i, name in enumerate(names):
+        path = debug_dir / name
+        path.write_text("{}", encoding="utf-8")
+        os.utime(path, (start_mtime + i, start_mtime + i))
+
+
+SNAPSHOT_MAX = 100
+OLD_SNAPSHOTS = [f"aviasales_empty_20261101_{i:06d}.json" for i in range(SNAPSHOT_MAX + 5)]
+NOT_SNAPSHOTS = [
+    "aviasales.png",  # скриншот сборщика
+    "aviasales.txt",  # текст страницы сборщика
+    "notes_empty_20261101_000001.txt",
+    "aviasales_empty_latest.json",
+    "aviasales_other_20261101_000001.json",
+]
+
+
+def test_debug_snapshots_capped_oldest_removed(tmp_path):
+    """Сверх DEBUG_SNAPSHOTS_MAX удаляются самые старые снимки — только по шаблону имени и только в debug_dir."""
+    case = SITE_CASES[0]
+    settings = _settings(tmp_path, case, debug_snapshots_max=SNAPSHOT_MAX)
+    debug_dir = tmp_path / "debug"
+    _make_debug_files(debug_dir, OLD_SNAPSHOTS)
+    _make_debug_files(debug_dir, NOT_SNAPSHOTS)
+    _make_debug_files(debug_dir / "recon", OLD_SNAPSHOTS[:3])
+
+    new_path = _save_empty_snapshot(settings.sites[0], _renamed_snapshot(case), settings)
+
+    snapshots = sorted(p.name for p in debug_dir.iterdir() if p.is_file() and p.name.endswith(".json")
+                       and p.name not in NOT_SNAPSHOTS)
+    assert new_path is not None and new_path.exists()
+    assert len(snapshots) == SNAPSHOT_MAX
+    assert set(OLD_SNAPSHOTS[:6]).isdisjoint(snapshots)
+    assert set(OLD_SNAPSHOTS[6:]) <= set(snapshots)
+    assert all((debug_dir / name).exists() for name in NOT_SNAPSHOTS)
+    assert sorted(p.name for p in (debug_dir / "recon").iterdir()) == OLD_SNAPSHOTS[:3]
+
+
+def test_debug_snapshots_not_capped_when_limit_off(tmp_path):
+    """DEBUG_SNAPSHOTS_MAX = 0 — предел выключен, как было до правки."""
+    case = SITE_CASES[0]
+    settings = _settings(tmp_path, case, debug_snapshots_max=0)
+    _make_debug_files(tmp_path / "debug", OLD_SNAPSHOTS)
+
+    _save_empty_snapshot(settings.sites[0], _renamed_snapshot(case), settings)
+
+    assert len(list((tmp_path / "debug").iterdir())) == len(OLD_SNAPSHOTS) + 1
 
 
 @pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
@@ -454,34 +600,138 @@ def test_one_element_with_garbage_time_does_not_break_the_rest(case):
     assert len(kept & intact) >= case.normal_count - 1
 
 
-_GARBAGE_TIME_KEPT = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Кривой элемент не пропущен: билет с мусором вместо времени вылета остаётся в выдаче человека "
-        "(kupibilet, ttravel, tutu — время «мусор», ozon_travel — без времени). У aviasales и yandex_travel "
-        "мусор уходит и в depart_at, и билет отбрасывает filter_wrong_dates как «неверные даты». Правка меняет "
-        "поведение — решает приёмщик, предложение в docs/audit/kt4_parsers.md"
-    ),
-)
-
-
-@pytest.mark.parametrize(
-    "case",
-    [pytest.param(c, id=c.name, marks=() if c.name in ("aviasales", "yandex_travel") else _GARBAGE_TIME_KEPT)
-     for c in SITE_CASES],
-)
+@pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
 @pytest.mark.asyncio
-async def test_one_element_with_garbage_time_not_shown(tmp_path, case):
-    """То, что получит человек после _process_snapshot: билета с мусором вместо времени нет, остальные на месте."""
+async def test_one_element_with_garbage_time_skipped_as_crooked(tmp_path, case, caplog):
+    """Мусор вместо времени — кривой элемент: пропущен, в строке «пропущено», а не «неверные даты»."""
     intact = {_offer_key(o) for o in _intact_offers(case)}
     data = case.data()
+    total = len(case.elements(data))
     case.garbage_time(data, case.elements(data)[0])
     settings = _settings(tmp_path, case)
 
-    offers, _, _ = await _process_snapshot(settings.sites[0], case.snapshot(data), case.query, settings)
+    with caplog.at_level(logging.WARNING):
+        offers, _, _ = await _process_snapshot(settings.sites[0], case.snapshot(data), case.query, settings)
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert len(offers) == case.normal_count - 1
+    assert {_offer_key(o) for o in offers} < intact
+    assert [m for m in messages if "пропущено" in m] == [f"Сайт {case.name}: пропущено 1 из {total} элементов выдачи"]
+    assert not [m for m in messages if "неверными датами" in m]
+
+
+@pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
+def test_quick_parse_drops_garbage_time(case):
+    """Быстрый разбор (FAST_STOP) не видит цену билета, который полный разбор выбросит."""
+    intact = {_offer_key(o) for o in _intact_offers(case)}
+    data = case.data()
+    case.garbage_time(data, case.elements(data)[0])
+    site = SiteConfig(name=case.name, url_template="https://site.test/{origin}{destination}", parser=case.name)
+
+    offers = _quick_parse_offers(site, case.snapshot(data), case.query)
 
     assert len(offers) == case.normal_count - 1
     assert {_offer_key(o) for o in offers} < intact
+
+
+TIME_QUERY = Query("MOW", "LED", date(2026, 12, 10))
+TIME_OFFERS = [
+    # (цена, время вылета, время прилёта, вылет ISO, обратное плечо, останется ли)
+    (1000, "07:05", "9:10", "2026-12-10T07:05", None, True),
+    (1100, None, None, None, None, True),  # время неизвестно — билет остаётся, как раньше
+    (1200, "", "", "", None, True),  # пустое время — тоже
+    (1300, "07:05", "09:10", "2026-12-10T07:05:00+03:00", None, True),
+    (1400, "мусор", "09:10", None, None, False),
+    (1500, "25:00", "09:10", None, None, False),
+    (1600, "07:05", "09:10", "мусор", None, False),
+    (1700, "07:05", "09:10", None, Leg(depart_time="мусор"), False),
+    (1800, "07:05", "09:10", None, Leg(depart_time="18:40", arrive_time="20:15"), True),
+]
+
+
+@pytest.mark.asyncio
+async def test_time_check_drops_only_present_malformed_times(tmp_path, monkeypatch, caplog):
+    """Одна проверка в _process_snapshot: время есть, но не ЧЧ:ММ (или ISO не ГГГГ-ММ-ДДTЧЧ:ММ) — кривой элемент."""
+    def fake_parser(snap, q):
+        return [Offer(site="fake_times", price=price, depart_time=dep, arrive_time=arr, depart_at=dep_at, back=back)
+                for price, dep, arr, dep_at, back, _ in TIME_OFFERS]
+
+    monkeypatch.setitem(PARSERS, "fake_times", fake_parser)
+    site = SiteConfig(name="fake_times", url_template="https://site.test/{origin}{destination}", parser="fake_times")
+    settings = Settings(sites=[site], storage_dir=tmp_path, debug_dir=tmp_path / "debug")
+
+    with caplog.at_level(logging.WARNING):
+        offers, _, _ = await _process_snapshot(site, Snapshot(url="u", text=""), TIME_QUERY, settings)
+
+    assert sorted(o.price for o in offers) == [p for p, *_, keep in TIME_OFFERS if keep]
+    assert [r.getMessage() for r in caplog.records if "пропущено" in r.getMessage()] == [
+        f"Сайт fake_times: пропущено 4 из {len(TIME_OFFERS)} элементов выдачи"
+    ]
+
+
+@pytest.mark.parametrize("text", [None, ""], ids=["no_trip_time", "empty_trip_time"])
+def test_ozon_card_without_time_kept(text):
+    """Ozon: времени в карточке нет — билет остаётся без времени, как раньше; мусор — пропуск (тест выше)."""
+    case = next(c for c in SITE_CASES if c.name == "ozon_travel")
+    data = case.data()
+    details = case.elements(data)[0]["wayThereDetails"]
+    if text is None:
+        details.pop("tripTime")
+    else:
+        details["tripTime"]["text"] = text
+
+    offers = case.parse(case.snapshot(data))
+
+    assert len(offers) == case.normal_count
+    assert offers.skipped == 0
+    assert sum(1 for o in offers if o.depart_time is None) == 1
+
+
+ALL_FIXTURES = [
+    ("aviasales", name) for name in ("results_final_mow_ala.json", "results_mow_ala.json",
+                                     "results_partial_mow_ala.json", "results_rt_kuf_evn.json")
+] + [("kupibilet", name) for name in ("search_full_mow_ala.json", "search_quick_mow_ala.json", "search_rt_kuf_evn.json")] + [
+    ("ozon_travel", name) for name in ("search_oneway_kuf_evn_0112_widget.json", "search_rt_kuf_evn_0112_0812_widget.json")
+] + [("ttravel", name) for name in ("search_ow_kuf_mow_1210.json", "search_rt_kuf_svo_1210_1217.json")] + [
+    ("tutu", name) for name in ("offers_first_mow_ala.json", "offers_last_mow_ala.json", "offers_rt_a_kuf_evn.json",
+                                "offers_rt_cheapest_kuf_evn.json", "offers_rt_final_kuf_evn.json")
+] + [("yandex_travel", name) for name in ("results_cont0_mow_ala.json", "results_cont_last_mow_ala.json",
+                                          "results_rt_a_kuf_evn.json", "results_rt_b_kuf_evn.json",
+                                          "results_rt_final_kuf_evn.json")]
+TEXT_PAGES = [
+    ("ozon_travel", "text_only_oneway_kuf_evn_0112_page.txt", Query("KUF", "EVN", date(2026, 12, 1))),
+    ("ozon_travel", "text_only_oneway_kuf_evn_0412_page.txt", Query("KUF", "EVN", date(2026, 12, 4))),
+    ("ozon_travel", "text_rt_kuf_evn_0112_0812_page.txt", Query("KUF", "EVN", date(2026, 12, 1), return_date=date(2026, 12, 8))),
+    ("yandex_travel", "text_only_oneway_mow_led_1012_page.txt", Query("MOW", "LED", date(2026, 12, 10))),
+]
+OW_QUERY = Query("MOW", "ALA", date(2026, 12, 10))
+RT_QUERY = Query("KUF", "EVN", date(2026, 12, 1), return_date=date(2026, 12, 8))
+
+
+def _fixture_snapshot(site: str, name: str) -> Snapshot:
+    case = next(c for c in SITE_CASES if c.name == site)
+    body = (FIXTURES_DIR / site / name).read_text(encoding="utf-8")
+    if name.endswith(".txt"):
+        return Snapshot(url=case.page_url, text=body, json_payloads=[])
+    return Snapshot(url=case.page_url, text="", json_payloads=[(case.payload_url, body)])
+
+
+def _json_fixture_query(name: str) -> Query:
+    return RT_QUERY if "_rt" in name else OW_QUERY
+
+
+@pytest.mark.parametrize(
+    ("site", "name", "query"),
+    [(s, n, _json_fixture_query(n)) for s, n in ALL_FIXTURES] + TEXT_PAGES,
+    ids=[n for _, n in ALL_FIXTURES] + [n for _, n, _ in TEXT_PAGES],
+)
+def test_intact_fixtures_have_no_skips_and_no_bad_times(site, name, query):
+    """Все 21 целая JSON-фикстура и 4 текстовые страницы: ни одного пропуска, ни одного кривого времени."""
+    offers = PARSERS[site](_fixture_snapshot(site, name), query)
+
+    assert offers
+    assert offers.skipped == 0
+    assert not [o for o in offers if pipeline._has_bad_time(o)]
 
 
 @pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
@@ -597,14 +847,12 @@ async def test_one_crooked_element_run_stays_successful(tmp_path, monkeypatch, c
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
-@pytest.mark.asyncio
-async def test_short_page_without_captcha_current_behaviour(tmp_path, monkeypatch, case):
-    """Сейчас: «0 вариантов», сбор удачный (ok = 1, partial = 1), человек видит «билетов не нашлось»."""
-    snap = Snapshot(url=case.page_url, text=SHORT_PAGE_TEXT, json_payloads=[])
+def _short_page(case: SiteCase, payloads: list[tuple[str, str]] | None = None) -> Snapshot:
+    return Snapshot(url=case.page_url, text=SHORT_PAGE_TEXT, json_payloads=payloads or [])
 
-    result, store = await _search_with_snapshot(tmp_path, monkeypatch, case, snap)
 
+async def _assert_short_page_as_before(result: SiteResult, store: MetricsStore, tmp_path: Path, case: SiteCase) -> None:
+    """Как до флага: «0 вариантов», сбор удачный (ok = 1, partial = 1), человек видит «билетов не нашлось»."""
     assert (result.ok, result.offers, result.partial, result.error) == (True, [], True, None)
     assert _site_runs(store) == [
         {"site": case.name, "ok": 1, "partial": 1, "captcha": 0, "error": None, "offers": 0, "device": DEVICE}
@@ -613,22 +861,99 @@ async def test_short_page_without_captcha_current_behaviour(tmp_path, monkeypatc
     assert _watch_status(tmp_path, case, store) == STATUS_DEGRADED
     assert "билетов не нашлось" in _site_issue(result)
     assert "неполная выдача" in _site_issue(result)
+    assert _debug_snapshots(tmp_path) == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Порог плана не выполняется: короткая страница без капчи (меньше 200 символов, «502 Bad Gateway») "
-        "даёт 0 вариантов и удачный сбор ok = 1, partial = 1; parser_watch считает его удачным, человек видит "
-        "«билетов не нашлось». Предложение — в docs/audit/kt4_parsers.md, решает приёмщик"
-    ),
-)
+@pytest.mark.parametrize("flag", [None, False], ids=["flag_default", "flag_0"])
 @pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
 @pytest.mark.asyncio
-async def test_short_page_without_captcha_counted_as_failed_run(tmp_path, monkeypatch, case):
-    snap = Snapshot(url=case.page_url, text=SHORT_PAGE_TEXT, json_payloads=[])
+async def test_short_page_flag_off_behaves_as_before(tmp_path, monkeypatch, case, flag):
+    """SHORT_PAGE_FAIL = 0 (по умолчанию): короткая страница — как до правки."""
+    extra = {} if flag is None else {"short_page_fail": flag}
 
-    result, store = await _search_with_snapshot(tmp_path, monkeypatch, case, snap)
+    result, store = await _search_with_snapshot(tmp_path, monkeypatch, case, _short_page(case), **extra)
+
+    await _assert_short_page_as_before(result, store, tmp_path, case)
+
+
+@pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
+@pytest.mark.asyncio
+async def test_short_page_flag_on_counted_as_failed_run(tmp_path, monkeypatch, case):
+    """SHORT_PAGE_FAIL = 1: короткая страница без JSON-ответов — неудачный сбор и строка ошибки сайта."""
+    result, store = await _search_with_snapshot(tmp_path, monkeypatch, case, _short_page(case), short_page_fail=True)
+
+    assert (result.ok, result.offers, result.captcha) == (False, [], False)
+    assert result.error == "сайт не отдал выдачу: «502 Bad Gateway nginx»"
+    assert _site_runs(store) == [
+        {"site": case.name, "ok": 0, "partial": 0, "captcha": 0, "error": result.error, "offers": 0, "device": DEVICE}
+    ]
+    assert store.watch_stats(0)[case.name] == {"runs": 1, "ok": 0, "partial": 0}
+    assert _watch_status(tmp_path, case, store) == STATUS_BROKEN
+    issue = _site_issue(result)
+    assert issue.startswith("⚠️") and "сайт не отдал выдачу" in issue
+    assert "билетов не нашлось" not in issue
+    snaps = _debug_snapshots(tmp_path)
+    assert len(snaps) == 1 and snaps[0].startswith(f"{case.name}_short_")
+
+
+@pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
+@pytest.mark.asyncio
+async def test_short_page_flag_on_with_json_answer_behaves_as_before(tmp_path, monkeypatch, case):
+    """Сайт ответил JSON, но билетов нет (тело «{}») — это не «сайт не отдал выдачу»: как до правки."""
+    snap = _short_page(case, [(case.payload_url, "{}")])
+
+    result, store = await _search_with_snapshot(tmp_path, monkeypatch, case, snap, short_page_fail=True)
+
+    await _assert_short_page_as_before(result, store, tmp_path, case)
+
+
+@pytest.mark.parametrize("case", SITE_CASES, ids=CASE_IDS)
+@pytest.mark.asyncio
+async def test_short_page_flag_on_with_html_in_captured_answer_fails(tmp_path, monkeypatch, case):
+    """Перехваченный ответ выдачи — HTML 502, а не JSON: JSON-ответов нет, сбор неудачный."""
+    snap = _short_page(case, [(case.payload_url, "<html><body>502 Bad Gateway</body></html>")])
+
+    result, store = await _search_with_snapshot(tmp_path, monkeypatch, case, snap, short_page_fail=True)
 
     assert result.ok is False
-    assert store.watch_stats(0)[case.name]["ok"] == 0
+    assert _site_runs(store)[0]["ok"] == 0
+
+
+@pytest.mark.asyncio
+async def test_short_page_flag_on_captcha_still_captcha(tmp_path, monkeypatch):
+    """Капча остаётся капчей и при SHORT_PAGE_FAIL = 1."""
+    case = SITE_CASES[0]
+    snap = Snapshot(url=case.page_url, text=CAPTCHA_PAGE_TEXT, json_payloads=[], blocked=True)
+
+    result, store = await _search_with_snapshot(tmp_path, monkeypatch, case, snap, short_page_fail=True)
+
+    assert (result.ok, result.captcha) == (False, True)
+    assert _site_runs(store)[0]["captcha"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 6. Флаги в config: SHORT_PAGE_FAIL (0/1, по умолчанию 0), DEBUG_SNAPSHOTS_MAX (по умолчанию 100)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [(None, False), ("0", False), ("1", True), ("true", True), ("off", False)],
+)
+def test_load_settings_short_page_fail(monkeypatch, env, expected):
+    if env is None:
+        monkeypatch.delenv("SHORT_PAGE_FAIL", raising=False)
+    else:
+        monkeypatch.setenv("SHORT_PAGE_FAIL", env)
+
+    assert load_settings().short_page_fail is expected
+
+
+@pytest.mark.parametrize(("env", "expected"), [(None, 100), ("5", 5), ("0", 0), ("abc", 100)])
+def test_load_settings_debug_snapshots_max(monkeypatch, env, expected):
+    if env is None:
+        monkeypatch.delenv("DEBUG_SNAPSHOTS_MAX", raising=False)
+    else:
+        monkeypatch.setenv("DEBUG_SNAPSHOTS_MAX", env)
+
+    assert load_settings().debug_snapshots_max == expected
