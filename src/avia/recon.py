@@ -43,7 +43,10 @@ def parse_recon_return_date(val: str, depart: date, today: date | None = None) -
 def parse_recon_args(args: list[str], today: date | None = None) -> tuple[str, Query]:
     """Разбирает аргументы recon: <сайт> <откуда> <куда> <вылет> [возврат]."""
     if len(args) < 4:
-        raise ParseError("Формат: python -m avia.recon <сайт> Москва Алматы 10.12 [дата_возврата] [--show]")
+        raise ParseError(
+            "Формат: python -m avia.recon <сайт> Москва Алматы 10.12 [дата_возврата] [--show]\n"
+            "Чтобы выбрать аэропорт, напишите, например: Москва Домодедово или DME"
+        )
     site_name = args[0]
     origin = to_iata(args[1])
     destination = to_iata(args[2])
@@ -65,7 +68,10 @@ def parse_recon_args(args: list[str], today: date | None = None) -> tuple[str, Q
 async def main() -> int:
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if len(args) < 4:
-        print("Формат: python -m avia.recon <сайт> Москва Алматы 10.12 [дата_возврата] [--show]")
+        print(
+            "Формат: python -m avia.recon <сайт> Москва Алматы 10.12 [дата_возврата] [--show]\n"
+            "Чтобы выбрать аэропорт, напишите, например: Москва Домодедово или DME"
+        )
         return 2
     try:
         site_name, q = parse_recon_args(args)

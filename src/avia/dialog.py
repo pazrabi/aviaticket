@@ -57,7 +57,8 @@ HELP = (
     "⚡ <b>Быстрый поиск командой</b>\n"
     "<code>/price Москва Алматы 10.12</code>\n"
     "<code>/price MOW TAS 2026-12-10 2</code> — 2 пассажира\n\n"
-    "Города можно писать по-русски или кодом IATA."
+    "Города можно писать по-русски или кодом IATA.\n"
+    "Чтобы выбрать аэропорт, напишите, например: Москва Домодедово или DME."
 )
 
 
@@ -999,14 +1000,14 @@ class Dialog:
                 ] + [[("✖ Отмена", f"cancel:{session.dialog_id}")]]
                 return [
                     Reply(
-                        text=f"⚠️ {escape(str(e))}\n\n🛫 <b>Откуда летим?</b>\nГород или код IATA, например <i>Москва</i> или <i>MOW</i>",
+                        text=f"⚠️ {escape(str(e))}\n\n🛫 <b>Откуда летим?</b>\nГород или код IATA, например <i>Москва</i> или <i>MOW</i>\nЧтобы выбрать аэропорт, напишите, например: Москва Домодедово или DME",
                         keyboard=kb,
                     )
                 ]
             except ParseError as e:
                 return [
                     Reply(
-                        text=f"⚠️ {escape(str(e))}\n\n🛫 <b>Откуда летим?</b>\nГород или код IATA, например <i>Москва</i> или <i>MOW</i>",
+                        text=f"⚠️ {escape(str(e))}\n\n🛫 <b>Откуда летим?</b>\nГород или код IATA, например <i>Москва</i> или <i>MOW</i>\nЧтобы выбрать аэропорт, напишите, например: Москва Домодедово или DME",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
@@ -1031,14 +1032,14 @@ class Dialog:
                 ] + [[("✖ Отмена", f"cancel:{session.dialog_id}")]]
                 return [
                     Reply(
-                        text=f"⚠️ {escape(str(e))}\n\n🛬 <b>Куда летим?</b>\nГород или код IATA, например <i>Ереван</i> или <i>EVN</i>",
+                        text=f"⚠️ {escape(str(e))}\n\n🛬 <b>Куда летим?</b>\nГород или код IATA, например <i>Ереван</i> или <i>EVN</i>\nЧтобы выбрать аэропорт, напишите, например: Москва Домодедово или DME",
                         keyboard=kb,
                     )
                 ]
             except ParseError as e:
                 return [
                     Reply(
-                        text=f"⚠️ {escape(str(e))}\n\n🛬 <b>Куда летим?</b>\nГород или код IATA, например <i>Ереван</i> или <i>EVN</i>",
+                        text=f"⚠️ {escape(str(e))}\n\n🛬 <b>Куда летим?</b>\nГород или код IATA, например <i>Ереван</i> или <i>EVN</i>\nЧтобы выбрать аэропорт, напишите, например: Москва Домодедово или DME",
                         keyboard=[[("✖ Отмена", f"cancel:{session.dialog_id}")]],
                     )
                 ]
