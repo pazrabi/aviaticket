@@ -255,6 +255,8 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
     summary = ctx.get("summary")
     if not summary or summary.get("_total", {}).get("runs", 0) == 0:
         lines.append("Данных пока нет: метрики копятся с момента включения")
+        if ctx.get("sub_prefilter_line"):  # все сборы подписок пропущены — пропуски всё равно видны
+            lines.extend(["", ctx["sub_prefilter_line"]])
         return "\n".join(lines)
 
     settings = ctx.get("settings")
@@ -339,6 +341,8 @@ def build_parse(ctx: dict[str, Any], period: str = "24h") -> str:
     lines.append("")
     lines.append("<b>Источники:</b>")
     lines.append(f"Люди: {u_c} · Подписки: {s_c} · Фон: {b_c}")
+    if ctx.get("sub_prefilter_line"):  # КТ4, работа 2: только при SUB_PREFILTER=1 и TP_TOKEN
+        lines.append(ctx["sub_prefilter_line"])
 
     devs = ctx.get("devices_summary") or ctx.get("by_device") or {}
     site_devs = ctx.get("site_devices_summary") or ctx.get("by_site_device") or {}

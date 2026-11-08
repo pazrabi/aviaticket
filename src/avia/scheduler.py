@@ -92,6 +92,7 @@ class Scheduler:
         today: Callable[[], date] = date.today,
         max_groups_per_run: int = 5,
         trial_sites: set[str] = frozenset(),
+        prefilter: Any | None = None,
     ) -> None:
         self.store = store
         self.search_fn = search_fn
@@ -101,6 +102,8 @@ class Scheduler:
         self.clock = clock
         self.today = today
         self.max_groups_per_run = max_groups_per_run
+        # КТ4, работа 2: предфильтр подписок (sub_prefilter.SubPrefilter); None — собираем каждую проверку, как было
+        self.prefilter = prefilter
         try:
             self.trial_sites = set(trial_sites) if trial_sites else frozenset()
         except Exception as e:
@@ -170,6 +173,8 @@ class Scheduler:
             try:
                 first_sub = group_subs[0]
                 query = first_sub.query()
+                if self.prefilter is not None and await self._prefilter_skips(group_subs, today_val):
+                    continue
                 try:
                     results = await self.search_fn(query)
                 except Exception:
@@ -325,6 +330,16 @@ class Scheduler:
                 log.exception("Ошибка обработки группы %s", group_key)
 
         return notifications_sent
+
+    async def _prefilter_skips(self, group_subs: list[Subscription], today_val: date) -> bool:
+        """Кэш изменения не показывает: сбор пропущен, срок подписок перенесён, как после обычной проверки."""
+        decision = await self.prefilter.check(group_subs, self.clock(), today_val)
+        if decision.collect:
+            return False
+        now = self.clock()
+        for sub in group_subs:
+            self.store.mark_checked(sub.id, now)
+        return True
 
     async def run_forever(self, tick_seconds: float = 300.0) -> None:
         """Бесконечный цикл run_once; ошибки логируются, asyncio.CancelledError пробрасывается."""
