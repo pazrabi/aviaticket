@@ -118,3 +118,17 @@ sites:
     settle_ms: 25000
     scrolls: 2
 
+  # City Travel: новый агрегатор, пробный режим (stage: trial). Текстовая выдача, без перехвата JSON.
+  - name: city_travel
+    source: browser
+    parser: city_travel
+    enabled: true
+    stage: trial
+    phone: "galaxya12,huawei2"
+    phone_patience_seconds: 10
+    phone_wait_seconds: 25
+    url_template: "https://city.travel/avia/search/{origin}/{destination}/E/{dd_mm_yyyy}/0/{adults}-0-0/0/0/0/00000000000000000000000000000000"
+    url_template_rt: "https://city.travel/avia/search/{origin}/{destination}/E/{dd_mm_yyyy}/{dd_mm_yyyy_ret}/{adults}-0-0/0/0/0/00000000000000000000000000000000?rt=RTA{destination}"
+    settle_ms: 15000
+    scrolls: 2
+
