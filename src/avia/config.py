@@ -10,6 +10,19 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 log = logging.getLogger("avia.config")
 
+# Окно доли успехов пары «сайт × телефон» в speed.py — последние N сборов пары (SPEED_PAIR_WINDOW)
+SPEED_PAIR_WINDOW_DEFAULT = 30
+SPEED_PAIR_WINDOW_MIN = 5
+
+
+def normalize_pair_window(value: object) -> int:
+    """Окно доли успехов пары: целое не меньше 5; мусор, пусто или меньше 5 — 30 (как было)."""
+    try:
+        window = int(str(value).strip())
+    except (TypeError, ValueError):
+        return SPEED_PAIR_WINDOW_DEFAULT
+    return window if window >= SPEED_PAIR_WINDOW_MIN else SPEED_PAIR_WINDOW_DEFAULT
+
 
 @dataclass
 class SiteConfig:
@@ -135,6 +148,8 @@ class Settings:
     speed_quarantine_seconds: int = 600
     speed_refresh_seconds: int = 300
     speed_live_min_p_lower: float = 0.6
+    # окно доли успехов пары (30 — как было); не 30 — ещё и запасные живого поиска: слабая после непроверенной
+    speed_pair_window: int = SPEED_PAIR_WINDOW_DEFAULT
     phone_min_battery: int = 15
     live_assignment: bool = True
     phone_wake_seconds: float = 5.0
@@ -251,6 +266,7 @@ def load_settings(path: Path | None = None) -> Settings:
         speed_live_min_p_lower = float(os.getenv("SPEED_LIVE_MIN_P_LOWER", "0.6"))
     except ValueError:
         speed_live_min_p_lower = 0.6
+    speed_pair_window = normalize_pair_window(os.getenv("SPEED_PAIR_WINDOW", str(SPEED_PAIR_WINDOW_DEFAULT)))
     try:
         phone_min_battery = int(os.getenv("PHONE_MIN_BATTERY", "15"))
     except ValueError:
@@ -454,6 +470,7 @@ def load_settings(path: Path | None = None) -> Settings:
         speed_quarantine_seconds=speed_quarantine_seconds,
         speed_refresh_seconds=speed_refresh_seconds,
         speed_live_min_p_lower=speed_live_min_p_lower,
+        speed_pair_window=speed_pair_window,
         phone_min_battery=phone_min_battery,
         live_assignment=live_assignment,
         phone_wake_seconds=phone_wake_seconds,

@@ -12,7 +12,7 @@ import threading
 import time
 from typing import Any, Sequence
 
-from .config import Settings, SiteConfig
+from .config import SPEED_PAIR_WINDOW_DEFAULT, Settings, SiteConfig, normalize_pair_window
 from .droidhub import PreferenceList
 
 logger = logging.getLogger("avia.speed")
@@ -26,6 +26,13 @@ def wilson_lower(p: float, n: int, z: float = 0.84) -> float:
     center = p + (z * z) / (2.0 * n)
     spread = z * math.sqrt(max(0.0, (p * (1.0 - p) + (z * z) / (4.0 * n)) / n))
     return max(0.0, (center - spread) / denom)
+
+
+def pair_window(settings: Settings | None) -> int:
+    """Окно доли успехов пары из настроек (SPEED_PAIR_WINDOW); без настроек или мусор — 30."""
+    if settings is None:
+        return SPEED_PAIR_WINDOW_DEFAULT
+    return normalize_pair_window(getattr(settings, "speed_pair_window", SPEED_PAIR_WINDOW_DEFAULT))
 
 
 @dataclass
@@ -100,6 +107,7 @@ class SpeedTable:
         quarantine_failures = getattr(settings, "speed_quarantine_failures", 3) if settings else 3
         quarantine_seconds = getattr(settings, "speed_quarantine_seconds", 600) if settings else 600
         min_samples = getattr(settings, "speed_min_samples", 5) if settings else 5
+        window = pair_window(settings)
         since_ts = curr_time - (window_days * 86400.0)
 
         if not self.metrics_path.exists() and str(self.metrics_path) != ":memory:":
@@ -322,12 +330,12 @@ class SpeedTable:
                 else:
                     new_phone_multipliers[(dev, c_name)] = mult_overall
 
-        # 5. Статистика пар (сайт, телефон, класс) по последним 30 запускам пары
+        # 5. Статистика пар (сайт, телефон, класс) по последним window запускам пары (SPEED_PAIR_WINDOW, 30)
         new_stats: dict[tuple[str, str, str], SpeedStats] = {}
 
         for key, r_list in grouped.items():
             s_name, dev, c_name = key
-            recent_p_runs = r_list[-30:]
+            recent_p_runs = r_list[-window:]
             n = len(recent_p_runs)
             ok_count = 0
             ok_fetches: list[float] = []
@@ -538,6 +546,8 @@ class SpeedTable:
           только если p_lower >= speed_live_min_p_lower (по умолчанию 0.6) и n >= speed_min_samples.
           Пары с меньшим p_lower остаются в конце списка как запасные, но не выбрасываются.
           Карантин/ожидание пробы — в самый конец.
+          SPEED_PAIR_WINDOW задан и не 30: среди запасных доказанно слабая пара (n >= speed_min_samples
+          и p_lower < speed_live_min_p_lower) идёт после непроверенной (n < speed_min_samples).
         - priority > 0 (подписки/фон): новые пары (n == 0) и пробные попытки после карантина — первыми;
           затем пригодные по убыванию C (медленные первыми, быстрые в конце);
           быстрые берутся, если медленные заняты дольше speed_bg_patience_seconds;
@@ -555,6 +565,7 @@ class SpeedTable:
         min_p_lower = getattr(settings, "speed_live_min_p_lower", 0.6) if settings else 0.6
         bg_patience = getattr(settings, "speed_bg_patience_seconds", 60) if settings else 60
         site_name = getattr(site, "name", "")
+        weak_backups_last = pair_window(settings) != SPEED_PAIR_WINDOW_DEFAULT
 
         if priority == 0:
             # -------------------------------------------------------------
@@ -562,7 +573,7 @@ class SpeedTable:
             # -------------------------------------------------------------
             bad_candidates: list[str] = []
             primary_list: list[tuple[str, float | None, int]] = []
-            backup_list: list[tuple[str, float | None, int]] = []
+            backup_list: list[tuple[str, float | None, int, bool]] = []
 
             for idx, dev in enumerate(cands):
                 pair_st = self.get_pair_status(site_name, dev, now=now)
@@ -573,7 +584,8 @@ class SpeedTable:
                 elif st.n >= min_samples and st.p_lower >= min_p_lower:
                     primary_list.append((dev, st.cost, idx))
                 else:
-                    backup_list.append((dev, st.cost, idx))
+                    proven_weak = weak_backups_last and st.n >= min_samples and st.p_lower < min_p_lower
+                    backup_list.append((dev, st.cost, idx, proven_weak))
 
             # Если у всех телефонов нет данных (n == 0), сохраняем исходный порядок (Req 2a)
             all_n_zero = all(
@@ -587,7 +599,10 @@ class SpeedTable:
                 return list(cands)
 
             primary_list.sort(key=lambda x: (0 if x[1] is not None else 1, x[1] if x[1] is not None else 0, x[2]))
-            backup_list.sort(key=lambda x: (0 if x[1] is not None else 1, x[1] if x[1] is not None else 0, x[2]))
+            # без флага proven_weak у всех False — порядок как был: по цене C
+            backup_list.sort(
+                key=lambda x: (x[3], 0 if x[1] is not None else 1, x[1] if x[1] is not None else 0, x[2])
+            )
 
             primary_names = [x[0] for x in primary_list]
             backup_names = [x[0] for x in backup_list]
