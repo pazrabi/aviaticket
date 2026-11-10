@@ -101,3 +101,4 @@
 ### 2026-11-11
 - Перевод City Travel в боевой режим (`stage: live`) в `config/sites.yaml`. Результаты суточной проверки в trial: 240 успешных сборов из 241 (240/241), контрольная проверка 10 результатов подтвердила корректность выдачи цен и ссылок.
 - Консолидация планов: старые файлы `ROADMAP.md`, `PLAN_SPEED.md`, `HUB_TASKS.md` удалены по решению владельца. Создан единый журнал проекта `JOURNAL.md`. Устаревшие ссылки на удалённые файлы планов в комментариях рабочего кода и тестов очищены без изменения поведения.
+- Проведён аудит оставшихся упоминаний удалённых планов в кодовой базе: зафиксированы ссылки в докстрингах модулей `src/avia/stop_rule.py`, `src/avia/stop_calibrate.py` и тестах `tests/test_scheduler_analytics.py`, `tests/test_fetch_jobs.py`, `tests/test_jobs_bad_site.py`, `tests/test_live_reserve.py`, `tests/test_replay_post.py`, `tests/test_scheduler_order.py`.
