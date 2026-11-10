@@ -257,7 +257,7 @@ def test_build_url_city_travel_both_templates():
     settings = load_settings()
     site = next((s for s in settings.sites if s.name == "city_travel"), None)
     assert site is not None
-    assert site.stage == "trial"
+    assert site.stage == "live"
 
     # В одну сторону
     q_ow = Query(origin="KUF", destination="EVN", depart=date(2026, 12, 20), adults=1)
@@ -283,11 +283,11 @@ def test_build_url_city_travel_both_templates():
 
 
 def test_city_travel_config_loading():
-    """Загрузка конфигурации city_travel: stage trial, source browser, phone-поля, settle_ms."""
+    """Загрузка конфигурации city_travel: stage live, source browser, phone-поля, settle_ms."""
     settings = load_settings()
     site = next((s for s in settings.sites if s.name == "city_travel"), None)
     assert site is not None
-    assert site.stage == "trial"
+    assert site.stage == "live"
     assert site.source == "browser"
     assert site.parser == "city_travel"
     assert site.phone == "galaxya12,huawei2"

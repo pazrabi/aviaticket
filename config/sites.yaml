@@ -120,12 +120,12 @@ sites:
     settle_ms: 25000
     scrolls: 2
 
-  # City Travel: новый агрегатор, пробный режим (stage: trial). Текстовая выдача, без перехвата JSON.
+  # City Travel: новый агрегатор, боевой режим (stage: live). Текстовая выдача, без перехвата JSON.
   - name: city_travel
     source: browser
     parser: city_travel
     enabled: true
-    stage: trial
+    stage: live
     phone: "galaxya12,huawei2"
     phone_patience_seconds: 10
     phone_wait_seconds: 25
