@@ -1,4 +1,4 @@
-"""Тесты работы с заданиями хаба fetch_jobs и интеграции с pipeline (PLAN_SPEED шаг 5)."""
+"""Тесты работы с заданиями хаба fetch_jobs и интеграции с pipeline."""
 from __future__ import annotations
 
 import asyncio

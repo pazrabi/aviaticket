@@ -1,4 +1,4 @@
-"""Правило остановки живого поиска по стабильному минимуму (PLAN_SPEED шаг 5)."""
+"""Правило остановки живого поиска по стабильному минимуму."""
 from __future__ import annotations
 
 from dataclasses import dataclass

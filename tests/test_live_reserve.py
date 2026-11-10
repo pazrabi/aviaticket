@@ -1,4 +1,4 @@
-"""Тесты резерва телефонов под живой поиск (PLAN_SPEED шаг 10)."""
+"""Тесты резерва телефонов под живой поиск."""
 from __future__ import annotations
 
 import asyncio

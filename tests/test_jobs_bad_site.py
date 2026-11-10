@@ -1,4 +1,4 @@
-"""Тест фоллбэка заданий хаба на старый fetch_page при пустой выдаче (PLAN_SPEED шаг 10)."""
+"""Тест фоллбэка заданий хаба на старый fetch_page при пустой выдаче."""
 from __future__ import annotations
 
 import asyncio

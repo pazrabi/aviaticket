@@ -1,4 +1,4 @@
-"""Тесты механизма replay_post для глубокого поиска и слияния выдачи Туту (PLAN_SPEED шаг 8)."""
+"""Тесты механизма replay_post для глубокого поиска и слияния выдачи Туту."""
 from __future__ import annotations
 
 import asyncio

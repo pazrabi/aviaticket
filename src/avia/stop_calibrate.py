@@ -1,4 +1,4 @@
-"""Калибровка времени стабильности (stable_seconds) правил остановки живого поиска (PLAN_SPEED шаг 7)."""
+"""Калибровка времени стабильности (stable_seconds) правил остановки живого поиска."""
 from __future__ import annotations
 
 import json
